@@ -1,0 +1,48 @@
+[project]
+name = "assistant"
+version = "0.1.0"
+description = "Local-first AI assistant backend for macOS Apple Silicon (omlx model layer + async agent)."
+requires-python = ">=3.11"
+# Upper bounds are deliberate: hermes-agent's litellm supply-chain incident is the
+# cautionary tale for unbounded deps. Pin majors, bump intentionally.
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    "httpx>=0.27,<1.0",
+    "pydantic>=2.7,<3.0",
+    "pydantic-settings>=2.3,<3.0",
+    "pyyaml>=6.0,<7.0",
+    "python-telegram-bot>=21,<22",
+    "huggingface-hub>=0.20,<1.0",  # model downloads (lightweight; mlx tools also use it)
+    "tomli-w>=1.0,<2.0",  # write the GUI-editable config back to config.toml
+]
+
+[project.optional-dependencies]
+# Each MLX backend is a heavy, Apple-Silicon-only opt-in: the matching feature
+# reports UNAVAILABLE (never crashes) when its extra isn't installed.
+mlx = ["mlx-lm>=0.20,<1.0"]            # native LLM inference backend
+images = ["mflux>=0.18,<1.0"]          # FLUX image generation + Qwen-Image-Edit
+embeddings = ["mlx-embeddings>=0.0.1,<1.0"]  # semantic memory search
+vlm = ["mlx-vlm>=0.1,<1.0"]            # vision-language (read images)
+audio = ["mlx-audio>=0.2,<1.0"]        # speech-to-text + text-to-speech
+video = ["mlx-video>=0.0.1,<1.0"]      # text-to-video (Wan / LTX)
+# Everything the app manages, in one install (recursive extra). `make install`.
+all = ["assistant[mlx,images,embeddings,vlm,audio,video]"]
+dev = [
+    "pytest>=8.0,<9.0",
+    "pytest-asyncio>=0.23,<1.0",
+]
+
+[project.scripts]
+assistant-server = "assistant.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["assistant"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

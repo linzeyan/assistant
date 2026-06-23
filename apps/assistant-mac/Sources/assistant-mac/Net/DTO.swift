@@ -1,0 +1,270 @@
+import Foundation
+
+// Codable mirrors of the backend's JSON. snake_case keys are mapped explicitly.
+
+struct StatusDTO: Decodable {
+    let backend: String
+    let modelBackend: String?
+    let omlx: OmlxStatusDTO
+
+    enum CodingKeys: String, CodingKey {
+        case backend, omlx
+        case modelBackend = "model_backend"
+    }
+}
+
+struct OmlxStatusDTO: Decodable {
+    let state: String
+    let detail: String
+    let baseURL: String?
+    let reachable: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case state, detail, reachable
+        case baseURL = "base_url"
+    }
+}
+
+struct ModelDTO: Decodable, Identifiable, Hashable {
+    let id: String
+    let type: String?
+    let loaded: Bool
+    let source: String?
+    let sizeBytes: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case id, type, loaded, source
+        case sizeBytes = "size_bytes"
+    }
+}
+
+struct ModelsDTO: Decodable {
+    let models: [ModelDTO]
+    let reachable: Bool
+}
+
+struct SkillDTO: Decodable, Identifiable, Hashable {
+    var id: String { name }
+    let name: String
+    let description: String
+    let editable: Bool?  // user-authored skills are editable; bundled ones are read-only
+}
+
+struct SkillsDTO: Decodable {
+    let skills: [SkillDTO]
+}
+
+struct SkillBodyDTO: Decodable {
+    let name: String
+    let body: String
+    let description: String?
+    let editable: Bool?
+}
+
+struct ReloadDTO: Decodable {
+    let added: [String]
+    let removed: [String]
+    let unchanged: [String]
+    let total: Int
+}
+
+struct MemoryEntryDTO: Decodable, Identifiable, Hashable {
+    let id: String
+    let content: String
+    let tags: [String]
+    let createdAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, content, tags
+        case createdAt = "created_at"
+    }
+}
+
+struct MemoryListDTO: Decodable {
+    let memories: [MemoryEntryDTO]
+}
+
+struct MemorySearchDTO: Decodable {
+    let results: [MemoryEntryDTO]
+}
+
+struct ImageResultDTO: Decodable {
+    let path: String
+}
+
+struct DownloadDTO: Decodable, Identifiable, Hashable {
+    var id: String { repoId }
+    let repoId: String
+    let status: String
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case status, error
+        case repoId = "repo_id"
+    }
+}
+
+struct DownloadsDTO: Decodable {
+    let downloads: [DownloadDTO]
+}
+
+// --- preflight / setup ---
+
+struct PreflightDTO: Decodable {
+    let venv: String
+    let python: String
+    let configPath: String
+    let configExists: Bool
+    let downloadDir: String
+    let paths: [PathCheckDTO]
+    let tools: [ToolCheckDTO]
+    let models: ModelsSummaryDTO
+    let installs: [InstallDTO]
+
+    enum CodingKeys: String, CodingKey {
+        case venv, python, paths, tools, models, installs
+        case configPath = "config_path"
+        case configExists = "config_exists"
+        case downloadDir = "download_dir"
+    }
+}
+
+struct PathCheckDTO: Decodable, Identifiable, Hashable {
+    var id: String { name }
+    let name: String
+    let path: String
+    let exists: Bool
+}
+
+struct ToolCheckDTO: Decodable, Identifiable, Hashable {
+    var id: String { feature }
+    let feature: String
+    let package: String
+    let label: String
+    let installed: Bool
+    let version: String?       // installed version, if known
+    let latest: String?        // PyPI latest (nil for source-overridden tools)
+    let source: String?        // configured install source (patched build), if any
+    let updateAvailable: Bool  // gates the "更新套件" button (N5)
+
+    enum CodingKeys: String, CodingKey {
+        case feature, package, label, installed, version, latest, source
+        case updateAvailable = "update_available"
+    }
+
+    // Custom decode so an older backend (stale managed venv) that doesn't yet emit the new
+    // fields still decodes — missing version info simply means "no update offered".
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        feature = try c.decode(String.self, forKey: .feature)
+        package = try c.decode(String.self, forKey: .package)
+        label = try c.decode(String.self, forKey: .label)
+        installed = (try? c.decode(Bool.self, forKey: .installed)) ?? false
+        version = try? c.decode(String.self, forKey: .version)
+        latest = try? c.decode(String.self, forKey: .latest)
+        source = try? c.decode(String.self, forKey: .source)
+        updateAvailable = (try? c.decode(Bool.self, forKey: .updateAvailable)) ?? false
+    }
+}
+
+struct ModelsSummaryDTO: Decodable, Hashable {
+    let dir: String
+    let exists: Bool
+    let count: Int
+    let hfCache: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case dir, exists, count
+        case hfCache = "hf_cache"
+    }
+}
+
+struct InstallDTO: Decodable, Identifiable, Hashable {
+    var id: String { feature }
+    let feature: String
+    let package: String
+    let status: String
+    let error: String?
+}
+
+struct ConfigDTO: Decodable {
+    let modelsDir: String
+    let downloadDir: String
+    let extraModelDirs: [String]
+    let hfCache: Bool
+    let backendHost: String
+    let backendPort: Int
+    let modelBackend: String
+    let configPath: String
+
+    enum CodingKeys: String, CodingKey {
+        case configPath = "config_path"
+        case modelsDir = "models_dir"
+        case downloadDir = "download_dir"
+        case extraModelDirs = "extra_model_dirs"
+        case hfCache = "hf_cache"
+        case backendHost = "backend_host"
+        case backendPort = "backend_port"
+        case modelBackend = "model_backend"
+    }
+}
+
+/// A single Server-Sent Event from `/chat`. Decoded loosely: only `type` is always
+/// present; the rest are populated per event kind.
+struct ChatEvent: Decodable {
+    let type: String
+    let content: String?
+    let sessionId: String?
+    let name: String?
+    let ok: Bool?
+    let detail: String?
+    let token: String?  // approval_request: the id to POST back to /chat/approve
+
+    enum CodingKeys: String, CodingKey {
+        case type, content, name, ok, detail, token
+        case sessionId = "session_id"
+    }
+}
+
+// --- sessions (persisted conversations, S1) ---
+
+struct SessionListDTO: Decodable {
+    let sessions: [SessionSummaryDTO]
+}
+
+struct SessionSummaryDTO: Decodable, Identifiable, Hashable {
+    let id: String
+    let title: String
+    let model: String?
+    let messageCount: Int
+    let lastAccessedAt: Double
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, model
+        case messageCount = "message_count"
+        case lastAccessedAt = "last_accessed_at"
+    }
+}
+
+struct SessionDetailDTO: Decodable {
+    let id: String
+    let model: String?
+    let title: String
+    let messages: [SessionMessageDTO]
+}
+
+struct SessionMessageDTO: Decodable {
+    let role: String
+    let content: String?
+
+    enum CodingKeys: String, CodingKey { case role, content }
+
+    // Tolerant decode: tool/system messages may carry non-string content; capture only
+    // plain-string content (user/assistant) and treat anything else as empty rather than
+    // failing the whole session load.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        role = (try? c.decode(String.self, forKey: .role)) ?? ""
+        content = try? c.decode(String.self, forKey: .content)
+    }
+}

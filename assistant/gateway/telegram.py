@@ -1,0 +1,291 @@
+"""Telegram gateway: makes the assistant reachable from Telegram.
+
+Runs inside the backend process and reuses the same AgentLoop, sessions, skills,
+and memory as the desktop path. Each Telegram chat maps to its own session; replies
+stream by editing a single message; tools that need approval prompt with inline
+buttons (see TelegramApprover).
+
+Security: the allowlist is deny-by-default — an empty ``allowed_users`` rejects
+everyone, and /start tells a user their id so it can be added.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import tempfile
+import time
+from pathlib import Path
+
+from assistant.gateway.approval import TelegramApprover
+
+try:
+    from telegram import Update
+    from telegram.ext import (
+        Application,
+        CallbackQueryHandler,
+        CommandHandler,
+        ContextTypes,
+        MessageHandler,
+        filters,
+    )
+
+    _PTB_AVAILABLE = True
+except ImportError:
+    _PTB_AVAILABLE = False
+
+log = logging.getLogger("assistant.telegram")
+
+
+class _StreamEditor:
+    """Accumulates streamed text into one Telegram message, throttling edits to
+    avoid hitting Telegram's per-chat edit rate limits."""
+
+    def __init__(self, bot, chat_id: int, message_id: int, min_interval: float = 1.5):
+        self._bot = bot
+        self._chat = chat_id
+        self._mid = message_id
+        self._buf = ""
+        self._shown = ""
+        self._last = 0.0
+        self._min = min_interval
+
+    def add(self, text: str) -> None:
+        self._buf += text
+
+    async def flush(self, final: bool = False) -> None:
+        if not final and (time.monotonic() - self._last) < self._min:
+            return
+        text = self._buf.strip() or ("(no response)" if final else "…")
+        if text == self._shown:
+            return
+        self._shown = text
+        self._last = time.monotonic()
+        await self._edit(text)
+
+    async def note(self, line: str) -> None:
+        # Transient progress shown only while there's no real content yet, so it
+        # never clobbers the streamed answer.
+        if self._buf.strip():
+            return
+        await self._edit(line)
+
+    async def set_error(self, detail: str) -> None:
+        await self._edit(f"⚠️ {detail}")
+
+    async def _edit(self, text: str) -> None:
+        try:
+            await self._bot.edit_message_text(
+                text[:4000], chat_id=self._chat, message_id=self._mid
+            )
+        except Exception:
+            # "message is not modified" / transient rate limits are non-fatal.
+            pass
+
+
+class TelegramGateway:
+    def __init__(
+        self,
+        *,
+        token: str,
+        allowed_users,
+        agent,
+        sessions,
+        model_service,
+        default_model: str | None = None,
+        approval_required: bool = True,
+        audio=None,
+    ):
+        self._token = token
+        self._allowed = set(allowed_users or [])
+        self._agent = agent
+        self._sessions = sessions
+        self._models = model_service
+        self._default_model = default_model
+        self._approval_required = approval_required
+        # Optional audio backend (mlx-audio): enables voice-in (STT) and voice-out
+        # (TTS). Absent/unavailable -> the gateway stays text-only.
+        self._audio = audio
+        self._app = None
+        self._pending: dict[str, asyncio.Future] = {}
+
+    # --- lifecycle ---
+
+    async def start(self) -> None:
+        if not _PTB_AVAILABLE:
+            raise RuntimeError("python-telegram-bot is not installed")
+        app = Application.builder().token(self._token).build()
+        app.add_handler(CommandHandler("start", self._on_start))
+        app.add_handler(CallbackQueryHandler(self._on_callback))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
+        app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self._on_voice))
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        self._app = app
+        log.info("Telegram gateway started")
+
+    async def stop(self) -> None:
+        if self._app is None:
+            return
+        try:
+            if self._app.updater:
+                await self._app.updater.stop()
+            await self._app.stop()
+            await self._app.shutdown()
+        except Exception:
+            log.exception("error stopping Telegram gateway")
+        finally:
+            self._app = None
+
+    # --- pure-ish helpers (unit tested) ---
+
+    def is_allowed(self, user_id: int) -> bool:
+        return user_id in self._allowed  # empty allowlist => deny all
+
+    async def pick_model(self) -> str | None:
+        models = await self._models.list_models()
+        if not models:
+            return None
+        if self._default_model:
+            for m in models:
+                if m.id == self._default_model:
+                    return m.id
+        for m in models:  # prefer an already-loaded model to avoid a load stall
+            if m.loaded:
+                return m.id
+        return models[0].id
+
+    # --- handlers ---
+
+    async def _on_start(self, update: "Update", context) -> None:
+        uid = update.effective_user.id
+        if not self.is_allowed(uid):
+            await update.message.reply_text(
+                f"Not authorized. Your Telegram user id is {uid} — add it to "
+                f"telegram_allowed_users to enable access."
+            )
+            return
+        await update.message.reply_text("Ready. Send me a message.")
+
+    async def _on_message(self, update: "Update", context) -> None:
+        if not await self._ensure_allowed(update):
+            return
+        await self._run_turn(update, context, update.message.text, voice_reply=False)
+
+    async def _on_voice(self, update: "Update", context) -> None:
+        if not await self._ensure_allowed(update):
+            return
+        if self._audio is None or not self._audio.available():
+            await update.message.reply_text(
+                "Voice messages need mlx-audio installed on the backend."
+            )
+            return
+        text = await self._transcribe_message(update, context)
+        if not text:
+            await update.message.reply_text("Sorry — I couldn't transcribe that audio.")
+            return
+        # Echo the transcription so the user can see what was understood, then answer
+        # it and reply by voice as well (voice in -> voice out).
+        await update.message.reply_text(f"🎙️ {text}")
+        await self._run_turn(update, context, text, voice_reply=True)
+
+    async def _ensure_allowed(self, update: "Update") -> bool:
+        uid = update.effective_user.id
+        if self.is_allowed(uid):
+            return True
+        await update.message.reply_text(
+            f"Not authorized. Your Telegram user id is {uid}."
+        )
+        return False
+
+    async def _run_turn(
+        self, update: "Update", context, text: str, *, voice_reply: bool
+    ) -> None:
+        model = await self.pick_model()
+        if model is None:
+            await update.message.reply_text("No model is available. Load one first.")
+            return
+
+        chat_id = update.effective_chat.id
+        session = self._sessions.get_or_create(f"tg:{chat_id}", model=model)
+        placeholder = await update.message.reply_text("…")
+        editor = _StreamEditor(context.bot, chat_id, placeholder.message_id)
+        approver = TelegramApprover(
+            self._pending, chat_id, context.bot, self._approval_required
+        )
+        answer_parts: list[str] = []
+        try:
+            async for ev in self._agent.run(session, text, model, approver=approver):
+                if ev["type"] == "assistant_delta":
+                    answer_parts.append(ev["content"])
+                await self._handle_event(ev, editor, context.bot, chat_id)
+            await editor.flush(final=True)
+        except Exception as exc:
+            log.exception("Telegram turn failed")
+            await editor.set_error(str(exc))
+            return
+        if voice_reply:
+            await self._send_voice_reply(
+                context.bot, chat_id, "".join(answer_parts).strip()
+            )
+
+    async def _transcribe_message(self, update: "Update", context) -> str | None:
+        media = update.message.voice or update.message.audio
+        if media is None:
+            return None
+        tmp = Path(tempfile.gettempdir()) / f"tg_voice_{media.file_unique_id}.oga"
+        try:
+            tg_file = await context.bot.get_file(media.file_id)
+            await tg_file.download_to_drive(str(tmp))
+            text = await self._audio.transcribe(str(tmp))
+            return text.strip() or None
+        except Exception:
+            log.exception("voice transcription failed")
+            return None
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    async def _send_voice_reply(self, bot, chat_id, text: str) -> None:
+        if not text or self._audio is None or not self._audio.available():
+            return
+        try:
+            path = await self._audio.speak(text)
+            with open(path, "rb") as fh:
+                await bot.send_voice(chat_id, voice=fh)
+        except Exception:
+            log.exception("failed to send voice reply")
+
+    async def _on_callback(self, update: "Update", context) -> None:
+        query = update.callback_query
+        await query.answer()
+        decision, _, token = (query.data or "").partition(":")
+        future = self._pending.get(token)
+        if future and not future.done():
+            future.set_result(decision == "ok")
+        try:
+            await query.edit_message_text(
+                "✅ Approved" if decision == "ok" else "❌ Denied"
+            )
+        except Exception:
+            pass
+
+    async def _handle_event(self, ev: dict, editor: _StreamEditor, bot, chat_id) -> None:
+        t = ev["type"]
+        if t == "assistant_delta":
+            editor.add(ev["content"])
+            await editor.flush()
+        elif t == "tool_call":
+            await editor.note(f"⚙️ {ev['name']}…")
+        elif t == "tool_result":
+            if ev["name"] in ("generate_image", "edit_image") and ev["ok"]:
+                await self._send_photo(bot, chat_id, ev["content"])
+        elif t == "error":
+            await editor.set_error(ev["detail"])
+
+    async def _send_photo(self, bot, chat_id, path: str) -> None:
+        try:
+            with open(path, "rb") as fh:
+                await bot.send_photo(chat_id, photo=fh)
+        except Exception:
+            log.exception("failed to send generated image")

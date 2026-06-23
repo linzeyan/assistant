@@ -1,0 +1,30 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.eggs/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Swift / SwiftPM ---
+apps/*/.build/
+.build/
+.swiftpm/
+*.xcuserstate
+
+# --- Packaging output ---
+dist/
+
+# --- macOS ---
+.DS_Store
+
+# --- Editors ---
+.vscode/
+.idea/
+.env
+*.log
+.assistant/
