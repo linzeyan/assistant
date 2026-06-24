@@ -136,3 +136,28 @@ async def test_unknown_tool_reported(tmp_path):
     ))
     tr = next(e for e in events if e["type"] == "tool_result")
     assert tr["ok"] is False and "unknown tool" in tr["content"]
+
+
+async def test_forwards_max_output_tokens_to_llm(tmp_path):
+    """The configured per-turn ceiling must actually reach the engine — the engine's own
+    default was 1024, which silently truncated long answers (bug #1)."""
+    captured: dict = {}
+
+    class CapturingLLM:
+        def stream_chat(self, messages, model, tools=None, **params):
+            captured.update(params)
+
+            async def gen():
+                yield {"type": "text", "content": "hi"}
+
+            return gen()
+
+    loop = AgentLoop(
+        CapturingLLM(),
+        build_registry(),
+        PolicyApprover(approval_required=False),
+        ToolContext(cwd=tmp_path),
+        max_output_tokens=2048,
+    )
+    await _collect(loop.run(Session(id="mt"), "hello", "m"))
+    assert captured.get("max_tokens") == 2048

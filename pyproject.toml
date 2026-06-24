@@ -13,7 +13,9 @@ dependencies = [
     "pydantic-settings>=2.3,<3.0",
     "pyyaml>=6.0,<7.0",
     "python-telegram-bot>=21,<22",
-    "huggingface-hub>=0.20,<1.0",  # model downloads (lightweight; mlx tools also use it)
+    # hub 1.x is required by mflux>=0.18 (and accepted by the whole mlx stack); we only use
+    # the stable snapshot_download, unaffected by the 0.x→1.x major. Cap the major per policy.
+    "huggingface-hub>=0.20,<2.0",  # model downloads (lightweight; mlx tools also use it)
     "tomli-w>=1.0,<2.0",  # write the GUI-editable config back to config.toml
 ]
 

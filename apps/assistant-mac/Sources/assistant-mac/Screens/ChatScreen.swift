@@ -53,6 +53,16 @@ struct ChatScreen: View {
 
             Spacer()
 
+            if let ctx = chat.contextTokens {
+                Text(Self.formatContext(ctx))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .help("Estimated context sent to the model last turn (tokens). "
+                        + "Long sessions auto-compact before they exceed the model's window.")
+                    .accessibilityLabel("Context \(ctx) tokens")
+            }
+
             Button { showSessions.toggle() } label: { Image(systemName: "clock.arrow.circlepath") }
                 .help("Conversations")
                 .popover(isPresented: $showSessions, arrowEdge: .bottom) { sessionList }
@@ -194,6 +204,11 @@ struct ChatScreen: View {
         chat.send(model: model, client: controller.client) {
             await controller.refresh()
         }
+    }
+
+    /// Compact token count for the header badge: "~1.2k ctx" past a thousand, else "~840 ctx".
+    static func formatContext(_ n: Int) -> String {
+        n >= 1000 ? String(format: "~%.1fk ctx", Double(n) / 1000) : "~\(n) ctx"
     }
 }
 

@@ -83,6 +83,18 @@ struct AssistantClient {
         try await postJSONNoDecode("/models/download", body: ["repo_id": repoId])
     }
 
+    func cancelDownload(repoId: String) async throws {
+        try await postJSONNoDecode("/models/download/cancel", body: ["repo_id": repoId])
+    }
+
+    func retryDownload(repoId: String) async throws {
+        try await postJSONNoDecode("/models/download/retry", body: ["repo_id": repoId])
+    }
+
+    func removeDownload(repoId: String) async throws {
+        try await postJSONNoDecode("/models/download/remove", body: ["repo_id": repoId])
+    }
+
     func approveTool(token: String, decision: Bool) async throws {
         try await postJSONNoDecode("/chat/approve", body: ["token": token, "decision": decision])
     }
@@ -112,7 +124,8 @@ struct AssistantClient {
         modelsDir: String? = nil, downloadDir: String? = nil,
         extraModelDirs: [String]? = nil, hfCache: Bool? = nil,
         backendHost: String? = nil, backendPort: Int? = nil,
-        modelBackend: String? = nil
+        modelBackend: String? = nil, maxOutputTokens: Int? = nil,
+        telegramToken: String? = nil, telegramAllowedUsers: [Int]? = nil
     ) async throws {
         var body: [String: Any] = [:]
         if let modelsDir { body["models_dir"] = modelsDir }
@@ -122,6 +135,9 @@ struct AssistantClient {
         if let backendHost { body["backend_host"] = backendHost }
         if let backendPort { body["backend_port"] = backendPort }
         if let modelBackend { body["model_backend"] = modelBackend }
+        if let maxOutputTokens { body["max_output_tokens"] = maxOutputTokens }
+        if let telegramToken { body["telegram_token"] = telegramToken }
+        if let telegramAllowedUsers { body["telegram_allowed_users"] = telegramAllowedUsers }
         try await sendJSONNoDecode("PUT", "/config", body: body)
     }
 

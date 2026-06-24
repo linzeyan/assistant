@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from assistant.config import XDG_CONFIG_DIR
+from assistant.gateway import lifecycle as gateway_lifecycle
 
 router = APIRouter(tags=["config"])
 
@@ -35,6 +36,11 @@ class ConfigPatch(BaseModel):
     backend_host: str | None = None
     backend_port: int | None = None
     model_backend: str | None = None
+    max_output_tokens: int | None = None
+    # Gateways (S9): a token/allowlist edit (re)starts the gateway live, no backend restart.
+    # An empty token clears it (stops the gateway).
+    telegram_token: str | None = None
+    telegram_allowed_users: list[int] | None = None
 
 
 @router.get("/config")
@@ -48,7 +54,9 @@ async def get_config(request: Request):
         "backend_host": s.backend_host,
         "backend_port": s.backend_port,
         "model_backend": s.model_backend,
+        "max_output_tokens": s.max_output_tokens,
         "config_path": str(_CONFIG_PATH),
+        **gateway_lifecycle.status(request.app),  # telegram_* (token masked)
     }
 
 
@@ -84,6 +92,17 @@ async def put_config(patch: ConfigPatch, request: Request):
         raise HTTPException(
             status_code=400, detail="model_backend must be 'mlx' or 'omlx'"
         )
+    if "max_output_tokens" in updates and not (64 <= updates["max_output_tokens"] <= 131072):
+        raise HTTPException(
+            status_code=400, detail="max_output_tokens must be 64–131072"
+        )
+    if "telegram_token" in updates:
+        token = updates["telegram_token"].strip()
+        if token and any(c.isspace() for c in token):
+            raise HTTPException(
+                status_code=400, detail="telegram_token must not contain whitespace."
+            )
+        updates["telegram_token"] = token  # normalise; "" clears the gateway
 
     _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     existing: dict = {}
@@ -98,6 +117,10 @@ async def put_config(patch: ConfigPatch, request: Request):
     # model engine can't be done in place.
     restart_required = _apply_live(request, updates)
 
+    # Gateways (S9): a token/allowlist change (re)starts the gateway live — no backend restart.
+    if updates.keys() & _GATEWAY_KEYS:
+        await gateway_lifecycle.reload(request.app)
+
     return {
         "updated": updates,
         "restart_required": restart_required,
@@ -108,6 +131,7 @@ async def put_config(patch: ConfigPatch, request: Request):
 # Keys that take effect live vs. those that can only change on a restart.
 _DISCOVERY_KEYS = frozenset({"models_dir", "download_dir", "extra_model_dirs", "hf_cache"})
 _RESTART_KEYS = frozenset({"backend_host", "backend_port", "model_backend"})
+_GATEWAY_KEYS = frozenset({"telegram_token", "telegram_allowed_users"})
 
 
 def _apply_live(request: Request, updates: dict) -> bool:
@@ -122,6 +146,18 @@ def _apply_live(request: Request, updates: dict) -> bool:
         settings.extra_model_dirs = [Path(p) for p in updates["extra_model_dirs"]]
     if "hf_cache" in updates:
         settings.hf_cache = updates["hf_cache"]
+    if "max_output_tokens" in updates:
+        # Applies live: the next turn reads the loop's ceiling, so no restart needed.
+        settings.max_output_tokens = updates["max_output_tokens"]
+        agent = getattr(request.app.state, "agent", None)
+        if agent is not None:
+            agent.set_max_output_tokens(updates["max_output_tokens"])
+    # Gateway settings: stage onto live settings so the subsequent reload reads the new values
+    # (the reload itself is async, so it runs in put_config, not here).
+    if "telegram_token" in updates:
+        settings.telegram_token = updates["telegram_token"] or None
+    if "telegram_allowed_users" in updates:
+        settings.telegram_allowed_users = list(updates["telegram_allowed_users"])
 
     if updates.keys() & _DISCOVERY_KEYS:
         service = getattr(request.app.state, "model_service", None)

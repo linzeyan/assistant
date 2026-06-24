@@ -15,10 +15,20 @@ struct SettingsScreen: View {
     @State private var backendHost: String = ""
     @State private var backendPort: String = ""
     @State private var modelBackend: String = "mlx"
+    @State private var maxOutputTokens: String = ""
     @State private var configPath: String = ""
     @State private var savedNote: String?
     @State private var bindNote: String?
     @State private var backendKindNote: String?
+    @State private var agentNote: String?
+    // Gateways (S9): the token field is write-only (blank = keep current); the rest is status.
+    @State private var telegramTokenInput: String = ""
+    @State private var telegramAllowlist: String = ""
+    @State private var telegramConfigured: Bool = false
+    @State private var telegramTokenMasked: String?
+    @State private var telegramRunning: Bool = false
+    @State private var telegramError: String?
+    @State private var gatewaysNote: String?
     // Resolved (read-only) runtime paths, so the user can see what's actually in use.
     @State private var backendExe: String = ""
     @State private var inUseVenv: String = ""
@@ -97,6 +107,59 @@ struct SettingsScreen: View {
                 }
                 Text("Host 0.0.0.0 exposes the backend on your LAN; the app still connects "
                     + "over 127.0.0.1. Changing the port reconnects locally. Restart to apply.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
+            Section("Agent") {
+                HStack(spacing: 10) {
+                    Text("Max output tokens").foregroundStyle(.secondary)
+                        .frame(width: labelWidth, alignment: .leading)
+                    TextField("", text: $maxOutputTokens, prompt: Text("4096"))
+                        .textFieldStyle(.roundedBorder).frame(width: 100)
+                    Button("Save") { Task { await saveMaxOutputTokens() } }
+                }
+                if let agentNote {
+                    Text(agentNote).font(.caption).foregroundStyle(.secondary)
+                }
+                Text("The ceiling on tokens generated per reply (the model still stops early "
+                    + "at its end-of-text). Raising it prevents long answers being cut off. "
+                    + "Applies to the next reply — no restart.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
+            Section("Gateways") {
+                HStack {
+                    Text("Telegram").font(.subheadline).bold()
+                    Spacer()
+                    gatewayStatusBadge()
+                }
+                HStack(spacing: 10) {
+                    Text("Bot token").foregroundStyle(.secondary)
+                        .frame(width: labelWidth, alignment: .leading)
+                    SecureField(
+                        telegramConfigured ? (telegramTokenMasked ?? "set") : "123456:ABC-DEF…",
+                        text: $telegramTokenInput
+                    )
+                    .textFieldStyle(.roundedBorder).autocorrectionDisabled()
+                }
+                HStack(spacing: 10) {
+                    Text("Allowed user IDs").foregroundStyle(.secondary)
+                        .frame(width: labelWidth, alignment: .leading)
+                    TextField("comma-separated, e.g. 12345, 67890", text: $telegramAllowlist)
+                        .textFieldStyle(.roundedBorder).autocorrectionDisabled()
+                }
+                HStack {
+                    Button("Save & (re)start") { Task { await saveGateways() } }
+                    if telegramConfigured {
+                        Button("Disable") { Task { await disableTelegram() } }
+                    }
+                }
+                if let gatewaysNote {
+                    Text(gatewaysNote).font(.caption).foregroundStyle(.secondary)
+                }
+                Text("Applies live — the gateway (re)starts on save, no backend restart. The "
+                    + "token is stored locally and never shown in full; leave it blank to keep "
+                    + "the current one. The allowlist is deny-by-default (empty = nobody).")
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
@@ -406,7 +469,74 @@ struct SettingsScreen: View {
             backendHost = cfg.backendHost
             backendPort = String(cfg.backendPort)
             modelBackend = cfg.modelBackend
+            maxOutputTokens = String(cfg.maxOutputTokens)
+            telegramAllowlist = cfg.telegramAllowedUsers.map(String.init).joined(separator: ", ")
+            telegramConfigured = cfg.telegramConfigured
+            telegramTokenMasked = cfg.telegramTokenMasked
+            telegramRunning = cfg.telegramRunning
+            telegramError = cfg.telegramError
             configPath = cfg.configPath
+        }
+    }
+
+    private func saveGateways() async {
+        let ids = Self.parseAllowlist(telegramAllowlist)
+        let token = telegramTokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            // Blank token field = keep the current token; only send it when the user typed one.
+            try await controller.client.putConfig(
+                telegramToken: token.isEmpty ? nil : token, telegramAllowedUsers: ids
+            )
+            telegramTokenInput = ""  // never keep the secret sitting in the field
+            await load()  // refresh status (running / error / masked)
+            gatewaysNote = telegramRunning
+                ? "Telegram gateway running."
+                : (telegramError.map { "Not running: \($0)" } ?? "Saved.")
+        } catch {
+            gatewaysNote = "Save failed: \(error)"
+        }
+    }
+
+    private func disableTelegram() async {
+        do {
+            try await controller.client.putConfig(telegramToken: "")  // "" clears the token
+            telegramTokenInput = ""
+            await load()
+            gatewaysNote = "Telegram disabled."
+        } catch {
+            gatewaysNote = "Disable failed: \(error)"
+        }
+    }
+
+    static func parseAllowlist(_ s: String) -> [Int] {
+        s.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+    }
+
+    @ViewBuilder private func gatewayStatusBadge() -> some View {
+        let (label, color): (String, Color) =
+            telegramRunning ? ("running", .green)
+            : telegramConfigured ? ("stopped", .red)
+            : ("off", .gray)
+        Text(label)
+            .font(.caption)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(color.opacity(0.2))
+            .clipShape(Capsule())
+    }
+
+    private func saveMaxOutputTokens() async {
+        guard let n = Int(maxOutputTokens.trimmingCharacters(in: .whitespaces)),
+            (64...131072).contains(n)
+        else {
+            agentNote = "Max output tokens must be a number 64–131072."
+            return
+        }
+        do {
+            // Applies live — the next reply uses the new ceiling, no backend restart.
+            try await controller.client.putConfig(maxOutputTokens: n)
+            agentNote = "Saved — replies may now run up to \(n) tokens."
+        } catch {
+            agentNote = "Save failed: \(error)"
         }
     }
 

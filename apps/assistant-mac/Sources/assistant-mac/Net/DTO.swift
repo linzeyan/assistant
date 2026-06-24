@@ -96,12 +96,25 @@ struct DownloadDTO: Decodable, Identifiable, Hashable {
     var id: String { repoId }
     let repoId: String
     let status: String
+    let totalBytes: Int
+    let downloadedBytes: Int
+    let etaSeconds: Int?
     let error: String?
 
     enum CodingKeys: String, CodingKey {
         case status, error
         case repoId = "repo_id"
+        case totalBytes = "total_bytes"
+        case downloadedBytes = "downloaded_bytes"
+        case etaSeconds = "eta_seconds"
     }
+
+    /// 0…1 when the total size is known; nil → indeterminate bar.
+    var fraction: Double? {
+        totalBytes > 0 ? min(1, Double(downloadedBytes) / Double(totalBytes)) : nil
+    }
+    var isActive: Bool { status == "queued" || status == "downloading" }
+    var isResumable: Bool { status == "error" || status == "cancelled" }
 }
 
 struct DownloadsDTO: Decodable {
@@ -195,7 +208,14 @@ struct ConfigDTO: Decodable {
     let backendHost: String
     let backendPort: Int
     let modelBackend: String
+    let maxOutputTokens: Int
     let configPath: String
+    // Gateways (S9): the token is masked by the backend; full secret never crosses the wire.
+    let telegramConfigured: Bool
+    let telegramTokenMasked: String?
+    let telegramAllowedUsers: [Int]
+    let telegramRunning: Bool
+    let telegramError: String?
 
     enum CodingKeys: String, CodingKey {
         case configPath = "config_path"
@@ -206,6 +226,12 @@ struct ConfigDTO: Decodable {
         case backendHost = "backend_host"
         case backendPort = "backend_port"
         case modelBackend = "model_backend"
+        case maxOutputTokens = "max_output_tokens"
+        case telegramConfigured = "telegram_configured"
+        case telegramTokenMasked = "telegram_token_masked"
+        case telegramAllowedUsers = "telegram_allowed_users"
+        case telegramRunning = "telegram_running"
+        case telegramError = "telegram_error"
     }
 }
 
@@ -219,9 +245,21 @@ struct ChatEvent: Decodable {
     let ok: Bool?
     let detail: String?
     let token: String?  // approval_request: the id to POST back to /chat/approve
+    let usage: Usage?   // done: token accounting for the just-finished turn
+
+    /// Estimated token counts carried by the terminal `done` event (backend tokens.py).
+    struct Usage: Decodable {
+        let contextTokens: Int?
+        let outputTokens: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case contextTokens = "context_tokens"
+            case outputTokens = "output_tokens"
+        }
+    }
 
     enum CodingKeys: String, CodingKey {
-        case type, content, name, ok, detail, token
+        case type, content, name, ok, detail, token, usage
         case sessionId = "session_id"
     }
 }

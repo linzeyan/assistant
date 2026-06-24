@@ -7,13 +7,19 @@ or spawns the omlx model server. One supervision chain, torn down in reverse on 
 from __future__ import annotations
 
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
+from assistant.agent.compaction import CompactionManager
 from assistant.agent.llm_client import AsyncLLM
+from assistant.agent.hooks import HookRegistry
 from assistant.agent.loop import AgentLoop
+from assistant.downloads import DownloadManager
+from assistant.gateway import lifecycle as gateway_lifecycle
 from assistant.agent.session import SessionStore
 from assistant.api import (
     routes_audio,
@@ -40,10 +46,16 @@ from assistant.models.mlx_vlm import MlxVLMBackend
 from assistant.models.service import ModelService
 from assistant.skills.discovery import SkillStore
 from assistant.tools import build_registry
-from assistant.tools.approval import PolicyApprover
+from assistant.tools.approval import PolicyApprover, Rule
 from assistant.tools.base import ToolContext
 
 log = logging.getLogger("assistant")
+req_log = logging.getLogger("assistant.request")
+
+# High-frequency liveness polls from the GUI — logged at DEBUG so they don't drown the
+# log with one-line-per-second noise (the user's complaint about the raw uvicorn access
+# log). Everything else is logged at INFO with a request id, status, and duration.
+_QUIET_PATHS = frozenset({"/status", "/downloads", "/preflight"})
 
 # Bundled seed skills ship at the repo root, alongside the `assistant` package.
 _BUNDLED_SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
@@ -138,6 +150,7 @@ async def lifespan(app: FastAPI):
         vision=vision,
         audio=audio,
         video=video,
+        output_spill_dir=settings.tool_output_dir,
     )
 
     app.state.model_service = model_service
@@ -148,60 +161,104 @@ async def lifespan(app: FastAPI):
     app.state.audio = audio
     app.state.video = video
     app.state.sessions = SessionStore(settings.sessions_dir)
-    # Shared registries: interactive-approval futures keyed by token, and in-flight
-    # / finished model downloads keyed by repo id.
+    # Shared registries: interactive-approval futures keyed by token.
     app.state.pending_approvals = {}
-    app.state.downloads = {}
-    app.state.download_tasks = {}
+    # Model download manager (N17): progress / cancel / resume-after-restart / retry,
+    # persisted to downloads.json under the data dir.
+    download_manager = DownloadManager(
+        target_dir=settings.download_dir,
+        state_path=settings.home_dir / "downloads.json",
+    )
+    app.state.download_manager = download_manager
     # Managed-tool installs keyed by feature name.
     app.state.installs = {}
     app.state.install_tasks = {}
-    app.state.agent = AgentLoop(AsyncLLM(model_service), registry, approver, ctx)
+    llm = AsyncLLM(model_service)
+    compaction = (
+        CompactionManager(
+            llm,
+            context_window_fallback=settings.compaction_context_window,
+            reserve_tokens=settings.compaction_reserve_tokens,
+            keep_recent_tokens=settings.compaction_keep_recent_tokens,
+        )
+        if settings.compaction_enabled
+        else None
+    )
+    app.state.compaction = compaction
+    # S5: parse wildcard permission rules once; a malformed rule fails loud at startup
+    # rather than silently mis-authorising a tool at call time.
+    approval_rules = [Rule.from_dict(r) for r in settings.approval_rules]
+    # P2 hook seam: empty registry exposed on app.state for in-process extensions to register.
+    hooks = HookRegistry()
+    app.state.hooks = hooks
+    app.state.agent = AgentLoop(
+        llm,
+        registry,
+        approver,
+        ctx,
+        compaction=compaction,
+        max_output_tokens=settings.max_output_tokens,
+        approval_rules=approval_rules,
+        approval_ask_once=settings.approval_ask_once,
+        hooks=hooks,
+    )
 
     # Start the model backend. Non-fatal: a missing backend (no omlx / no mlx-lm)
     # still serves so the GUI can render and tell the user how to enable it.
     app.state.omlx_status = await model_service.start()
 
-    gateway = await _maybe_start_telegram(settings, app)
+    gateway, app.state.telegram_error = await gateway_lifecycle.build_and_start(settings, app)
     app.state.telegram = gateway
+    # Resume any download interrupted by the last shutdown (the hub continues partial files).
+    await download_manager.resume_incomplete()
     try:
         yield
     finally:
-        if gateway is not None:
-            await gateway.stop()
+        await download_manager.aclose()
+        gw = getattr(app.state, "telegram", None)
+        if gw is not None:
+            await gw.stop()
         await cleanup()
-
-
-async def _maybe_start_telegram(settings: Settings, app: FastAPI):
-    """Start the Telegram gateway if a token is configured. Failure is non-fatal:
-    the backend (and desktop GUI) must keep working even if Telegram can't connect."""
-    if not settings.telegram_token:
-        return None
-    from assistant.gateway.telegram import TelegramGateway
-
-    gateway = TelegramGateway(
-        token=settings.telegram_token,
-        allowed_users=settings.telegram_allowed_users,
-        agent=app.state.agent,
-        sessions=app.state.sessions,
-        model_service=app.state.model_service,
-        default_model=settings.default_model,
-        approval_required=settings.approval_required,
-        audio=app.state.audio,
-    )
-    try:
-        await gateway.start()
-        return gateway
-    except Exception as exc:
-        # A bad token is common user misconfiguration — a clean one-liner beats a
-        # scary traceback. The backend must keep serving regardless.
-        log.warning("Telegram gateway failed to start: %s; continuing without it", exc)
-        return None
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="assistant-backend", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings or get_settings()
+
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next):
+        """One structured line per request (id + method + path + status + duration) so the
+        log is actually useful for debugging — replaces uvicorn's bare access lines. The id
+        is also returned as ``x-request-id`` so a client report can be tied to a log line."""
+        rid = uuid.uuid4().hex[:8]
+        request.state.request_id = rid
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            dur = (time.perf_counter() - started) * 1000
+            req_log.exception(
+                "req %s %s %s -> unhandled error %.0fms", rid, request.method,
+                request.url.path, dur,
+            )
+            raise
+        dur = (time.perf_counter() - started) * 1000
+        path = request.url.path
+        if response.status_code >= 500:
+            level = logging.ERROR
+        elif response.status_code >= 400:
+            level = logging.WARNING
+        elif path in _QUIET_PATHS:
+            level = logging.DEBUG
+        else:
+            level = logging.INFO
+        req_log.log(
+            level, "req %s %s %s -> %d %.0fms", rid, request.method, path,
+            response.status_code, dur,
+        )
+        response.headers["x-request-id"] = rid
+        return response
+
     app.include_router(routes_status.router)
     app.include_router(routes_models.router)
     app.include_router(routes_downloads.router)
@@ -221,9 +278,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 def run() -> None:
     import uvicorn
 
+    from assistant.logging_setup import configure_logging
+
     settings = get_settings()
+    log_path = configure_logging(log_dir=settings.log_dir, level=settings.log_level)
+    log.info(
+        "assistant-server starting: host=%s port=%s backend=%s models_dir=%s log=%s",
+        settings.backend_host,
+        settings.backend_port,
+        settings.model_backend,
+        settings.models_dir,
+        log_path,
+    )
     uvicorn.run(
         create_app(settings),
         host=settings.backend_host,
         port=settings.backend_port,
+        # Per-request logging is handled by our middleware (with ids + timings), so disable
+        # uvicorn's bare access log — it was the low-value spam in backend.out.log.
+        access_log=False,
     )

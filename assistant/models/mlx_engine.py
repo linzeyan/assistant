@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import logging
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from pathlib import Path
+
+log = logging.getLogger("assistant")
 
 
 def _release_mlx_memory() -> None:
@@ -42,6 +45,16 @@ def _release_mlx_memory() -> None:
     )
     if callable(clear):
         clear()
+    # Log the active/cache footprint so "unload didn't free memory" reports are diagnosable:
+    # active = memory still held by live arrays (a leaked reference shows up here), cache =
+    # pooled-but-free buffers (should drop to ~0 right after clear_cache).
+    active = getattr(mx, "get_active_memory", None)
+    cache = getattr(mx, "get_cache_memory", None)
+    if callable(active) and callable(cache):
+        log.info(
+            "mlx memory after release: active=%.2fGB cache=%.2fGB",
+            active() / 1e9, cache() / 1e9,
+        )
 
 
 class MlxEngine:
@@ -196,9 +209,11 @@ class MlxEnginePool:
             self._evict(exclude=model_id)
             # Load outside would race the lock; loading under the lock serialises
             # model switches, which is what we want (one heavy load at a time).
+            log.info("loading model into pool: %s", model_id)
             engine = await asyncio.to_thread(self._loader, path)
             self._loaded[model_id] = engine
             self._loaded.move_to_end(model_id)
+            log.info("model loaded: %s (pool now: %s)", model_id, self.loaded_ids())
             return engine
 
     def _evict(self, exclude: str) -> None:
@@ -214,6 +229,7 @@ class MlxEnginePool:
             if victim is None:
                 break  # everything left is pinned — exceed budget rather than evict it
             self._loaded.pop(victim)
+            log.info("evicted LRU model from pool: %s (making room for %s)", victim, exclude)
             evicted = True
         if evicted:
             _release_mlx_memory()
@@ -225,7 +241,10 @@ class MlxEnginePool:
         async with self._lock:
             removed = self._loaded.pop(model_id, None) is not None
             if removed:
+                log.info("unloading model from pool: %s (pool now: %s)", model_id, self.loaded_ids())
                 _release_mlx_memory()
+            else:
+                log.info("unload requested for model not in pool: %s", model_id)
             return removed
 
     def is_loaded(self, model_id: str) -> bool:

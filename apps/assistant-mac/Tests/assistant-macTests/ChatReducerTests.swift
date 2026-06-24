@@ -82,4 +82,19 @@ struct ChatReducerTests {
         #expect(model.messages.count == 1)
         #expect(model.messages[0].text.contains("boom"))
     }
+
+    @Test func doneEventRecordsContextTokens() throws {
+        let model = ChatModel()
+        var current: Int?
+        model.reduce(
+            try event(#"{"type":"done","usage":{"context_tokens":1234,"output_tokens":56}}"#),
+            currentAssistant: &current)
+        #expect(model.contextTokens == 1234)
+        #expect(model.messages.isEmpty)  // done is metadata-only, adds no bubble
+    }
+
+    @Test func contextBadgeFormatsCompactly() {
+        #expect(ChatScreen.formatContext(840) == "~840 ctx")
+        #expect(ChatScreen.formatContext(1234) == "~1.2k ctx")
+    }
 }

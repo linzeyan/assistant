@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 from .base import ToolContext, ToolResult
+from .output_bounding import bound_text
 from .registry import registry
 
 _MAX_READ = 100_000
@@ -36,9 +37,9 @@ async def read_file(args: dict, ctx: ToolContext) -> ToolResult:
     if not p.is_file():
         return ToolResult(False, f"not a file: {p}")
     data = p.read_text(errors="replace")
-    if len(data) > _MAX_READ:
-        data = data[:_MAX_READ] + f"\n...[truncated, {len(data)} chars total]"
-    return ToolResult(True, data)
+    # Keep both ends of a large file (head-only dropped the tail). No spill: the file itself
+    # is the full copy on disk — the marker reports the true size so the agent knows.
+    return ToolResult(True, bound_text(data, limit=_MAX_READ, label="read"))
 
 
 @registry.tool(

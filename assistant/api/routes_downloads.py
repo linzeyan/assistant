@@ -1,17 +1,15 @@
 """Model download endpoints.
 
-Downloads a HuggingFace repo into the local HF cache via ``snapshot_download`` (the
-same cache mlx-lm / mflux use, so it's shared and de-duplicated). Discovery's HF
-cache scan then surfaces it in ``/models``. Downloads run as background tasks; the
-client polls ``GET /downloads`` for status.
+Downloads a HuggingFace repo into the configured download dir (the same cache mlx-lm / mflux
+use, so it's shared and de-duplicated). Discovery's scan then surfaces it in ``/models``. The
+lifecycle — progress, cancel, resume-after-restart, retry — lives in
+:class:`assistant.downloads.DownloadManager` (``app.state.download_manager``); these routes are
+thin wrappers. The client polls ``GET /downloads`` for live progress.
 """
 
 from __future__ import annotations
 
-import asyncio
 import importlib.util
-from collections.abc import Callable
-from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
@@ -23,47 +21,59 @@ class DownloadRequest(BaseModel):
     repo_id: str
 
 
-async def perform_download(
-    state: dict, repo_id: str, downloader: Callable[[str], object]
-) -> None:
-    """Run one download, recording its lifecycle in ``state`` (testable: the
-    downloader is injected so this never needs the network)."""
-    state[repo_id] = {"repo_id": repo_id, "status": "downloading", "error": None}
-    try:
-        await asyncio.to_thread(downloader, repo_id)
-        state[repo_id] = {"repo_id": repo_id, "status": "done", "error": None}
-    except Exception as exc:
-        state[repo_id] = {"repo_id": repo_id, "status": "error", "error": str(exc)}
+def _clean_repo_id(raw: str) -> str:
+    repo_id = raw.strip()
+    if not repo_id or any(c.isspace() for c in repo_id):
+        # A pasted multi-line / doubled value would otherwise reach the hub and fail with a
+        # confusing message — reject it up front with a clear one (also guards non-GUI callers).
+        raise HTTPException(
+            status_code=400,
+            detail="repo_id must be a single 'namespace/name' with no spaces or line breaks.",
+        )
+    return repo_id
+
+
+def _require_hub() -> None:
+    if importlib.util.find_spec("huggingface_hub") is None:
+        raise HTTPException(status_code=503, detail="model download requires huggingface_hub.")
 
 
 @router.post("/models/download")
 async def start_download(req: DownloadRequest, request: Request):
-    if importlib.util.find_spec("huggingface_hub") is None:
-        raise HTTPException(
-            status_code=503, detail="model download requires huggingface_hub."
-        )
-    state = request.app.state.downloads
-    if state.get(req.repo_id, {}).get("status") == "downloading":
-        return {"repo_id": req.repo_id, "status": "downloading"}  # idempotent
+    _require_hub()
+    repo_id = _clean_repo_id(req.repo_id)
+    return request.app.state.download_manager.start(repo_id)
 
-    from huggingface_hub import snapshot_download
 
-    # Fetch into the configured download dir (defaults to models_dir) as org/model,
-    # which discovery's two-level scan then surfaces in /models.
-    target = Path(request.app.state.settings.download_dir)
+@router.post("/models/download/cancel")
+async def cancel_download(req: DownloadRequest, request: Request):
+    repo_id = _clean_repo_id(req.repo_id)
+    try:
+        return request.app.state.download_manager.cancel(repo_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"no such download: {repo_id}") from None
 
-    def downloader(repo_id: str) -> object:
-        return snapshot_download(repo_id, local_dir=str(target / repo_id))
 
-    task = asyncio.create_task(perform_download(state, req.repo_id, downloader))
-    request.app.state.download_tasks[req.repo_id] = task
-    # Drop the finished task reference so the registry doesn't grow unbounded.
-    task.add_done_callback(
-        lambda _t, rid=req.repo_id: request.app.state.download_tasks.pop(rid, None)
-    )
-    return {"repo_id": req.repo_id, "status": "downloading"}
+@router.post("/models/download/retry")
+async def retry_download(req: DownloadRequest, request: Request):
+    _require_hub()
+    repo_id = _clean_repo_id(req.repo_id)
+    try:
+        return request.app.state.download_manager.retry(repo_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"no such download: {repo_id}") from None
+
+
+@router.post("/models/download/remove")
+async def remove_download(req: DownloadRequest, request: Request):
+    repo_id = _clean_repo_id(req.repo_id)
+    try:
+        request.app.state.download_manager.remove(repo_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"no such download: {repo_id}") from None
+    return {"removed": repo_id}
 
 
 @router.get("/downloads")
 async def list_downloads(request: Request):
-    return {"downloads": list(request.app.state.downloads.values())}
+    return {"downloads": request.app.state.download_manager.snapshot()}

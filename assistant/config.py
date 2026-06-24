@@ -86,6 +86,13 @@ class Settings(BaseSettings):
     sessions_dir: Path = XDG_DATA_DIR / "sessions"  # persisted conversations (S1)
     audio_dir: Path = XDG_DATA_DIR / "audio"
 
+    # --- logging ---
+    # The GUI spawns the backend with no console attached, so without an explicit file sink
+    # its logs vanish — exactly when you need them to diagnose a failing turn. The server
+    # entry point writes a rotating file here; ASSISTANT_LOG_LEVEL tunes verbosity.
+    log_dir: Path = XDG_DATA_DIR / "logs"
+    log_level: str = "INFO"
+
     # --- managed-tool install sources ---
     # Per-feature pip install-source overrides (key = feature: mlx/images/embeddings/vlm/
     # audio/video). When set, install/update targets this spec instead of the PyPI package
@@ -96,8 +103,34 @@ class Settings(BaseSettings):
     #   mlx = "git+https://github.com/ml-explore/mlx-lm.git@refs/pull/1192/head"
     managed_tool_sources: dict[str, str] = Field(default_factory=dict)
 
+    # --- conversation compaction (S6) ---
+    # When estimated context exceeds (window - reserve), the oldest turns are summarized so a
+    # long session stays within the model's window. The window is auto-detected from the model
+    # when possible; compaction_context_window is the fallback. keep_recent is kept verbatim.
+    compaction_enabled: bool = True
+    compaction_context_window: int = 8192
+    compaction_reserve_tokens: int = 1024
+    compaction_keep_recent_tokens: int = 3072
+
     # --- agent behaviour ---
     approval_required: bool = True
+    # Wildcard permission rules (S5): each is {action = "<tool-name glob>", resource =
+    # "<glob, default *>", decision = "allow|deny|ask"}. First match wins; no match falls
+    # through to the normal prompt. Lets the user pre-authorise safe tools or block dangerous
+    # ones without a prompt each time. In config.toml:
+    #   [[approval_rules]]
+    #   action = "read_file"
+    #   decision = "allow"
+    approval_rules: list[dict] = Field(default_factory=list)
+    # Remember an interactively-granted (tool, resource) so the same action isn't re-prompted.
+    # Process-scoped: resets when the backend restarts.
+    approval_ask_once: bool = True
+    # Cap on tokens generated per assistant turn. The MLX engine defaulted to 1024, which
+    # silently truncated long answers (code, explanations) mid-output; this is the real
+    # ceiling and is config-tunable. Generation still stops early on the model's EOS.
+    max_output_tokens: int = 4096
+    # Where over-budget tool output (S4) is spilled in full so the agent can read the rest.
+    tool_output_dir: Path = XDG_DATA_DIR / "tool-output"
     # Directory the coding/shell tools operate in. Defaults to the process cwd.
     workspace_dir: Path = Field(default_factory=Path.cwd)
     # Fallback model for non-GUI entry points (Telegram) that don't pick one.

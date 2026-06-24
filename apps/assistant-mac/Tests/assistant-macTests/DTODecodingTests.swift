@@ -36,7 +36,10 @@ struct DTODecodingTests {
             ConfigDTO.self,
             """
             {"models_dir":"/m","download_dir":"/d","extra_model_dirs":["/e"],"hf_cache":true,
-             "backend_host":"127.0.0.1","backend_port":9981,"model_backend":"mlx","config_path":"/c"}
+             "backend_host":"127.0.0.1","backend_port":9981,"model_backend":"mlx",
+             "max_output_tokens":8192,"config_path":"/c",
+             "telegram_configured":true,"telegram_token_masked":"1234…wxyz",
+             "telegram_allowed_users":[7,8],"telegram_running":true,"telegram_error":null}
             """)
         #expect(dto.modelsDir == "/m")
         #expect(dto.downloadDir == "/d")
@@ -44,6 +47,35 @@ struct DTODecodingTests {
         #expect(dto.hfCache)
         #expect(dto.backendPort == 9981)
         #expect(dto.modelBackend == "mlx")
+        #expect(dto.maxOutputTokens == 8192)
+        #expect(dto.telegramConfigured)
+        #expect(dto.telegramTokenMasked == "1234…wxyz")
+        #expect(dto.telegramAllowedUsers == [7, 8])
+        #expect(dto.telegramRunning)
+        #expect(dto.telegramError == nil)
+    }
+
+    @Test func gatewayAllowlistParsesCommaSeparatedIds() throws {
+        #expect(SettingsScreen.parseAllowlist("12345, 67890") == [12345, 67890])
+        #expect(SettingsScreen.parseAllowlist(" 7 ,bad, 9 ") == [7, 9])  // skips non-numeric
+        #expect(SettingsScreen.parseAllowlist("") == [])
+    }
+
+    @Test func downloadDTOMapsProgressFields() throws {
+        let dto = try decode(
+            DownloadDTO.self,
+            """
+            {"repo_id":"org/m","status":"downloading","total_bytes":1000,
+             "downloaded_bytes":250,"eta_seconds":12,"error":null}
+            """)
+        #expect(dto.repoId == "org/m")
+        #expect(dto.status == "downloading")
+        #expect(dto.totalBytes == 1000)
+        #expect(dto.downloadedBytes == 250)
+        #expect(dto.etaSeconds == 12)
+        #expect(dto.fraction == 0.25)
+        #expect(dto.isActive)
+        #expect(!dto.isResumable)
     }
 
     @Test func chatEventMapsSessionId() throws {

@@ -20,3 +20,7 @@ class AsyncLLM:
         self, messages: list[dict], model: str, tools: list[dict] | None = None, **params
     ) -> AsyncIterator[dict]:
         return self._models.stream_chat(messages, model, tools=tools, **params)
+
+    async def context_window(self, model: str) -> int | None:
+        """Best-effort context length for the model (tokens); None when unknown."""
+        return await self._models.context_window(model)

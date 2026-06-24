@@ -29,6 +29,49 @@ def test_get_config_reports_paths(tmp_path, monkeypatch):
     assert body["model_backend"] == "mlx"
     assert body["extra_model_dirs"] == []
     assert body["hf_cache"] is False
+    assert body["max_output_tokens"] == 4096
+    # Gateways (S9): status is surfaced here; the token is masked (None when unset).
+    assert body["telegram_configured"] is False
+    assert body["telegram_token_masked"] is None
+    assert body["telegram_allowed_users"] == []
+
+
+def test_put_config_sets_telegram_allowlist_live(tmp_path, monkeypatch):
+    client, cfg = _client(tmp_path, monkeypatch)
+    with client:
+        resp = client.put("/config", json={"telegram_allowed_users": [111, 222]})
+        body = client.get("/config").json()
+    assert resp.status_code == 200 and resp.json()["restart_required"] is False
+    assert body["telegram_allowed_users"] == [111, 222]
+    assert tomllib.loads(cfg.read_text())["telegram_allowed_users"] == [111, 222]
+
+
+def test_put_config_rejects_whitespace_telegram_token(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+    with client:
+        resp = client.put("/config", json={"telegram_token": "bad token"})
+    assert resp.status_code == 400
+
+
+def test_put_config_sets_max_output_tokens_live(tmp_path, monkeypatch):
+    # The generation ceiling applies live (next turn reads the loop's value), so it persists
+    # to config.toml AND updates the running AgentLoop without a restart.
+    client, cfg = _client(tmp_path, monkeypatch)
+    with client:
+        resp = client.put("/config", json={"max_output_tokens": 8192})
+        live = client.app.state.agent._max_output_tokens
+        live_settings = client.app.state.settings.max_output_tokens
+    assert resp.status_code == 200 and resp.json()["restart_required"] is False
+    assert live == 8192 and live_settings == 8192
+    assert tomllib.loads(cfg.read_text())["max_output_tokens"] == 8192
+
+
+def test_put_config_rejects_out_of_range_max_output_tokens(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+    with client:
+        too_low = client.put("/config", json={"max_output_tokens": 16})
+        too_high = client.put("/config", json={"max_output_tokens": 999999})
+    assert too_low.status_code == 400 and too_high.status_code == 400
 
 
 def test_put_config_writes_extra_model_dirs_and_hf_cache(tmp_path, monkeypatch):

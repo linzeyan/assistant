@@ -33,6 +33,8 @@ class ToolContext:
     vision: "VisionService | None" = None
     audio: "AudioService | None" = None
     video: "VideoService | None" = None
+    # Where over-budget tool output is spilled in full (S4); None = bound in place, no spill.
+    output_spill_dir: Path | None = None
 
 
 @dataclass

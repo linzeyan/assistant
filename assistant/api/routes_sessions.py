@@ -8,10 +8,16 @@ checkpoints the session after each turn.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from assistant.agent.tokens import estimate_messages_tokens
+
 router = APIRouter(tags=["sessions"])
+log = logging.getLogger("assistant")
 
 
 class CreateSessionRequest(BaseModel):
@@ -20,7 +26,11 @@ class CreateSessionRequest(BaseModel):
 
 @router.get("/sessions")
 async def list_sessions(request: Request):
-    return {"sessions": request.app.state.sessions.list_sessions()}
+    sessions = request.app.state.sessions.list_sessions()
+    # Logged so "my old conversation vanished" (#5) is diagnosable: this is exactly how many
+    # the backend can see (in-memory + on-disk merged) at the moment the GUI asks.
+    log.info("list sessions: %d found", len(sessions))
+    return {"sessions": sessions}
 
 
 @router.post("/sessions")
@@ -48,3 +58,29 @@ async def delete_session(session_id: str, request: Request):
     if not ok:
         raise HTTPException(status_code=404, detail=f"unknown session: {session_id}")
     return {"ok": True}
+
+
+@router.post("/sessions/{session_id}/compact")
+async def compact_session(session_id: str, request: Request):
+    """Manually compact a session now (S6), independent of the auto threshold. Summarizes the
+    oldest turns, keeps recent ones verbatim, and archives the originals on the session."""
+    store = request.app.state.sessions
+    session = store.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"unknown session: {session_id}")
+    compaction = getattr(request.app.state, "compaction", None)
+    if compaction is None:
+        raise HTTPException(status_code=503, detail="compaction is disabled")
+    if not session.model:
+        raise HTTPException(
+            status_code=400, detail="session has no model to summarize with"
+        )
+    event = await compaction.force_compact(session, session.model)
+    if event is None:
+        # Nothing old enough to summarize safely — report current size, no change made.
+        return {
+            "compacted": False,
+            "context_tokens": estimate_messages_tokens(session.messages),
+        }
+    await asyncio.to_thread(store.checkpoint, session)
+    return {"compacted": True, **event}

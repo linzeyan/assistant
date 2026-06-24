@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -10,6 +11,7 @@ from pydantic import BaseModel
 from assistant.tools.approval import InteractiveApprover, resolve_pending
 
 router = APIRouter(tags=["chat"])
+log = logging.getLogger("assistant")
 
 
 class ChatRequest(BaseModel):
@@ -43,6 +45,11 @@ async def chat(req: ChatRequest, request: Request):
     store = request.app.state.sessions
     agent = request.app.state.agent
     session = store.get_or_create(req.session_id, model=req.model)
+    new_session = req.session_id is None
+    log.info(
+        "chat turn: session=%s (%s) model=%s msgs=%d",
+        session.id, "new" if new_session else "resume", req.model, len(session.messages),
+    )
     approver = (
         InteractiveApprover(request.app.state.pending_approvals)
         if req.interactive_approval
@@ -52,6 +59,7 @@ async def chat(req: ChatRequest, request: Request):
     async def event_stream():
         # Emit the session id first so the client can continue this conversation.
         yield _sse({"type": "session", "session_id": session.id})
+        completed = False
         try:
             # The loop yields fully-formed events (assistant_delta / tool_call /
             # approval_request / tool_result / done / error); forward them verbatim.
@@ -59,10 +67,21 @@ async def chat(req: ChatRequest, request: Request):
                 session, req.message, req.model, approver=approver
             ):
                 yield _sse(event)
+            completed = True
             # Persist the completed turn so the conversation survives a restart and shows
             # up in the session list. Off-thread: the write must not stall the response.
             await asyncio.to_thread(store.checkpoint, session)
+            log.info("chat turn checkpointed: session=%s msgs=%d", session.id, len(session.messages))
+        except asyncio.CancelledError:
+            # The client disconnected mid-stream (New chat / Stop while generating, or the
+            # SSE connection dropped). Logged because a turn cancelled here never reaches the
+            # checkpoint above — a prime suspect for "conversation vanished after New" (#5).
+            log.warning(
+                "chat turn cancelled mid-stream: session=%s completed=%s", session.id, completed
+            )
+            raise
         except Exception as exc:  # stream the error instead of dropping the connection
+            log.exception("chat turn failed: session=%s", session.id)
             yield _sse({"type": "error", "detail": str(exc)})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

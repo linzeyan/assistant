@@ -1,8 +1,13 @@
-"""System-prompt assembly: base instructions + skills index + memory block.
+"""System-prompt assembly: base instructions + skills index.
 
 Only the skills INDEX (name + description) is injected, never every skill body —
 that keeps the prompt small and lets the model pull a skill's full text on demand
-via skill_view. Relevant memories are prefetched per turn and appended.
+via skill_view.
+
+The system prompt is deliberately STABLE (it depends only on the base text + the skills
+index, not on the user's message), so it can serve as a byte-identical cacheable prefix
+across turns (on-device KV-cache reuse). Per-turn memory does NOT go here — it rides the
+current user turn via ``wrap_memory_context`` so dynamic context can't perturb the prefix.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ skill via skill_manage(action="create").
 - When the user states a durable preference or fact, save it with memory_write."""
 
 
-def build_system_prompt(skills_index: str, memory_block: str) -> str:
+def build_system_prompt(skills_index: str) -> str:
     parts = [
         _BASE,
         "",
@@ -33,6 +38,10 @@ def build_system_prompt(skills_index: str, memory_block: str) -> str:
         skills_index,
         "Call skill_view(name) to read a skill's full instructions before following it.",
     ]
-    if memory_block:
-        parts += ["", "## Relevant memory", memory_block]
     return "\n".join(parts)
+
+
+def wrap_memory_context(memory_block: str) -> str:
+    """Wrap prefetched memory as a reference-only block to ride the *current user turn*
+    (never the system prompt), so dynamic memory can't perturb the cacheable prefix."""
+    return f"<memory-context reference-only>\n{memory_block}\n</memory-context>"

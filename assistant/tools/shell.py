@@ -11,6 +11,7 @@ import os
 import signal
 
 from .base import ToolContext, ToolResult
+from .output_bounding import bound_text
 from .registry import registry
 
 _MAX_OUTPUT = 60_000
@@ -58,6 +59,9 @@ async def bash(args: dict, ctx: ToolContext) -> ToolResult:
         return ToolResult(False, f"timed out after {timeout:g}s")
 
     text = out.decode(errors="replace")
-    if len(text) > _MAX_OUTPUT:
-        text = text[:_MAX_OUTPUT] + "\n...[truncated]"
+    # Bound combined stdout+stderr keeping both ends; the command's real result/error is
+    # usually at the tail. Ephemeral output, so spill the full text for on-demand retrieval.
+    text = bound_text(
+        text, limit=_MAX_OUTPUT, spill_dir=ctx.output_spill_dir, label="bash"
+    )
     return ToolResult(proc.returncode == 0, f"[exit {proc.returncode}]\n{text}")

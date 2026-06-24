@@ -49,6 +49,12 @@ enum Bootstrap {
         dataHome().appendingPathComponent("assistant/bin")
     }
 
+    /// Where the backend's logs live — the same `logs/` dir the backend writes its own
+    /// rotating `backend.log` into, so a spawned backend's raw stdout/stderr sits beside it.
+    static func logsDir() -> URL {
+        dataHome().appendingPathComponent("assistant/logs")
+    }
+
     static func managedServer() -> URL {
         managedVenvDir().appendingPathComponent("bin/assistant-server")
     }

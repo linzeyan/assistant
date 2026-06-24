@@ -58,6 +58,11 @@ final class BackendController: ObservableObject {
     private var backend = BackendProcess(command: BackendProcess.defaultCommand())
     private var terminationObserver: NSObjectProtocol?
     private let bootstrap = BackendBootstrap()
+    /// Set around deliberate shutdowns (app quit, user restart) so the health monitor doesn't
+    /// fight them by auto-restarting a backend we intentionally stopped.
+    private var expectingExit = false
+    /// Long-lived supervisor: probes the managed backend and auto-restarts it on a crash.
+    private var monitorTask: Task<Void, Never>?
 
     /// Port the app connects to — followed when reinstalling so we evict the right server.
     private var currentPort: Int { URL(string: baseURLString)?.port ?? 9981 }
@@ -70,6 +75,7 @@ final class BackendController: ObservableObject {
     func start() async {
         starting = true
         defer { starting = false }
+        expectingExit = false  // a fresh start cancels any prior deliberate-stop intent
         // Pick up a managed venv that may have appeared since launch (bootstrap).
         if backend.command == nil, let cmd = BackendProcess.defaultCommand() {
             backend = BackendProcess(command: cmd)
@@ -101,14 +107,19 @@ final class BackendController: ObservableObject {
         for _ in 0..<40 {  // ~20s
             if await probe() {
                 await refresh()
+                startHealthMonitor()
                 return
             }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         await refresh()  // final attempt surfaces lastError if still down
+        startHealthMonitor()
     }
 
     func stop() {
+        expectingExit = true  // deliberate — the monitor must not auto-restart it
+        monitorTask?.cancel()
+        monitorTask = nil
         backend.stop()
     }
 
@@ -131,6 +142,9 @@ final class BackendController: ObservableObject {
         guard canManageBackend else { return }
         starting = true
         defer { starting = false }
+        // A deliberate restart wants the backend running afterwards, so clear any stale
+        // stop-intent; the `starting` flag keeps the health monitor from racing this.
+        expectingExit = false
         backend.stop()
         // Wait for the old process to release the port before respawning. Without this,
         // the new process can't bind and we silently reconnect to the dying instance —
@@ -162,8 +176,47 @@ final class BackendController: ObservableObject {
         terminationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.backend.stop() }
+            MainActor.assumeIsolated {
+                self?.expectingExit = true  // quitting is expected — don't auto-restart
+                self?.monitorTask?.cancel()
+                self?.backend.stop()
+            }
         }
+    }
+
+    /// Supervise the managed backend: probe periodically and auto-restart it on a crash, with
+    /// exponential backoff so a backend that keeps dying doesn't spin. No-op for an
+    /// externally-run backend (nothing we can relaunch). Started once, after the first boot.
+    private func startHealthMonitor() {
+        guard monitorTask == nil, canManageBackend else { return }
+        monitorTask = Task { [weak self] in
+            var backoff: UInt64 = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)  // probe cadence
+                guard let self, !Task.isCancelled else { return }
+                if await self.probe() {
+                    backoff = 0  // healthy — reset the backoff
+                    continue
+                }
+                // Unreachable: only act if we own the process and aren't deliberately stopping
+                // it (a UI restart already holds `starting`, app quit holds `expectingExit`).
+                guard self.canManageBackend, !self.expectingExit, !self.starting else { continue }
+                await self.restart()
+                if await self.probe() {
+                    backoff = 0
+                } else {
+                    backoff = Self.nextBackoffNanos(backoff)
+                    try? await Task.sleep(nanoseconds: backoff)  // back off before retrying
+                }
+            }
+        }
+    }
+
+    /// Backoff policy: 1s → 2s → 4s … capped at 30s. Pure (nonisolated), so the schedule is
+    /// unit-testable without the main actor.
+    nonisolated static func nextBackoffNanos(_ current: UInt64) -> UInt64 {
+        let next = current == 0 ? 1_000_000_000 : current * 2
+        return min(next, 30_000_000_000)
     }
 
     func refresh() async {

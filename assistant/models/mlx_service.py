@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import shutil
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -31,6 +32,35 @@ from .types import ModelInfo
 # Hold back this many trailing chars while streaming so a tool-call marker split
 # across token boundaries is detected before its prefix leaks as text.
 _HOLD = max(len(m) for m in TOOL_MARKERS) - 1
+
+# Config keys a model's context length hides behind, across architectures. VL/omni
+# checkpoints nest the text config, so we recurse into those too.
+_CTX_KEYS = ("max_position_embeddings", "n_positions", "max_seq_len", "max_sequence_length", "n_ctx")
+_CTX_NESTS = ("text_config", "llm_config", "language_config")
+
+
+def _extract_ctx(cfg: dict) -> int | None:
+    for k in _CTX_KEYS:
+        v = cfg.get(k)
+        if isinstance(v, int) and v > 0:
+            return v
+    for nest in _CTX_NESTS:
+        sub = cfg.get(nest)
+        if isinstance(sub, dict):
+            found = _extract_ctx(sub)
+            if found:
+                return found
+    return None
+
+
+def _read_context_window(path: Path) -> int | None:
+    """Read a model's trained context length from its ``config.json`` (no model load needed).
+    Returns None when the file is missing/unreadable or names no recognised window key."""
+    try:
+        cfg = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return _extract_ctx(cfg) if isinstance(cfg, dict) else None
 
 
 class MlxModelService(ModelService):
@@ -170,6 +200,17 @@ class MlxModelService(ModelService):
 
     async def unload(self, model_id: str) -> None:
         await self._pool.unload(model_id)
+
+    async def context_window(self, model: str) -> int | None:
+        # Read it from the model's own config.json (off-thread) — no load required, works
+        # whether or not the model is currently in the pool. Unknown model → None (fallback).
+        if not self.available():
+            return None
+        try:
+            entry = await self._entry_for(model)
+        except ValueError:
+            return None
+        return await asyncio.to_thread(_read_context_window, entry.path)
 
     def stream_chat(
         self, messages: list[dict], model: str, tools: list[dict] | None = None, **params

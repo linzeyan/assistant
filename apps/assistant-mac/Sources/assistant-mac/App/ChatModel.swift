@@ -12,6 +12,9 @@ final class ChatModel: ObservableObject {
 
     @Published private(set) var currentSessionId: String?
     @Published var sessions: [SessionSummaryDTO] = []
+    /// Estimated context size (tokens) of the last completed turn, from the `done` event.
+    /// Shown in the Chat header so the user can watch the window fill before compaction.
+    @Published private(set) var contextTokens: Int?
     private var streamTask: Task<Void, Never>?
 
     func send(model: String, client: AssistantClient,
@@ -52,6 +55,7 @@ final class ChatModel: ObservableObject {
         stop()
         messages.removeAll()
         currentSessionId = nil
+        contextTokens = nil
     }
 
     /// Start a fresh conversation; the backend assigns a new session id on the next turn.
@@ -67,6 +71,7 @@ final class ChatModel: ObservableObject {
         guard let detail = try? await client.sessionDetail(id) else { return }
         stop()
         currentSessionId = detail.id
+        contextTokens = nil  // unknown until this conversation's next turn reports usage
         messages = detail.messages.compactMap { m in
             guard m.role == "user" || m.role == "assistant" else { return nil }
             return ChatMessage(role: m.role, text: m.content ?? "")
@@ -133,6 +138,9 @@ final class ChatModel: ObservableObject {
             }
         case "error":
             messages.append(ChatMessage(role: "tool", text: "⚠️ \(event.detail ?? "error")"))
+        case "done":
+            currentAssistant = nil
+            if let ctx = event.usage?.contextTokens { contextTokens = ctx }
         default:
             break
         }

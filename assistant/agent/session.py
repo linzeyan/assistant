@@ -33,6 +33,10 @@ class Session:
     system_prompt: str | None = None
     system_fingerprint: str | None = None
     parent_session_id: str | None = None
+    # Compaction archive (S6): each entry records a summary + the original messages it
+    # replaced, so older turns can be relieved from the live context window without losing
+    # the detail (recoverable from disk). Append-only; the live `messages` stays compact.
+    compactions: list[dict] = field(default_factory=list)
     schema_version: int = SCHEMA_VERSION
     created_at: float = field(default_factory=_now)
     last_accessed_at: float = field(default_factory=_now)
@@ -43,6 +47,24 @@ class Session:
             self.messages[0] = msg
         else:
             self.messages.insert(0, msg)
+
+    def ensure_system(self, text: str, fingerprint: str) -> str:
+        """Install the system prompt only when its ``fingerprint`` changed, so the leading
+        cacheable prefix stays byte-identical across turns (on-device KV-cache reuse).
+
+        Returns ``"reused"`` (prefix untouched), ``"new"`` (first install — or migrating a
+        pre-fingerprint session, no cache to miss), or ``"changed"`` (a cache-relevant
+        rebuild worth warning about). The fingerprint is the caller's hash of the stable
+        prompt + model, so swapping models counts as ``"changed"`` even if the text matches
+        (the KV-cache is per-model)."""
+        has_system = bool(self.messages) and self.messages[0].get("role") == "system"
+        if has_system and self.system_fingerprint == fingerprint:
+            return "reused"
+        outcome = "changed" if self.system_fingerprint is not None else "new"
+        self.set_system(text)
+        self.system_prompt = text
+        self.system_fingerprint = fingerprint
+        return outcome
 
     def add_user(self, text: str) -> None:
         self.messages.append({"role": "user", "content": text})
@@ -81,6 +103,7 @@ class Session:
             "system_prompt": self.system_prompt,
             "system_fingerprint": self.system_fingerprint,
             "parent_session_id": self.parent_session_id,
+            "compactions": self.compactions,
             "schema_version": self.schema_version,
             "created_at": self.created_at,
             "last_accessed_at": self.last_accessed_at,
@@ -96,6 +119,7 @@ class Session:
             system_prompt=data.get("system_prompt"),
             system_fingerprint=data.get("system_fingerprint"),
             parent_session_id=data.get("parent_session_id"),
+            compactions=data.get("compactions") or [],
             schema_version=data.get("schema_version", SCHEMA_VERSION),
             created_at=data.get("created_at") or _now(),
             last_accessed_at=data.get("last_accessed_at") or _now(),

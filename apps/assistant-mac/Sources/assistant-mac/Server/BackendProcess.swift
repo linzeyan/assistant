@@ -75,6 +75,15 @@ final class BackendProcess {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: exe)
         proc.arguments = Array(command.dropFirst())
+        // A GUI-spawned backend inherits no usable console, so its stdout/stderr — uvicorn's
+        // lifecycle lines and any traceback raised *before* Python logging is configured —
+        // would be lost, defeating diagnosis. Tee them to a file beside the backend's own
+        // rotating log. Truncated per spawn so it holds just the current run (the backend's
+        // backend.log keeps the rotated history); best-effort — nil just inherits the app's.
+        if let handle = Self.spawnOutHandle() {
+            proc.standardOutput = handle
+            proc.standardError = handle
+        }
         do {
             try proc.run()
             process = proc
@@ -83,8 +92,33 @@ final class BackendProcess {
         }
     }
 
-    func stop() {
-        process?.terminate()
+    /// A fresh, append-positioned handle to `logs/backend.out.log` for this spawn.
+    private static func spawnOutHandle() -> FileHandle? {
+        let fm = FileManager.default
+        let dir = Bootstrap.logsDir()
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("backend.out.log")
+        guard fm.createFile(atPath: url.path, contents: nil) else { return nil }  // truncate
+        return try? FileHandle(forWritingTo: url)
+    }
+
+    var isRunning: Bool { process?.isRunning ?? false }
+
+    /// Graceful stop: SIGTERM first, then SIGKILL if the backend hasn't exited within `grace`.
+    /// uvicorn handles SIGTERM promptly (usually well under 0.5s), so the bounded wait is short
+    /// in practice; the escalation guarantees we never leave a wedged backend holding the port
+    /// (which would make connect-or-spawn reuse a half-dead process).
+    func stop(grace: Double = 2) {
+        guard let proc = process else { return }
         process = nil
+        guard proc.isRunning else { return }
+        proc.terminate()  // SIGTERM
+        let deadline = Date().addingTimeInterval(grace)
+        while proc.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if proc.isRunning {
+            kill(proc.processIdentifier, SIGKILL)  // escalate — it ignored SIGTERM
+        }
     }
 }

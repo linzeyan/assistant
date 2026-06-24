@@ -39,6 +39,12 @@ class ModelService(ABC):
         self, messages: list[dict], model: str, tools: list[dict] | None = None, **params
     ) -> AsyncIterator[dict]: ...
 
+    async def context_window(self, model: str) -> int | None:
+        """Best-effort context length (tokens) for ``model``, used by compaction to decide
+        when to summarize. ``None`` means unknown — the caller falls back to config. Concrete
+        by default (returns None); only backends that can introspect a window override it."""
+        return None
+
 
 class OmlxModelService(ModelService):
     def __init__(self, client: OmlxClient, process: OmlxProcess):
