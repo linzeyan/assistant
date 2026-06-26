@@ -20,7 +20,7 @@ from pathlib import Path
 from assistant.gateway.approval import TelegramApprover
 
 try:
-    from telegram import Update
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
     from telegram.ext import (
         Application,
         CallbackQueryHandler,
@@ -111,6 +111,10 @@ class TelegramGateway:
         self._audio = audio
         self._app = None
         self._pending: dict[str, asyncio.Future] = {}
+        # Per-chat model override, set via the /models inline-keyboard picker. Takes
+        # precedence over default_model in pick_model, so a Telegram user can switch
+        # models without touching config.
+        self._selected_model: dict[int, str] = {}
 
     # --- lifecycle ---
 
@@ -119,6 +123,7 @@ class TelegramGateway:
             raise RuntimeError("python-telegram-bot is not installed")
         app = Application.builder().token(self._token).build()
         app.add_handler(CommandHandler("start", self._on_start))
+        app.add_handler(CommandHandler("models", self._on_models))
         app.add_handler(CallbackQueryHandler(self._on_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self._on_voice))
@@ -146,18 +151,23 @@ class TelegramGateway:
     def is_allowed(self, user_id: int) -> bool:
         return user_id in self._allowed  # empty allowlist => deny all
 
-    async def pick_model(self) -> str | None:
+    async def pick_model(self, chat_id: int | None = None) -> str | None:
         # Only text LLMs / VLMs can chat (mirror mlx_service._CHATTABLE_KINDS). A video or
         # embedding model in the catalog must never be auto-picked — loading one as a chat
         # model fails (a Wan video model dies with "No safetensors found").
         models = [m for m in await self._models.list_models() if m.type in _CHATTABLE_KINDS]
         if not models:
             return None
+        # Order of preference: this chat's explicit /models pick, then the configured
+        # default, then an already-loaded model (avoids a load stall), then the first.
+        chosen = self._selected_model.get(chat_id) if chat_id is not None else None
+        if chosen and any(m.id == chosen for m in models):
+            return chosen
         if self._default_model:
             for m in models:
                 if m.id == self._default_model:
                     return m.id
-        for m in models:  # prefer an already-loaded model to avoid a load stall
+        for m in models:
             if m.loaded:
                 return m.id
         return models[0].id
@@ -172,7 +182,28 @@ class TelegramGateway:
                 f"telegram_allowed_users to enable access."
             )
             return
-        await update.message.reply_text("Ready. Send me a message.")
+        await update.message.reply_text(
+            "Ready. Send me a message. Use /models to switch the chat model."
+        )
+
+    async def _on_models(self, update: "Update", context) -> None:
+        if not await self._ensure_allowed(update):
+            return
+        models = [m for m in await self._models.list_models() if m.type in _CHATTABLE_KINDS]
+        if not models:
+            await update.message.reply_text("No chat model is available. Load one first.")
+            return
+        current = await self.pick_model(update.effective_chat.id)
+        # callback_data is capped at 64 bytes and model ids blow past that, so key each
+        # button by catalog index and resolve it back on tap (the chattable order is stable).
+        rows = [
+            [InlineKeyboardButton(
+                f"{'● ' if m.id == current else '○ '}{m.id}", callback_data=f"model:{i}")]
+            for i, m in enumerate(models)
+        ]
+        await update.message.reply_text(
+            "Pick the chat model:", reply_markup=InlineKeyboardMarkup(rows)
+        )
 
     async def _on_message(self, update: "Update", context) -> None:
         if not await self._ensure_allowed(update):
@@ -208,12 +239,12 @@ class TelegramGateway:
     async def _run_turn(
         self, update: "Update", context, text: str, *, voice_reply: bool
     ) -> None:
-        model = await self.pick_model()
+        chat_id = update.effective_chat.id
+        model = await self.pick_model(chat_id)
         if model is None:
             await update.message.reply_text("No model is available. Load one first.")
             return
 
-        chat_id = update.effective_chat.id
         session = self._sessions.get_or_create(f"tg:{chat_id}", model=model)
         placeholder = await update.message.reply_text("…")
         editor = _StreamEditor(context.bot, chat_id, placeholder.message_id)
@@ -265,7 +296,11 @@ class TelegramGateway:
     async def _on_callback(self, update: "Update", context) -> None:
         query = update.callback_query
         await query.answer()
-        decision, _, token = (query.data or "").partition(":")
+        data = query.data or ""
+        if data.startswith("model:"):  # a /models picker tap, not an approval
+            await self._apply_model_choice(query)
+            return
+        decision, _, token = data.partition(":")
         future = self._pending.get(token)
         if future and not future.done():
             future.set_result(decision == "ok")
@@ -273,6 +308,22 @@ class TelegramGateway:
             await query.edit_message_text(
                 "✅ Approved" if decision == "ok" else "❌ Denied"
             )
+        except Exception:
+            pass
+
+    async def _apply_model_choice(self, query) -> None:
+        # Resolve the button's catalog index back to a model id (see _on_models for why we
+        # key by index), record it as this chat's pick, and confirm.
+        _, _, idx = (query.data or "").partition(":")
+        models = [m for m in await self._models.list_models() if m.type in _CHATTABLE_KINDS]
+        try:
+            chosen = models[int(idx)].id
+        except (ValueError, IndexError):
+            await query.edit_message_text("That model is no longer available.")
+            return
+        self._selected_model[query.message.chat.id] = chosen
+        try:
+            await query.edit_message_text(f"✅ Model set to {chosen}")
         except Exception:
             pass
 

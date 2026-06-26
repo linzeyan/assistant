@@ -103,6 +103,48 @@ async def test_pick_model_none_when_only_non_chat_models():
     assert await _gateway(models=models).pick_model() is None
 
 
+# --- per-chat model picker (/models inline keyboard) ---
+
+
+async def test_pick_model_selected_overrides_default():
+    models = [ModelInfo("a", type="llm"), ModelInfo("b", type="llm")]
+    gw = _gateway(models=models, default="a")
+    gw._selected_model[42] = "b"
+    assert await gw.pick_model(42) == "b"  # this chat's pick wins over the default
+    assert await gw.pick_model(99) == "a"  # a different chat still gets the default
+
+
+async def test_pick_model_stale_selection_falls_back():
+    # A pick that's since been deleted must not be returned — fall back to normal order.
+    gw = _gateway(models=[ModelInfo("a", type="llm")], default="a")
+    gw._selected_model[42] = "gone"
+    assert await gw.pick_model(42) == "a"
+
+
+async def test_apply_model_choice_records_pick_by_index():
+    # The button index addresses the *chattable* list (video filtered out), so index 1 is
+    # "b", not the video model — confirms index<->id stays aligned with the filter.
+    models = [ModelInfo("a", type="llm"), ModelInfo("Wan", type="video"), ModelInfo("b", type="llm")]
+    gw = _gateway(models=models)
+    query = Mock()
+    query.data = "model:1"
+    query.message.chat.id = 42
+    query.edit_message_text = AsyncMock()
+    await gw._apply_model_choice(query)
+    assert gw._selected_model[42] == "b"
+    query.edit_message_text.assert_awaited_once()
+
+
+async def test_apply_model_choice_handles_stale_index():
+    gw = _gateway(models=[ModelInfo("a", type="llm")])
+    query = Mock()
+    query.data = "model:9"  # out of range (catalog shrank since the menu was shown)
+    query.message.chat.id = 42
+    query.edit_message_text = AsyncMock()
+    await gw._apply_model_choice(query)
+    assert 42 not in gw._selected_model  # nothing recorded
+
+
 # --- interactive approver ---
 
 
