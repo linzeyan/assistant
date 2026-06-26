@@ -31,10 +31,13 @@ the page to confirm. Do NOT claim you can't access the internet or lack a weathe
 look it up.
 
 Media generation:
-- When the user asks you to CREATE an image or a video from a description, call the \
-matching tool (generate_image / generate_video) directly. Do not reply with a tutorial, a \
-script, or steps for doing it in other software — "generate / draw / make a video of X" is a \
-request to call the tool, not to explain how the user could make X themselves.
+- When the user asks you to CREATE an image or a video from a description, you MUST actually \
+call the matching tool (generate_image / generate_video) — issuing that tool call is the ONLY \
+thing that produces the file. Announcing that you will use it, or writing the scene out in \
+prose, produces NOTHING for the user. So do not describe the result, give a tutorial, or \
+output a script for other software: emit the generate_image / generate_video tool call as your \
+action, passing the user's request as the prompt. "generate / draw / make a video of X" means \
+call the tool now.
 
 Self-improvement:
 - After solving a non-trivial, reusable task, consider saving the procedure as a \
