@@ -31,7 +31,12 @@ final class ChatModel: ObservableObject {
             // A chat turn loads its model on demand in the backend pool; let the caller
             // refresh so the Models tab reflects the now-loaded state (and offers Unload)
             // instead of showing a stale "Load".
-            await onFinish()
+            // Only on a turn that actually finished: Stop cancels this task, and running
+            // onFinish in a cancelled context fires client calls that fail with
+            // URLError.cancelled (-999) — which refresh() would misread as "backend offline".
+            if !Task.isCancelled {
+                await onFinish()
+            }
         }
     }
 

@@ -237,6 +237,12 @@ final class BackendController: ObservableObject {
                     ?? models.first?.id
             }
             lastError = nil
+        } catch is CancellationError {
+            // A cancelled request (e.g. the user pressed Stop, which tears down the chat
+            // task) is NOT evidence the backend is down — leave reachable as-is so the
+            // offline banner doesn't flash on Stop and then stick.
+        } catch let urlError as URLError where urlError.code == .cancelled {
+            // URLSession reports a cancelled task as -999; same reasoning as above.
         } catch {
             lastError = String(describing: error)
             reachable = false
