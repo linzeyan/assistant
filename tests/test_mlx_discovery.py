@@ -119,3 +119,21 @@ def test_classify_kind_defaults_to_llm_when_unknown(tmp_path):
     d.mkdir()
     (d / "config.json").write_text("{}")  # unrecognised → fail open, don't block load
     assert classify_kind(d) == "llm"
+
+
+def test_classify_kind_video_via_model_type(tmp_path):
+    # Wan TI2V (text/image-to-video) advertises a video model_type. Without "video" it
+    # fail-opens to "llm" and pollutes the chat list, where loading it throws.
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"model_type": "ti2v"}))
+    assert classify_kind(d) == "video"
+
+
+def test_classify_kind_video_via_wan_class_name(tmp_path):
+    # Wan S2V's config has no model_type/architectures, only a _class_name. The diffusers
+    # class is the giveaway that this is generative video, not a chat model.
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"_class_name": "WanModel_S2V"}))
+    assert classify_kind(d) == "video"

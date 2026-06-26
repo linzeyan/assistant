@@ -25,7 +25,6 @@ try:
         Application,
         CallbackQueryHandler,
         CommandHandler,
-        ContextTypes,
         MessageHandler,
         filters,
     )
@@ -35,6 +34,10 @@ except ImportError:
     _PTB_AVAILABLE = False
 
 log = logging.getLogger("assistant.telegram")
+
+# Kinds usable as a chat model (mirror mlx_service._CHATTABLE_KINDS) — keeps pick_model
+# from auto-selecting a video / embedding model that can't serve a chat turn.
+_CHATTABLE_KINDS = ("llm", "vlm")
 
 
 class _StreamEditor:
@@ -144,7 +147,10 @@ class TelegramGateway:
         return user_id in self._allowed  # empty allowlist => deny all
 
     async def pick_model(self) -> str | None:
-        models = await self._models.list_models()
+        # Only text LLMs / VLMs can chat (mirror mlx_service._CHATTABLE_KINDS). A video or
+        # embedding model in the catalog must never be auto-picked — loading one as a chat
+        # model fails (a Wan video model dies with "No safetensors found").
+        models = [m for m in await self._models.list_models() if m.type in _CHATTABLE_KINDS]
         if not models:
             return None
         if self._default_model:
@@ -277,9 +283,15 @@ class TelegramGateway:
             await editor.flush()
         elif t == "tool_call":
             await editor.note(f"⚙️ {ev['name']}…")
-        elif t == "tool_result":
-            if ev["name"] in ("generate_image", "edit_image") and ev["ok"]:
+        elif t == "tool_result" and ev["ok"]:
+            # Media tools return a saved file path as their content; play each modality
+            # back into the chat by mirroring the image path. Non-media results are
+            # text-only (folded into the streamed answer), so they aren't routed here.
+            name = ev["name"]
+            if name in ("generate_image", "edit_image"):
                 await self._send_photo(bot, chat_id, ev["content"])
+            elif name == "generate_video":
+                await self._send_video(bot, chat_id, ev["content"])
         elif t == "error":
             await editor.set_error(ev["detail"])
 
@@ -289,3 +301,10 @@ class TelegramGateway:
                 await bot.send_photo(chat_id, photo=fh)
         except Exception:
             log.exception("failed to send generated image")
+
+    async def _send_video(self, bot, chat_id, path: str) -> None:
+        try:
+            with open(path, "rb") as fh:
+                await bot.send_video(chat_id, video=fh)
+        except Exception:
+            log.exception("failed to send generated video")

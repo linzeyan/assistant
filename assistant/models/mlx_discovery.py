@@ -79,6 +79,9 @@ _VLM_TYPES = (
 _ENCODER_TYPES = {
     "t5", "umt5", "mt5", "bert", "roberta", "xlm-roberta", "clip", "siglip",
 }
+# Diffusion video model_type tags (Wan family: sound/text/image-to-video). These are
+# generative video, not chat — see classify_kind for why misclassifying them matters.
+_VIDEO_TYPES = {"s2v", "ti2v", "t2v", "i2v"}
 
 
 def _read_config(d: Path) -> dict:
@@ -93,6 +96,13 @@ def classify_kind(d: Path) -> str:
     archs = cfg.get("architectures") or []
     arch = (archs[0] if archs else "").lower()
     mtype = str(cfg.get("model_type") or "").lower()
+    cls_name = str(cfg.get("_class_name") or "").lower()
+    # Diffusion video models (Wan S2V/TI2V/T2V/I2V …) declare a video model_type or a
+    # WanModel diffusers class. They are NOT chattable: without this they fail-open to
+    # "llm" below and pollute the chat model list, where loading one as an LLM dies with
+    # "No safetensors found" (weights are diffusion_pytorch_model-*, not LM format).
+    if mtype in _VIDEO_TYPES or "wan" in cls_name or "video" in cls_name:
+        return "video"
     # Vision-language first: a VL config also carries a causal-LM head, so it would
     # otherwise read as a plain LLM. ``vision_config`` is the strongest signal.
     if (

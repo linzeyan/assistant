@@ -1,8 +1,6 @@
 import asyncio
 from unittest.mock import AsyncMock, Mock
 
-import pytest
-
 from assistant.gateway.approval import TelegramApprover
 from assistant.gateway.telegram import TelegramGateway
 from assistant.models.types import ModelInfo
@@ -78,18 +76,31 @@ async def test_pick_model_none_when_no_models():
 
 
 async def test_pick_model_prefers_default():
-    models = [ModelInfo("a"), ModelInfo("b")]
+    models = [ModelInfo("a", type="llm"), ModelInfo("b", type="llm")]
     assert await _gateway(models=models, default="b").pick_model() == "b"
 
 
 async def test_pick_model_prefers_loaded():
-    models = [ModelInfo("a", loaded=False), ModelInfo("b", loaded=True)]
+    models = [ModelInfo("a", type="llm", loaded=False), ModelInfo("b", type="llm", loaded=True)]
     assert await _gateway(models=models).pick_model() == "b"
 
 
 async def test_pick_model_first_fallback():
-    models = [ModelInfo("a"), ModelInfo("b")]
+    models = [ModelInfo("a", type="llm"), ModelInfo("b", type="llm")]
     assert await _gateway(models=models).pick_model() == "a"
+
+
+async def test_pick_model_skips_non_chat_models():
+    # A video model in the catalog must never be auto-selected — loading it as a chat
+    # model dies with "No safetensors found". This was the real Telegram failure: a Wan
+    # video model fail-classified as "llm" got picked, so even "test" crashed.
+    models = [ModelInfo("Wan2.2-S2V-14B", type="video"), ModelInfo("qwen", type="llm")]
+    assert await _gateway(models=models).pick_model() == "qwen"
+
+
+async def test_pick_model_none_when_only_non_chat_models():
+    models = [ModelInfo("Wan2.2-S2V-14B", type="video"), ModelInfo("bge", type="embedding")]
+    assert await _gateway(models=models).pick_model() is None
 
 
 # --- interactive approver ---
@@ -186,3 +197,49 @@ async def test_on_voice_without_audio_backend_tells_user():
     await gw._on_voice(update, Mock())
     update.message.reply_text.assert_awaited_once()
     assert "mlx-audio" in update.message.reply_text.call_args.args[0]
+
+
+# --- media result routing (P2: play modalities back into the chat) ---
+
+
+def _media_result(name, ok=True, content="/x"):
+    return {"type": "tool_result", "name": name, "ok": ok, "content": content}
+
+
+async def test_handle_event_sends_generated_video(tmp_path):
+    clip = tmp_path / "out.mp4"
+    clip.write_bytes(b"\x00\x00")  # a real file so _send_video can open() it
+    bot = Mock()
+    bot.send_video = AsyncMock()
+    bot.send_photo = AsyncMock()
+    await _gateway()._handle_event(
+        _media_result("generate_video", content=str(clip)), Mock(), bot, 42
+    )
+    bot.send_video.assert_awaited_once()
+    bot.send_photo.assert_not_awaited()  # routed as video, never as an image
+
+
+async def test_handle_event_image_routing_unchanged(tmp_path):
+    img = tmp_path / "out.png"
+    img.write_bytes(b"\x89PNG")
+    bot = Mock()
+    bot.send_photo = AsyncMock()
+    await _gateway()._handle_event(
+        _media_result("generate_image", content=str(img)), Mock(), bot, 42
+    )
+    bot.send_photo.assert_awaited_once()  # the video addition didn't break images
+
+
+async def test_handle_event_skips_nonmedia_and_failed_results():
+    # WHY: only a *successful media* result is a file to play back. A text tool result
+    # (folded into the streamed answer) or a failed media call must not try to open a path.
+    bot = Mock()
+    bot.send_video = AsyncMock()
+    bot.send_photo = AsyncMock()
+    gw = _gateway()
+    await gw._handle_event(_media_result("web_search", content="snippets"), Mock(), bot, 42)
+    await gw._handle_event(
+        _media_result("generate_video", ok=False, content="/nope"), Mock(), bot, 42
+    )
+    bot.send_video.assert_not_awaited()
+    bot.send_photo.assert_not_awaited()
