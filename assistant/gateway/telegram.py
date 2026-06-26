@@ -128,6 +128,14 @@ class TelegramGateway:
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self._on_voice))
         await app.initialize()
+        # Register slash commands so they appear in Telegram's "/" command menu — without
+        # this the user can't discover /models. Non-fatal if the API call fails.
+        try:
+            await app.bot.set_my_commands(
+                [("start", "Show status and usage"), ("models", "Pick the chat model")]
+            )
+        except Exception:
+            log.warning("could not register Telegram command menu", exc_info=True)
         await app.start()
         await app.updater.start_polling()
         self._app = app
