@@ -143,7 +143,11 @@ async def lifespan(app: FastAPI):
         stt_model=settings.stt_model,
         tts_model=settings.tts_model,
     )
-    video = MlxVideoBackend(settings.video_dir, model=settings.video_model)
+    video = MlxVideoBackend(
+        settings.video_dir,
+        model=settings.video_model,
+        checkpoint=settings.video_checkpoint,
+    )
     ctx = ToolContext(
         cwd=settings.workspace_dir,
         skills=skills,

@@ -93,6 +93,24 @@ def _render_telegram_html(text: str) -> str:
     return "".join(out)
 
 
+def _clip_error(detail: str, limit: int = 500) -> str:
+    """Cap a user-facing error message. A model-load failure can raise a ValueError that
+    lists hundreds of mismatched weight names; surfacing it raw turns the reply into a
+    multi-KB key dump. Keep the first ``limit`` chars (full detail stays in the backend log)."""
+    detail = detail.strip()
+    return detail if len(detail) <= limit else detail[:limit].rstrip() + " […]"
+
+
+def _same_path(a, b) -> bool:
+    """Whether two paths point at the same dir (the /video picker marks the active one)."""
+    if a is None or b is None:
+        return False
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return False
+
+
 class _StreamEditor:
     """Accumulates streamed text into one Telegram message, throttling edits to
     avoid hitting Telegram's per-chat edit rate limits."""
@@ -127,7 +145,7 @@ class _StreamEditor:
         await self._edit(line)
 
     async def set_error(self, detail: str) -> None:
-        await self._edit(f"⚠️ {detail}")
+        await self._edit(f"⚠️ {_clip_error(detail)}")
 
     async def _edit(self, text: str, rich: bool = False) -> None:
         # Only the final message is rich-rendered (think collapsed, markdown/code). Partial
@@ -163,6 +181,8 @@ class TelegramGateway:
         default_model: str | None = None,
         approval_required: bool = True,
         audio=None,
+        video=None,
+        model_dirs=None,
     ):
         self._token = token
         self._allowed = set(allowed_users or [])
@@ -174,6 +194,11 @@ class TelegramGateway:
         # Optional audio backend (mlx-audio): enables voice-in (STT) and voice-out
         # (TTS). Absent/unavailable -> the gateway stays text-only.
         self._audio = audio
+        # Optional video-generation backend (MlxVideoBackend) + the model dirs to scan for
+        # loadable mlx-video checkpoints — together they power the /video generation-model
+        # picker (N28). The picker sets the backend's active checkpoint at runtime.
+        self._video = video
+        self._video_dirs = [Path(d) for d in (model_dirs or [])]
         self._app = None
         self._pending: dict[str, asyncio.Future] = {}
         # Per-chat model override, set via the /models inline-keyboard picker. Takes
@@ -189,6 +214,7 @@ class TelegramGateway:
         app = Application.builder().token(self._token).build()
         app.add_handler(CommandHandler("start", self._on_start))
         app.add_handler(CommandHandler("models", self._on_models))
+        app.add_handler(CommandHandler("video", self._on_video))
         app.add_handler(CallbackQueryHandler(self._on_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self._on_voice))
@@ -197,7 +223,11 @@ class TelegramGateway:
         # this the user can't discover /models. Non-fatal if the API call fails.
         try:
             await app.bot.set_my_commands(
-                [("start", "Show status and usage"), ("models", "Pick the chat model")]
+                [
+                    ("start", "Show status and usage"),
+                    ("models", "Pick the chat model"),
+                    ("video", "Pick the video-generation model"),
+                ]
             )
         except Exception:
             log.warning("could not register Telegram command menu", exc_info=True)
@@ -256,7 +286,8 @@ class TelegramGateway:
             )
             return
         await update.message.reply_text(
-            "Ready. Send me a message. Use /models to switch the chat model."
+            "Ready. Send me a message. Use /models to switch the chat model, "
+            "/video to pick the video-generation model."
         )
 
     async def _on_models(self, update: "Update", context) -> None:
@@ -276,6 +307,40 @@ class TelegramGateway:
         ]
         await update.message.reply_text(
             "Pick the chat model:", reply_markup=InlineKeyboardMarkup(rows)
+        )
+
+    def _video_catalog(self):
+        # Loadable mlx-video checkpoints across the configured model dirs (cheap filesystem
+        # scan). Only converted-MLX Wan/LTX dirs qualify, so the picker never offers a model
+        # that would fail at generation time. Stable order → a button index resolves on tap.
+        from assistant.models.mlx_discovery import discover_video_checkpoints
+
+        return discover_video_checkpoints(self._video_dirs)
+
+    async def _on_video(self, update: "Update", context) -> None:
+        if not await self._ensure_allowed(update):
+            return
+        if self._video is None or not self._video.available():
+            await update.message.reply_text(
+                "Video generation is unavailable (install mlx-video on the backend)."
+            )
+            return
+        catalog = self._video_catalog()
+        if not catalog:
+            await update.message.reply_text(
+                "No video-generation model found. Place a converted-MLX Wan/LTX checkpoint "
+                "(e.g. Wan2.2-TI2V-5B-mlx) in a model dir."
+            )
+            return
+        current = self._video.checkpoint
+        rows = [
+            [InlineKeyboardButton(
+                f"{'● ' if _same_path(m.path, current) else '○ '}{m.id}",
+                callback_data=f"vchk:{i}")]
+            for i, m in enumerate(catalog)
+        ]
+        await update.message.reply_text(
+            "Pick the video-generation model:", reply_markup=InlineKeyboardMarkup(rows)
         )
 
     async def _on_message(self, update: "Update", context) -> None:
@@ -373,6 +438,9 @@ class TelegramGateway:
         if data.startswith("model:"):  # a /models picker tap, not an approval
             await self._apply_model_choice(query)
             return
+        if data.startswith("vchk:"):  # a /video picker tap
+            await self._apply_video_choice(query)
+            return
         decision, _, token = data.partition(":")
         future = self._pending.get(token)
         if future and not future.done():
@@ -397,6 +465,24 @@ class TelegramGateway:
         self._selected_model[query.message.chat.id] = chosen
         try:
             await query.edit_message_text(f"✅ Model set to {chosen}")
+        except Exception:
+            pass
+
+    async def _apply_video_choice(self, query) -> None:
+        # Resolve the button index back to a checkpoint (re-scan: same stable order as
+        # _on_video) and point the shared video backend at it. Global, not per-chat:
+        # generation is heavy and runs one at a time, so a per-chat checkpoint adds no value.
+        _, _, idx = (query.data or "").partition(":")
+        catalog = self._video_catalog()
+        try:
+            chosen = catalog[int(idx)]
+        except (ValueError, IndexError):
+            await query.edit_message_text("That video model is no longer available.")
+            return
+        if self._video is not None:
+            self._video.set_checkpoint(chosen.path)
+        try:
+            await query.edit_message_text(f"✅ Video model set to {chosen.id}")
         except Exception:
             pass
 

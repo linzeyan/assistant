@@ -8,6 +8,8 @@ from assistant.models.mlx_discovery import (
     discover_hf_cache,
     discover_local,
     discover_models,
+    discover_video_checkpoints,
+    is_video_checkpoint,
 )
 
 
@@ -137,3 +139,62 @@ def test_classify_kind_video_via_wan_class_name(tmp_path):
     d.mkdir()
     (d / "config.json").write_text(json.dumps({"_class_name": "WanModel_S2V"}))
     assert classify_kind(d) == "video"
+
+
+def test_classify_kind_omni_with_vae_is_not_chattable(tmp_path):
+    # Lance-3B-Video declares model_type qwen2_5_vl (would read as vlm = chattable) but ships a
+    # diffusion vae.safetensors — it's an omni gen model mlx-vlm can't load. The vae is the
+    # signal to keep it OUT of the chat picker (N32); without it, picking it dumped 1606 weights.
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "config.json").write_text(
+        json.dumps({"architectures": ["Qwen2_5_VLForConditionalGeneration"],
+                    "model_type": "qwen2_5_vl", "vision_config": {}})
+    )
+    (d / "vae.safetensors").write_bytes(b"\x00")
+    assert classify_kind(d) == "video"  # not "vlm" → excluded from the chat list
+
+
+def _make_video_ckpt(d: Path, *, dual: bool = False, t5: bool = True, vae: bool = True) -> Path:
+    """A converted-MLX Wan checkpoint: config + vae + t5_encoder + transformer weight(s)."""
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.json").write_text(json.dumps({"model_type": "ti2v"}))
+    if vae:
+        (d / "vae.safetensors").write_bytes(b"\x00")
+    if t5:
+        (d / "t5_encoder.safetensors").write_bytes(b"\x00")
+    if dual:
+        (d / "low_noise_model.safetensors").write_bytes(b"\x00")
+        (d / "high_noise_model.safetensors").write_bytes(b"\x00")
+    else:
+        (d / "model.safetensors").write_bytes(b"\x00")
+    return d
+
+
+def test_is_video_checkpoint_requires_converted_layout(tmp_path):
+    assert is_video_checkpoint(_make_video_ckpt(tmp_path / "single"))
+    assert is_video_checkpoint(_make_video_ckpt(tmp_path / "dual", dual=True))
+    # Missing any required component → not loadable by mlx-video.
+    assert not is_video_checkpoint(_make_video_ckpt(tmp_path / "no_t5", t5=False))
+    assert not is_video_checkpoint(_make_video_ckpt(tmp_path / "no_vae", vae=False))
+
+
+def test_discover_video_checkpoints_excludes_raw_hf_dir(tmp_path):
+    # A converted-MLX dir is loadable; a raw HF Wan download (model_type ti2v but only
+    # diffusion_pytorch_model-* weights, no vae/t5_encoder) classifies as video yet mlx-video
+    # cannot load it — the picker must offer only the converted one.
+    primary = tmp_path / "primary"
+    _make_video_ckpt(primary / "Wan2.2-TI2V-5B-mlx")
+    raw = primary / "Wan2.2-TI2V-5B"
+    raw.mkdir(parents=True)
+    (raw / "config.json").write_text(json.dumps({"model_type": "ti2v"}))
+    (raw / "diffusion_pytorch_model-00001-of-00003.safetensors").write_bytes(b"\x00")
+    found = discover_video_checkpoints([primary])
+    assert [m.id for m in found] == ["Wan2.2-TI2V-5B-mlx"]
+
+
+def test_discover_video_checkpoints_dedupes_across_dirs(tmp_path):
+    _make_video_ckpt(tmp_path / "a" / "Wan-mlx")
+    _make_video_ckpt(tmp_path / "b" / "Wan-mlx")  # same id in a second dir
+    found = discover_video_checkpoints([tmp_path / "a", tmp_path / "b"])
+    assert [m.id for m in found] == ["Wan-mlx"]  # first dir wins, no duplicate

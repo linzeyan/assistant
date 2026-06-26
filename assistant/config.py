@@ -152,6 +152,12 @@ class Settings(BaseSettings):
     # --- video generation ---
     video_model: str = "wan"  # mlx-video pipeline: "wan" (wan_2) or "ltx" (ltx_2)
     video_dir: Path = XDG_DATA_DIR / "videos"
+    # Local converted-MLX checkpoint dir for video gen (mlx-video's `model_dir`). Unlike image
+    # gen (mflux resolves an alias internally), Wan/LTX must be pointed at an on-disk checkpoint
+    # — unset → generate_video returns a clear "set video_checkpoint" error. Picking this from
+    # discovered models is the next sprint's job (N28); for now it's an explicit path, e.g.
+    # .../Wan-AI/Wan2.2-TI2V-5B-mlx.
+    video_checkpoint: Path | None = None
 
     # --- telegram (wired in a later phase) ---
     telegram_token: str | None = None

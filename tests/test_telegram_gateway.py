@@ -2,7 +2,11 @@ import asyncio
 from unittest.mock import AsyncMock, Mock
 
 from assistant.gateway.approval import TelegramApprover
-from assistant.gateway.telegram import TelegramGateway, _render_telegram_html
+from assistant.gateway.telegram import (
+    TelegramGateway,
+    _clip_error,
+    _render_telegram_html,
+)
 from assistant.models.types import ModelInfo
 from assistant.tools.base import Tool
 
@@ -45,7 +49,27 @@ class _FakeAudio:
         return p
 
 
-def _gateway(allowed=None, models=None, default=None, audio=None) -> TelegramGateway:
+class _FakeVideo:
+    def __init__(self, available=True, checkpoint=None):
+        self._available = available
+        self._checkpoint = checkpoint
+        self.set_to = "UNSET"
+
+    def available(self):
+        return self._available
+
+    @property
+    def checkpoint(self):
+        return self._checkpoint
+
+    def set_checkpoint(self, p):
+        self._checkpoint = p
+        self.set_to = p
+
+
+def _gateway(
+    allowed=None, models=None, default=None, audio=None, video=None, model_dirs=None
+) -> TelegramGateway:
     return TelegramGateway(
         token="x",
         allowed_users=allowed or [],
@@ -54,7 +78,19 @@ def _gateway(allowed=None, models=None, default=None, audio=None) -> TelegramGat
         model_service=_FakeModels(models or []),
         default_model=default,
         audio=audio,
+        video=video,
+        model_dirs=model_dirs,
     )
+
+
+def _make_mlx_video_ckpt(d):
+    import json
+
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.json").write_text(json.dumps({"model_type": "ti2v"}))
+    for f in ("vae.safetensors", "t5_encoder.safetensors", "model.safetensors"):
+        (d / f).write_bytes(b"\x00")
+    return d
 
 
 # --- allowlist (deny by default) ---
@@ -176,6 +212,56 @@ def test_render_escapes_stray_angle_brackets():
     # A bare < in prose must be escaped or Telegram rejects the whole message.
     out = _render_telegram_html("compare a < b")
     assert "&lt;" in out and "<blockquote" not in out
+
+
+def test_video_catalog_lists_only_loadable_checkpoints(tmp_path):
+    # The /video picker offers a converted-MLX checkpoint but NOT a raw HF Wan dir (model_type
+    # ti2v yet no vae/t5_encoder) — that would classify as video but fail at generation time.
+    import json
+
+    _make_mlx_video_ckpt(tmp_path / "Wan2.2-TI2V-5B-mlx")
+    raw = tmp_path / "Wan2.2-TI2V-5B"
+    raw.mkdir()
+    (raw / "config.json").write_text(json.dumps({"model_type": "ti2v"}))
+    (raw / "diffusion_pytorch_model-00001.safetensors").write_bytes(b"\x00")
+    gw = _gateway(video=_FakeVideo(), model_dirs=[tmp_path])
+    assert [m.id for m in gw._video_catalog()] == ["Wan2.2-TI2V-5B-mlx"]
+
+
+async def test_apply_video_choice_points_backend_at_checkpoint(tmp_path):
+    ckpt = _make_mlx_video_ckpt(tmp_path / "Wan-mlx")
+    video = _FakeVideo()
+    gw = _gateway(video=video, model_dirs=[tmp_path])
+    query = Mock()
+    query.data = "vchk:0"
+    query.edit_message_text = AsyncMock()
+    await gw._apply_video_choice(query)
+    assert video.set_to == ckpt  # backend now points at the chosen checkpoint
+    query.edit_message_text.assert_awaited()
+
+
+async def test_apply_video_choice_handles_stale_index(tmp_path):
+    video = _FakeVideo()
+    gw = _gateway(video=video, model_dirs=[tmp_path])  # empty dir → no checkpoints
+    query = Mock()
+    query.data = "vchk:0"
+    query.edit_message_text = AsyncMock()
+    await gw._apply_video_choice(query)
+    assert video.set_to == "UNSET"  # nothing applied
+    query.edit_message_text.assert_awaited_with("That video model is no longer available.")
+
+
+def test_clip_error_caps_runaway_dump():
+    # A model-load ValueError can list hundreds of weight names (Lance-3B-Video dumped
+    # 1606); the reply must stay short, not become a multi-KB key dump.
+    short = "model failed to load: bad arch"
+    assert _clip_error(short) == short  # normal errors pass through untouched
+    runaway = "Received 1606 parameters not in model: " + ", ".join(
+        f"blocks.{i}.attn.qkv.weight" for i in range(400)
+    )
+    clipped = _clip_error(runaway)
+    assert len(clipped) <= 510 and clipped.endswith("[…]")
+    assert clipped.startswith("Received 1606 parameters")
 
 
 # --- interactive approver ---

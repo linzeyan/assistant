@@ -103,6 +103,16 @@ def classify_kind(d: Path) -> str:
     # "No safetensors found" (weights are diffusion_pytorch_model-*, not LM format).
     if mtype in _VIDEO_TYPES or "wan" in cls_name or "video" in cls_name:
         return "video"
+    # A chat-arch config (Qwen-VL / causal-LM) that ALSO ships a diffusion VAE is really a
+    # generation / "omni" checkpoint, not a clean chat model — e.g. Lance-3B-Video declares
+    # model_type qwen2_5_vl but carries extra generation heads + a vae.safetensors that
+    # mlx-vlm's stock class can't load; picked as a chat model it dumped 1606 mismatched
+    # weights (N32). A normal mlx chat VLM never bundles a diffusion VAE, so this file is a
+    # safe signal to keep such models OUT of the chat picker (only mlx-loadable chat models
+    # belong there). It isn't a loadable mlx-video checkpoint either (no t5_encoder), so the
+    # /video picker's is_video_checkpoint filter excludes it too.
+    if (d / "vae.safetensors").is_file():
+        return "video"
     # Vision-language first: a VL config also carries a causal-LM head, so it would
     # otherwise read as a plain LLM. ``vision_config`` is the strongest signal.
     if (
@@ -141,6 +151,37 @@ def discover_local(models_dir: Path) -> list[DiscoveredModel]:
                         classify_kind(sub), _dir_size(sub),
                     )
                 )
+    return found
+
+
+def is_video_checkpoint(d: Path) -> bool:
+    """True if ``d`` is a *converted-MLX* Wan/LTX checkpoint that mlx-video can actually load.
+
+    A "video"-kind dir is not enough: the raw HuggingFace download (``Wan2.2-TI2V-5B`` with
+    ``diffusion_pytorch_model-*.safetensors`` + ``Wan2.x_VAE.pth``) classifies as video but
+    mlx-video CANNOT load it — only the converted layout can. That layout always carries a
+    ``vae.safetensors`` + ``t5_encoder.safetensors`` plus at least one transformer weight
+    (``model.safetensors`` for single-model, ``low_noise_model.safetensors`` for dual). This
+    structural check keeps unloadable raw dirs out of the generation picker (N28).
+    """
+    d = Path(d)
+    if not (d / "vae.safetensors").is_file() or not (d / "t5_encoder.safetensors").is_file():
+        return False
+    return (d / "model.safetensors").is_file() or (d / "low_noise_model.safetensors").is_file()
+
+
+def discover_video_checkpoints(dirs: list[Path]) -> list[DiscoveredModel]:
+    """Loadable mlx-video checkpoints across the given model dirs (flat + org/<model>
+    layouts, via discover_local), deduped by id with earlier dirs winning. Only converted-MLX
+    dirs qualify (see is_video_checkpoint), so the Telegram /video picker never offers a raw
+    HF Wan dir that would fail at generation time."""
+    found: list[DiscoveredModel] = []
+    seen: set[str] = set()
+    for base in dirs:
+        for m in discover_local(base):
+            if m.kind == "video" and m.id not in seen and is_video_checkpoint(m.path):
+                found.append(m)
+                seen.add(m.id)
     return found
 
 

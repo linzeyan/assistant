@@ -27,7 +27,7 @@ images = ["mflux>=0.18,<1.0"]          # FLUX image generation + Qwen-Image-Edit
 embeddings = ["mlx-embeddings>=0.0.1,<1.0"]  # semantic memory search
 vlm = ["mlx-vlm>=0.1,<1.0"]            # vision-language (read images)
 audio = ["mlx-audio>=0.2,<1.0"]        # speech-to-text + text-to-speech
-video = ["mlx-video>=0.0.1,<1.0"]      # text-to-video (Wan / LTX)
+video = ["mlx-video @ git+https://github.com/Blaizzy/mlx-video.git"]  # text-to-video (Wan / LTX) — Blaizzy's MLX gen lib; the identically-named PyPI package is an unrelated I/O lib
 # Everything the app manages, in one install (recursive extra). `make install`.
 all = ["assistant[mlx,images,embeddings,vlm,audio,video]"]
 dev = [
@@ -41,6 +41,11 @@ assistant-server = "assistant.main:run"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# The [video] extra pins Blaizzy's mlx-video by git URL (the PyPI name is an unrelated
+# I/O lib); hatchling rejects direct references in dependencies unless this is opted in.
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["assistant"]

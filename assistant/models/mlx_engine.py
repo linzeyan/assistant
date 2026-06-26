@@ -210,7 +210,24 @@ def _load_vlm(path: Path) -> VlmChatEngine:
             'this is a vision-language model; install mlx-vlm to chat with it: '
             'uv pip install -e ".[vlm]"'
         ) from exc
-    model, processor = load(str(path))
+    try:
+        model, processor = load(str(path))
+    except Exception as exc:
+        # mlx-vlm loads weights strictly: a checkpoint whose architecture doesn't match
+        # mlx-vlm's class for its model_type raises a ValueError that lists EVERY mismatched
+        # weight — hundreds of names (e.g. Lance-3B-Video, a custom "omni" understand+generate
+        # variant declaring model_type qwen2_5_vl but carrying extra gen heads/VAE bridges the
+        # stock class lacks). Collapse it to a one-line, actionable error so the gateway/GUI
+        # shows a usable message instead of a multi-KB key dump; the full detail stays in the
+        # backend log via the caller's log.exception.
+        head = next((ln.strip() for ln in str(exc).splitlines() if ln.strip()), "") or type(
+            exc
+        ).__name__
+        raise RuntimeError(
+            f"this vision-language model failed to load — its checkpoint doesn't match "
+            f"mlx-vlm's architecture ({head}). It's likely a custom or unsupported variant; "
+            f"pick a standard chat model instead."
+        ) from exc
     return VlmChatEngine(model, processor)
 
 

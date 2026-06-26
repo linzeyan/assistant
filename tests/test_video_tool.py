@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from assistant.models.mlx_video import _valid_num_frames
 from assistant.tools import build_registry
 from assistant.tools.base import ToolContext
 
@@ -45,3 +46,13 @@ async def test_generate_video_no_backend(tmp_path):
     ctx = ToolContext(cwd=tmp_path)  # video=None
     res = await _tool().handler({"prompt": "x"}, ctx)
     assert not res.ok and "unavailable" in res.content
+
+
+def test_valid_num_frames_rounds_to_4n_plus_1():
+    # Wan/LTX assert (num_frames - 1) % 4 == 0; a free-form request must be coerced to a
+    # valid count, not crash the whole generation on a bad number the model happened to pick.
+    assert _valid_num_frames(81) == 81  # already valid (4*20 + 1) → unchanged
+    assert _valid_num_frames(48) == 45  # rounds down to the nearest 4n+1
+    assert _valid_num_frames(1) == 5  # clamped up to the minimum sane count
+    for n in range(5, 200):
+        assert (_valid_num_frames(n) - 1) % 4 == 0  # always lands on a valid count
