@@ -83,6 +83,18 @@ async def chat(req: ChatRequest, request: Request):
         except Exception as exc:  # stream the error instead of dropping the connection
             log.exception("chat turn failed: session=%s", session.id)
             yield _sse({"type": "error", "detail": str(exc)})
+            # Persist even a failed turn so the conversation — and the user's message — doesn't
+            # vanish from the session list (#4). The turn added the user message before any
+            # exception, so there's real content to keep. Best-effort: a checkpoint failure
+            # here must not re-break an already-failed turn.
+            try:
+                await asyncio.to_thread(store.checkpoint, session)
+                log.info(
+                    "failed turn checkpointed: session=%s msgs=%d",
+                    session.id, len(session.messages),
+                )
+            except Exception:
+                log.exception("checkpoint after failed turn failed: session=%s", session.id)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

@@ -21,6 +21,7 @@ from assistant.agent.loop import AgentLoop
 from assistant.downloads import DownloadManager
 from assistant.gateway import lifecycle as gateway_lifecycle
 from assistant.agent.session import SessionStore
+from assistant.agent.trace import TraceStore
 from assistant.api import (
     routes_audio,
     routes_chat,
@@ -33,6 +34,7 @@ from assistant.api import (
     routes_setup,
     routes_skills,
     routes_status,
+    routes_traces,
     routes_video,
     routes_vision,
 )
@@ -191,6 +193,10 @@ async def lifespan(app: FastAPI):
     # P2 hook seam: empty registry exposed on app.state for in-process extensions to register.
     hooks = HookRegistry()
     app.state.hooks = hooks
+    # P0 per-turn trace (spring2): records each turn so reliability failures are visible
+    # (GET /sessions/{id}/turns, /turns/{id}). Off → memory-only store, no disk writes.
+    trace_store = TraceStore(settings.trace_dir if settings.trace_enabled else None)
+    app.state.trace_store = trace_store
     app.state.agent = AgentLoop(
         llm,
         registry,
@@ -201,6 +207,7 @@ async def lifespan(app: FastAPI):
         approval_rules=approval_rules,
         approval_ask_once=settings.approval_ask_once,
         hooks=hooks,
+        trace_store=trace_store,
     )
 
     # Start the model backend. Non-fatal: a missing backend (no omlx / no mlx-lm)
@@ -266,6 +273,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(routes_config.router)
     app.include_router(routes_chat.router)
     app.include_router(routes_sessions.router)
+    app.include_router(routes_traces.router)
     app.include_router(routes_skills.router)
     app.include_router(routes_memory.router)
     app.include_router(routes_images.router)

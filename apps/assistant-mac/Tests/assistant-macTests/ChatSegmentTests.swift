@@ -46,4 +46,19 @@ struct ChatSegmentTests {
             parseSegments("<tool_call>tc</tool_call><think>th</think>")
                 == [.toolCall("tc"), .think("th")])
     }
+
+    @Test func orphanedClosingThinkIsTreatedAsLeadingThink() {
+        // Qwen3.x emits </think> with no opening <think> (the template injected the opener).
+        // The reasoning must collapse, not leak its </think> markup into the answer.
+        #expect(
+            parseSegments("reasoning text</think>the answer")
+                == [.think("reasoning text"), .prose("the answer")])
+    }
+
+    @Test func realOpeningThinkStillWinsOverLaterClose() {
+        // A normal paired <think>…</think> must NOT trigger the orphan path.
+        #expect(
+            parseSegments("<think>r</think>a")
+                == [.think("r"), .prose("a")])
+    }
 }

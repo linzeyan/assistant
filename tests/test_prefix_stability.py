@@ -1,6 +1,7 @@
 """Prefix stability (spring1 S2+S3): the system prompt is a byte-stable cacheable prefix,
-and per-turn memory rides the user turn instead of mutating that prefix. These tests guard
-the WHY — on-device every cache miss re-prefills the whole prompt — not just the mechanics.
+and per-turn context (memory, current date) rides the user turn instead of mutating that
+prefix. These tests guard the WHY — on-device every cache miss re-prefills the whole prompt
+— not just the mechanics.
 """
 
 import logging
@@ -73,12 +74,17 @@ async def test_memory_rides_user_turn_not_system(tmp_path):
     assert stored_user["content"] == "hello"
 
 
-async def test_no_memory_leaves_user_turn_clean(tmp_path):
+async def test_no_memory_injects_date_only_not_memory(tmp_path):
+    # The current date ALWAYS rides the user turn (the local-model "what day is it" fix);
+    # with no memory configured, nothing else is added, and neither touches the prefix.
     llm = CapturingLLM()
     await _run(_loop(llm, tmp_path, memory=None), Session(id="s2"), "hello")
     sent = llm.calls[0]
-    assert _last_user(sent) == "hello"
-    assert "<memory-context" not in _system(sent)
+    user = _last_user(sent)
+    assert "hello" in user  # original text preserved
+    assert "<memory-context" not in user  # no memory configured → none injected
+    assert "<current-datetime" in user  # date rides the user turn...
+    assert "<current-datetime" not in _system(sent)  # ...never the cacheable prefix
 
 
 async def test_system_prefix_byte_stable_across_turns(tmp_path, caplog):

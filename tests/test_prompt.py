@@ -1,0 +1,34 @@
+"""System-prompt assembly + send-time reference blocks (date / memory).
+
+The date block fixes local models hallucinating "today" from their training cutoff. It must
+ride the user turn, NEVER the cacheable system prefix (S3) — pinned here."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from assistant.agent.prompt import (
+    build_system_prompt,
+    wrap_datetime_context,
+    wrap_memory_context,
+)
+
+
+def test_datetime_context_includes_date_and_weekday():
+    now = datetime(2026, 6, 26, 14, 30, tzinfo=timezone.utc)
+    block = wrap_datetime_context(now)
+    assert "2026-06-26" in block
+    assert now.strftime("%A") in block  # weekday, so the model can reason about recency
+    assert block.startswith("<current-datetime")
+
+
+def test_system_prompt_has_no_date():
+    # The date must NOT live in the system prompt — that would break the byte-stable,
+    # cacheable prefix (a fresh fingerprint every minute → KV-cache miss every turn).
+    p = build_system_prompt("(skills index)")
+    assert "current-datetime" not in p
+    assert "2026" not in p
+
+
+def test_memory_context_is_reference_only_block():
+    assert wrap_memory_context("a fact").startswith("<memory-context reference-only>")

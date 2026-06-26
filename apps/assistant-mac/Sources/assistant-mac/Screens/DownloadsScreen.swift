@@ -39,6 +39,9 @@ struct DownloadsScreen: View {
                     systemImage: "arrow.down.circle",
                     description: Text("Enter a repo id above to fetch a model into the local cache.")
                 )
+                // Fill the area so the placeholder centres, matching the Memory screen
+                // (without this it's pinned to the top by the outer .top alignment).
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(downloads) { item in
                     VStack(alignment: .leading, spacing: 4) {

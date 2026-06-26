@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import pytest
+
 from assistant.models import mlx_engine
-from assistant.models.mlx_engine import MlxEnginePool
+from assistant.models.mlx_engine import (
+    MlxEnginePool,
+    _messages_for_template,
+    _render_prompt,
+)
 
 
 class FakeEngine:
@@ -89,3 +96,63 @@ async def test_eviction_releases_mlx_memory(monkeypatch):
     await pool.acquire("a", Path("/a"))
     await pool.acquire("b", Path("/b"))  # evicts "a"
     assert calls["n"] >= 1
+
+
+# --- chat-template tool_calls rendering (the "web search just fails" root cause) ---
+
+
+def _msg_with_args(arguments):
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "web_search", "arguments": arguments}}
+        ],
+    }
+
+
+def _items_templater(messages, tools=None, add_generation_prompt=True, tokenize=False):
+    """Mimics a Qwen3.x template: it iterates each tool call's arguments with jinja
+    ``| items``, which raises on a string and only accepts a mapping."""
+    for m in messages:
+        for tc in m.get("tool_calls") or []:
+            if not isinstance(tc["function"]["arguments"], dict):
+                raise TypeError("Can only get item pairs from a mapping.")
+    return "RENDERED"
+
+
+def test_messages_for_template_parses_string_args_to_dict():
+    msgs = [_msg_with_args(json.dumps({"query": "lua http"}))]
+    out = _messages_for_template(msgs)
+    assert out[0]["tool_calls"][0]["function"]["arguments"] == {"query": "lua http"}
+    # Copy-on-write: the persisted history stays string-typed (OpenAI wire format).
+    assert isinstance(msgs[0]["tool_calls"][0]["function"]["arguments"], str)
+
+
+def test_messages_for_template_preserves_unparseable_args():
+    msgs = [_msg_with_args("not json")]
+    out = _messages_for_template(msgs)
+    assert out[0]["tool_calls"][0]["function"]["arguments"] == "not json"
+
+
+def test_render_prompt_normalizes_for_items_template():
+    # The actual bug: string args + an `| items` template = TypeError. Normalisation fixes it.
+    msgs = [_msg_with_args(json.dumps({"query": "lua http"}))]
+    assert _render_prompt(_items_templater, msgs, tools=[{"x": 1}]) == "RENDERED"
+
+
+def test_render_prompt_falls_back_when_tokenizer_rejects_tools_kwarg():
+    def picky(messages, add_generation_prompt=True, tokenize=False):  # no `tools` param
+        return "RENDERED"
+
+    # First call passes tools= -> TypeError mentioning 'tools' -> retried without it.
+    assert _render_prompt(picky, [_msg_with_args("{}")], tools=[{"x": 1}]) == "RENDERED"
+
+
+def test_render_prompt_surfaces_real_template_error():
+    def always_fail(messages, tools=None, add_generation_prompt=True, tokenize=False):
+        raise TypeError("Can only get item pairs from a mapping.")
+
+    # A template error unrelated to the tools kwarg must NOT be swallowed by a no-tools retry.
+    with pytest.raises(TypeError, match="mapping"):
+        _render_prompt(always_fail, [_msg_with_args("{}")], tools=[{"x": 1}])

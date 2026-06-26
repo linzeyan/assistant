@@ -12,6 +12,8 @@ current user turn via ``wrap_memory_context`` so dynamic context can't perturb t
 
 from __future__ import annotations
 
+from datetime import datetime
+
 _BASE = """You are a local-first AI coding assistant running on the user's Mac.
 
 You have tools to read/write/edit files, run shell commands, search code, search the \
@@ -19,10 +21,14 @@ web and fetch pages, manage skills, and store/recall long-term memory. Prefer us
 tools over guessing.
 
 Current / external information:
+- The current date is provided with each user message — use it; do not guess the date \
+from your training data.
 - For anything time-sensitive or outside your training data (weather, news, prices, \
-live docs, recent events), use web_search to find sources, then fetch_url to read one, \
-before answering. Do NOT claim you can't access the internet or lack a weather tool — \
-look it up with web_search.
+live docs, recent events), use web_search to find sources, then fetch_url to read the \
+most relevant one before answering. Search snippets are often stale or cached — for live \
+values (prices, scores, today's figures) do NOT answer from the snippets alone; fetch_url \
+the page to confirm. Do NOT claim you can't access the internet or lack a weather tool — \
+look it up.
 
 Self-improvement:
 - After solving a non-trivial, reusable task, consider saving the procedure as a \
@@ -45,3 +51,14 @@ def wrap_memory_context(memory_block: str) -> str:
     """Wrap prefetched memory as a reference-only block to ride the *current user turn*
     (never the system prompt), so dynamic memory can't perturb the cacheable prefix."""
     return f"<memory-context reference-only>\n{memory_block}\n</memory-context>"
+
+
+def wrap_datetime_context(now: datetime) -> str:
+    """Current date/time as a reference block that rides the *current user turn*, never the
+    system prompt (which must stay a byte-stable cacheable prefix, S3). Local models have no
+    clock and otherwise hallucinate the date from their training cutoff, so "today's …"
+    queries can't be reasoned about — or searched with a correct time frame — without it."""
+    return (
+        f"<current-datetime reference-only>\n{now:%Y-%m-%d %H:%M %Z} ({now:%A})\n"
+        "</current-datetime>"
+    )

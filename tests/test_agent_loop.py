@@ -161,3 +161,36 @@ async def test_forwards_max_output_tokens_to_llm(tmp_path):
     )
     await _collect(loop.run(Session(id="mt"), "hello", "m"))
     assert captured.get("max_tokens") == 2048
+
+
+async def test_injects_current_date_into_user_turn(tmp_path):
+    """A local model has no clock; the current date rides the latest user message (not the
+    system prompt) so 'today' isn't hallucinated from the training cutoff. Verified by
+    capturing exactly what reaches the engine."""
+    captured: dict = {}
+
+    class CapturingLLM:
+        def stream_chat(self, messages, model, tools=None, **params):
+            captured["messages"] = messages
+
+            async def gen():
+                yield {"type": "text", "content": "ok"}
+
+            return gen()
+
+    loop = AgentLoop(
+        CapturingLLM(),
+        build_registry(),
+        PolicyApprover(approval_required=False),
+        ToolContext(cwd=tmp_path),
+    )
+    session = Session(id="d1")
+    await _collect(loop.run(session, "今天美股狀況", "m"))
+
+    last_user = [m for m in captured["messages"] if m["role"] == "user"][-1]
+    assert "current-datetime" in last_user["content"]
+    assert "今天美股狀況" in last_user["content"]  # original text preserved
+    # Stored history stays clean — injection is send-time only.
+    assert any(
+        m.get("role") == "user" and m["content"] == "今天美股狀況" for m in session.messages
+    )

@@ -84,6 +84,12 @@ class Settings(BaseSettings):
     skills_dir: Path = XDG_DATA_DIR / "skills"
     memory_dir: Path = XDG_DATA_DIR / "memory"
     sessions_dir: Path = XDG_DATA_DIR / "sessions"  # persisted conversations (S1)
+    # Per-turn trace (spring2 P0): record each turn (model text + parsed calls + tool
+    # results) so "local-model turns don't always succeed" becomes a scannable, debuggable
+    # list instead of a vibe. Records only — fixes nothing (measure-before-fix). Toggle off
+    # to skip the per-turn disk writes.
+    trace_enabled: bool = True
+    trace_dir: Path = XDG_DATA_DIR / "traces"
     audio_dir: Path = XDG_DATA_DIR / "audio"
 
     # --- logging ---

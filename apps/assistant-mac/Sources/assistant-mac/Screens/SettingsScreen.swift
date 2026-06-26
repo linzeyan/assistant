@@ -43,6 +43,33 @@ struct SettingsScreen: View {
     private let labelWidth: CGFloat = 150
 
     var body: some View {
+        // Split into tabs (B1): the single Form had grown to ~11 sections. Grouping by
+        // concern — Backend / Agent / Gateways / Advanced — keeps each screen scannable.
+        // load() + the preflight poll live on the TabView so every tab shares one refresh.
+        TabView {
+            backendTab.tabItem { Label("Backend", systemImage: "server.rack") }
+            agentTab.tabItem { Label("Agent", systemImage: "brain") }
+            gatewaysTab.tabItem {
+                Label("Gateways", systemImage: "antenna.radiowaves.left.and.right")
+            }
+            advancedTab.tabItem { Label("Advanced", systemImage: "slider.horizontal.3") }
+        }
+        .padding()
+        .task { await load() }
+        // Poll preflight only while reachable so the Advanced tab's Managed tools / Data
+        // paths reflect live install state; the bootstrap panel drives the unreachable case.
+        .task(id: controller.reachable) {
+            guard controller.reachable else { return }
+            while !Task.isCancelled {
+                await refreshPreflight()
+                try? await Task.sleep(for: .seconds(3))
+            }
+        }
+    }
+
+    // MARK: - Tabs
+
+    private var backendTab: some View {
         Form {
             // On a clean machine the backend isn't up yet — lead with the bootstrap panel
             // (install uv → create venv → install wheel) instead of dead connection fields.
@@ -69,8 +96,6 @@ struct SettingsScreen: View {
                     + "(e.g. Homebrew). Restart to apply.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
-
-            managedTools
 
             Section("Backend connection") {
                 fieldRow("Backend URL", placeholder: "http://127.0.0.1:9981", text: $draft)
@@ -110,6 +135,36 @@ struct SettingsScreen: View {
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
+            Section("Backend runtime") {
+                // The two rows that answer "where is my server and its environment?" —
+                // always accurate, derived from what's actually launched.
+                resolvedRow("Backend executable", value: backendExe)
+                resolvedRow("Environment (venv)", value: inUseVenv)
+                // uv / Python only matter when bootstrapping a managed venv on a clean
+                // (thin-app) install — irrelevant to a dev checkout, so keep them folded
+                // away rather than cluttering the common case.
+                DisclosureGroup("Advanced — packaged-install setup") {
+                    pathRow("Managed venv", placeholder: resolvedVenv, text: $venvPath, directories: true)
+                    pathRow("uv", placeholder: resolvedUv, text: $uvPath, directories: false)
+                    HStack(spacing: 10) {
+                        Text("Python version").foregroundStyle(.secondary)
+                            .frame(width: labelWidth, alignment: .leading)
+                        TextField("", text: $pythonVersion, prompt: Text("3.12"))
+                            .textFieldStyle(.roundedBorder).frame(width: 80)
+                        Spacer()
+                    }
+                    Text("These bootstrap the managed venv on a clean (thin-app) install. "
+                        + "A dev checkout runs from its own .venv — shown above. Blank = "
+                        + "auto-detect.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var agentTab: some View {
+        Form {
             Section("Agent") {
                 HStack(spacing: 10) {
                     Text("Max output tokens").foregroundStyle(.secondary)
@@ -126,7 +181,12 @@ struct SettingsScreen: View {
                     + "Applies to the next reply — no restart.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
+        }
+        .formStyle(.grouped)
+    }
 
+    private var gatewaysTab: some View {
+        Form {
             Section("Gateways") {
                 HStack {
                     Text("Telegram").font(.subheadline).bold()
@@ -162,6 +222,13 @@ struct SettingsScreen: View {
                     + "the current one. The allowlist is deny-by-default (empty = nobody).")
                     .font(.caption2).foregroundStyle(.secondary)
             }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var advancedTab: some View {
+        Form {
+            managedTools
 
             Section("Model paths") {
                 // Discovery is a filesystem scan, so every change here applies live — no
@@ -204,45 +271,9 @@ struct SettingsScreen: View {
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
-            Section("Backend runtime") {
-                // The two rows that answer "where is my server and its environment?" —
-                // always accurate, derived from what's actually launched.
-                resolvedRow("Backend executable", value: backendExe)
-                resolvedRow("Environment (venv)", value: inUseVenv)
-                // uv / Python only matter when bootstrapping a managed venv on a clean
-                // (thin-app) install — irrelevant to a dev checkout, so keep them folded
-                // away rather than cluttering the common case.
-                DisclosureGroup("Advanced — packaged-install setup") {
-                    pathRow("Managed venv", placeholder: resolvedVenv, text: $venvPath, directories: true)
-                    pathRow("uv", placeholder: resolvedUv, text: $uvPath, directories: false)
-                    HStack(spacing: 10) {
-                        Text("Python version").foregroundStyle(.secondary)
-                            .frame(width: labelWidth, alignment: .leading)
-                        TextField("", text: $pythonVersion, prompt: Text("3.12"))
-                            .textFieldStyle(.roundedBorder).frame(width: 80)
-                        Spacer()
-                    }
-                    Text("These bootstrap the managed venv on a clean (thin-app) install. "
-                        + "A dev checkout runs from its own .venv — shown above. Blank = "
-                        + "auto-detect.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
-            }
-
             dataPaths
         }
         .formStyle(.grouped)
-        .padding()
-        .task { await load() }
-        // Poll preflight only while reachable so the Managed tools / Data paths sections
-        // reflect live install state; the bootstrap panel drives the unreachable case.
-        .task(id: controller.reachable) {
-            guard controller.reachable else { return }
-            while !Task.isCancelled {
-                await refreshPreflight()
-                try? await Task.sleep(for: .seconds(3))
-            }
-        }
     }
 
     // MARK: - Managed tools + data paths (absorbed from the former Setup tab)

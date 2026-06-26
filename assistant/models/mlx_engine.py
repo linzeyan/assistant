@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import logging
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
@@ -57,6 +58,56 @@ def _release_mlx_memory() -> None:
         )
 
 
+def _messages_for_template(messages: list[dict]) -> list[dict]:
+    """Return messages with assistant tool_calls' ``arguments`` parsed from JSON string to a
+    dict, for chat-template rendering only.
+
+    Sessions persist tool_calls in OpenAI wire format — ``arguments`` is a JSON *string* — but
+    HF chat templates expect a parsed mapping: Qwen3.x iterates it with jinja ``| items``,
+    which raises "Can only get item pairs from a mapping" on a string (the real cause of the
+    "web search just fails" reports). Copy-on-write so the persisted history stays
+    string-typed; a value that doesn't parse is left untouched.
+    """
+    out: list[dict] = []
+    for m in messages:
+        tcs = m.get("tool_calls") if isinstance(m, dict) else None
+        if not tcs:
+            out.append(m)
+            continue
+        new_tcs = []
+        for tc in tcs:
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    parsed = json.loads(args)
+                except (ValueError, TypeError):
+                    new_tcs.append(tc)  # not JSON — leave as-is, template may accept strings
+                    continue
+                new_tcs.append({**tc, "function": {**fn, "arguments": parsed}})
+            else:
+                new_tcs.append(tc)
+        out.append({**m, "tool_calls": new_tcs})
+    return out
+
+
+def _render_prompt(templater, messages: list[dict], tools: list[dict] | None) -> str:
+    """Render the chat prompt, normalising tool_calls first and falling back ONLY when the
+    tokenizer genuinely rejects the ``tools`` kwarg.
+
+    A TypeError from *inside* the template (a message-shape mismatch) must surface — retrying
+    without tools would just fail the same way and mask the real cause. The previous blanket
+    ``except TypeError`` swallowed exactly that, hiding the Qwen3.x tool_calls render bug.
+    """
+    messages = _messages_for_template(messages)
+    try:
+        return templater(messages, tools=tools, add_generation_prompt=True, tokenize=False)
+    except TypeError as exc:
+        if "tools" not in str(exc):  # not the "template doesn't accept tools" case — surface it
+            raise
+        return templater(messages, add_generation_prompt=True, tokenize=False)
+
+
 class MlxEngine:
     """A loaded mlx-lm model + tokenizer that streams text for one chat turn."""
 
@@ -75,15 +126,9 @@ class MlxEngine:
         from mlx_lm import stream_generate
 
         # Passing tools lets the chat template render them in the model's expected
-        # tool-calling format. Older tokenizers reject the kwarg — fall back cleanly.
-        try:
-            prompt = self._tokenizer.apply_chat_template(
-                messages, tools=tools, add_generation_prompt=True, tokenize=False
-            )
-        except TypeError:
-            prompt = self._tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False
-            )
+        # tool-calling format. _render_prompt normalises tool_calls and handles the
+        # tools-kwarg fallback without masking real template errors.
+        prompt = _render_prompt(self._tokenizer.apply_chat_template, messages, tools)
         for response in stream_generate(
             self._model, self._tokenizer, prompt, max_tokens=max_tokens
         ):
@@ -119,12 +164,7 @@ class VlmChatEngine:
         templater = getattr(self._processor, "apply_chat_template", None) or getattr(
             self._processor, "tokenizer"
         ).apply_chat_template
-        try:
-            prompt = templater(
-                messages, tools=tools, add_generation_prompt=True, tokenize=False
-            )
-        except TypeError:  # older processors reject the tools kwarg
-            prompt = templater(messages, add_generation_prompt=True, tokenize=False)
+        prompt = _render_prompt(templater, messages, tools)
         for chunk in stream_generate(
             self._model, self._processor, prompt, max_tokens=max_tokens
         ):

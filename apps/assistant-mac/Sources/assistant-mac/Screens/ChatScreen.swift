@@ -267,6 +267,18 @@ func parseSegments(_ text: String) -> [MessageSegment] {
     ]
     var out: [MessageSegment] = []
     var rest = text[...]
+    // Some reasoning models (Qwen3.x) close their reasoning with </think> but never emit an
+    // opening <think> — the chat template injects the opener into the generation prompt, so
+    // the model only streams "<reasoning></think><answer>". Treat a </think> that precedes
+    // any <think> as an implicit leading think block; otherwise its raw markup leaks into the
+    // visible answer (the orphaned-</think> bug).
+    if let close = rest.range(of: "</think>") {
+        let open = rest.range(of: "<think>")
+        if open == nil || close.lowerBound < open!.lowerBound {
+            out.append(.think(String(rest[rest.startIndex..<close.lowerBound])))
+            rest = rest[close.upperBound...]
+        }
+    }
     while !rest.isEmpty {
         var hit: (start: Substring.Index,
                   kind: (open: String, close: String, make: (String) -> MessageSegment))?

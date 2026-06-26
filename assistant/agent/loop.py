@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator
+from datetime import datetime
 
 from assistant.tools.approval import ApprovalPolicy, Rule, resource_of
 from assistant.tools.base import ToolContext, ToolResult
@@ -12,9 +13,10 @@ from assistant.tools.registry import ToolRegistry
 from .compaction import CompactionManager
 from .hooks import HookRegistry
 from .llm_client import AsyncLLM
-from .prompt import build_system_prompt, wrap_memory_context
+from .prompt import build_system_prompt, wrap_datetime_context, wrap_memory_context
 from .session import Session
 from .tokens import estimate_messages_tokens, estimate_tokens
+from .trace import TraceStep, TraceStore, TurnTrace
 
 log = logging.getLogger("assistant")
 
@@ -43,6 +45,7 @@ class AgentLoop:
         approval_rules: list[Rule] | None = None,
         approval_ask_once: bool = True,
         hooks: HookRegistry | None = None,
+        trace_store: TraceStore | None = None,
     ):
         self._llm = llm
         self._registry = registry
@@ -51,6 +54,9 @@ class AgentLoop:
         self._max_iters = max_iters
         self._compaction = compaction
         self._max_output_tokens = max_output_tokens
+        # Per-turn trace (spring2 P0): None = off. Recording is a side-channel — it never
+        # changes the events yielded to the caller.
+        self._trace = trace_store
         # In-process hook seam (P2); empty registry by default so every fire is a no-op.
         self._hooks = hooks or HookRegistry()
         # Wildcard permission rules (S5), layered over whichever approver a run uses. The
@@ -91,93 +97,135 @@ class AgentLoop:
         await self._hooks.fire_before_start(session, user_text)  # P2 hook seam
         memory_block = await self._prefetch_memory(user_text)
         tools = self._visible_tool_schemas()
+        # Reference-only blocks injected into the latest user message at send time (never the
+        # cacheable system prefix, S3). The date is stamped once per turn so a local model —
+        # which has no clock — stops hallucinating "today" from its training cutoff.
+        context_blocks = [
+            wrap_datetime_context(datetime.now().astimezone()),
+            wrap_memory_context(memory_block) if memory_block else "",
+        ]
+        # P0 trace: assemble a per-turn record as the loop runs; recorded at each exit point.
+        trace = TurnTrace.new(session.id, model, user_text) if self._trace else None
+        step: TraceStep | None = None  # current iteration's step; visible to the except below
 
-        for _ in range(self._max_iters):
-            text_parts: list[str] = []
-            tool_calls: list[dict] | None = None
+        try:
+            for _ in range(self._max_iters):
+                text_parts: list[str] = []
+                tool_calls: list[dict] | None = None
+                step = TraceStep() if trace is not None else None
 
-            send_messages = self._messages_for_send(session.messages, memory_block)
-            async for ev in self._llm.stream_chat(
-                send_messages, model, tools=tools, max_tokens=self._max_output_tokens
-            ):
-                if ev["type"] == "text":
-                    text_parts.append(ev["content"])
-                    yield {"type": "assistant_delta", "content": ev["content"]}
-                elif ev["type"] == "tool_calls":
-                    tool_calls = ev["tool_calls"]
+                send_messages = self._messages_for_send(session.messages, context_blocks)
+                async for ev in self._llm.stream_chat(
+                    send_messages, model, tools=tools, max_tokens=self._max_output_tokens
+                ):
+                    if ev["type"] == "text":
+                        text_parts.append(ev["content"])
+                        yield {"type": "assistant_delta", "content": ev["content"]}
+                    elif ev["type"] == "tool_calls":
+                        tool_calls = ev["tool_calls"]
 
-            if not tool_calls:
-                answer = "".join(text_parts)
-                session.add_assistant(answer)
-                # Surface a context-usage readout (estimate): context_tokens is the whole
-                # conversation's footprint — the number compaction (S6) keys off — and
-                # output_tokens is this reply. Heuristic; see agent/tokens.py.
-                yield {
-                    "type": "done",
-                    "usage": {
-                        "context_tokens": estimate_messages_tokens(session.messages),
-                        "output_tokens": estimate_tokens(answer),
-                    },
-                }
-                return
+                if not tool_calls:
+                    answer = "".join(text_parts)
+                    session.add_assistant(answer)
+                    if trace is not None:
+                        step.model_text = answer
+                        trace.steps.append(step)
+                        trace.final_text = answer
+                        self._trace.record(trace.finalize("answered"))
+                    # Surface a context-usage readout (estimate): context_tokens is the whole
+                    # conversation's footprint — the number compaction (S6) keys off — and
+                    # output_tokens is this reply. Heuristic; see agent/tokens.py.
+                    yield {
+                        "type": "done",
+                        "usage": {
+                            "context_tokens": estimate_messages_tokens(session.messages),
+                            "output_tokens": estimate_tokens(answer),
+                        },
+                    }
+                    return
 
-            session.messages.append(self._assistant_tool_msg(text_parts, tool_calls))
-            for tc in tool_calls:
-                yield {
-                    "type": "tool_call",
-                    "id": tc["id"],
-                    "name": tc["name"],
-                    "arguments": tc["arguments"],
-                }
-                tool = self._registry.get(tc["name"])
-                if tool is None:
-                    result = ToolResult(False, f"unknown tool: {tc['name']}")
-                else:
-                    # S5: rules + ask-once decide allow/deny before any prompt; only an
-                    # unresolved "ask" falls through to the interactive/policy approver.
-                    decision = self._rule_decision(tool, tc["arguments"])
-                    if decision == "allow":
-                        result = await self._run_tool(tool, tc)
-                    elif decision == "deny":
-                        result = ToolResult(False, f"denied by rule: tool '{tool.name}'")
-                    elif tool.needs_approval and getattr(
-                        effective_approver, "interactive", False
-                    ):
-                        # Interactive approver (GUI/HTTP): surface the request and wait for
-                        # an out-of-band decision (POST /chat/approve) before running.
-                        token = effective_approver.new_request()
-                        yield {
-                            "type": "approval_request",
-                            "id": tc["id"],
-                            "token": token,
-                            "name": tool.name,
-                            "arguments": tc["arguments"],
-                        }
-                        if await effective_approver.wait(token):
-                            self._remember(tool, tc["arguments"])  # ask-once-per-session
+                session.messages.append(self._assistant_tool_msg(text_parts, tool_calls))
+                if trace is not None:
+                    step.model_text = "".join(text_parts)
+                    step.parsed_calls = [
+                        {"name": tc["name"], "arguments": tc["arguments"]} for tc in tool_calls
+                    ]
+                for tc in tool_calls:
+                    yield {
+                        "type": "tool_call",
+                        "id": tc["id"],
+                        "name": tc["name"],
+                        "arguments": tc["arguments"],
+                    }
+                    tool = self._registry.get(tc["name"])
+                    if tool is None:
+                        result = ToolResult(False, f"unknown tool: {tc['name']}")
+                    else:
+                        # S5: rules + ask-once decide allow/deny before any prompt; only an
+                        # unresolved "ask" falls through to the interactive/policy approver.
+                        decision = self._rule_decision(tool, tc["arguments"])
+                        if decision == "allow":
                             result = await self._run_tool(tool, tc)
-                        else:
+                        elif decision == "deny":
+                            result = ToolResult(False, f"denied by rule: tool '{tool.name}'")
+                        elif tool.needs_approval and getattr(
+                            effective_approver, "interactive", False
+                        ):
+                            # Interactive approver (GUI/HTTP): surface the request and wait
+                            # for an out-of-band decision (POST /chat/approve) before running.
+                            token = effective_approver.new_request()
+                            yield {
+                                "type": "approval_request",
+                                "id": tc["id"],
+                                "token": token,
+                                "name": tool.name,
+                                "arguments": tc["arguments"],
+                            }
+                            if await effective_approver.wait(token):
+                                self._remember(tool, tc["arguments"])  # ask-once-per-session
+                                result = await self._run_tool(tool, tc)
+                            else:
+                                result = ToolResult(
+                                    False, f"denied: tool '{tool.name}' requires approval"
+                                )
+                        elif not await effective_approver.approve(tool, tc["arguments"]):
                             result = ToolResult(
                                 False, f"denied: tool '{tool.name}' requires approval"
                             )
-                    elif not await effective_approver.approve(tool, tc["arguments"]):
-                        result = ToolResult(
-                            False, f"denied: tool '{tool.name}' requires approval"
+                        else:
+                            result = await self._run_tool(tool, tc)
+                    session.messages.append(
+                        {"role": "tool", "tool_call_id": tc["id"], "content": result.content}
+                    )
+                    if trace is not None:
+                        step.tool_results.append(
+                            {"name": tc["name"], "ok": result.ok, "content": result.content}
                         )
-                    else:
-                        result = await self._run_tool(tool, tc)
-                session.messages.append(
-                    {"role": "tool", "tool_call_id": tc["id"], "content": result.content}
-                )
-                yield {
-                    "type": "tool_result",
-                    "id": tc["id"],
-                    "name": tc["name"],
-                    "ok": result.ok,
-                    "content": result.content,
-                }
+                    yield {
+                        "type": "tool_result",
+                        "id": tc["id"],
+                        "name": tc["name"],
+                        "ok": result.ok,
+                        "content": result.content,
+                    }
+                if trace is not None:
+                    trace.steps.append(step)
 
-        yield {"type": "error", "detail": f"reached max tool iterations ({self._max_iters})"}
+            if trace is not None:
+                self._trace.record(trace.finalize("max_iters"))
+            yield {"type": "error", "detail": f"reached max tool iterations ({self._max_iters})"}
+        except Exception as exc:
+            # A turn can die mid-loop — most often a chat-template render failure when the
+            # tool_calls history is fed back to the model. CancelledError / GeneratorExit are
+            # BaseException (client disconnect, New chat), so they bypass this handler and are
+            # NOT logged as failures. Record the error trace, then re-raise so the API layer
+            # still streams its error event (outward behaviour unchanged).
+            if trace is not None:
+                if step is not None and not any(s is step for s in trace.steps):
+                    trace.steps.append(step)
+                trace.error = str(exc)
+                self._trace.record(trace.finalize("error"))
+            raise
 
     def _build_stable_system(self) -> str:
         # Stable across turns: base text + skills index only (no user-dependent content),
@@ -197,18 +245,20 @@ class AgentLoop:
         return await memory.prefetch(user_text) if memory else ""
 
     @staticmethod
-    def _messages_for_send(messages: list[dict], memory_block: str) -> list[dict]:
-        """Send-time view of the conversation: prefetched memory rides the *latest user
-        message* as a reference-only block. Stored history (and the GUI) stay clean, and
-        the cacheable prefix — system + all prior turns — is left byte-for-byte unchanged.
-        Returns ``messages`` unchanged when there is no memory to inject."""
-        if not memory_block:
+    def _messages_for_send(messages: list[dict], context_blocks: list[str]) -> list[dict]:
+        """Send-time view of the conversation: reference-only blocks (current date,
+        prefetched memory) ride the *latest user message*. Stored history (and the GUI) stay
+        clean, and the cacheable prefix — system + all prior turns — is left byte-for-byte
+        unchanged. Returns ``messages`` unchanged when there are no blocks to inject."""
+        blocks = [b for b in context_blocks if b]
+        if not blocks:
             return messages
+        suffix = "\n\n".join(blocks)
         out = list(messages)
         for i in range(len(out) - 1, -1, -1):
             if out[i].get("role") == "user":
                 m = dict(out[i])
-                m["content"] = f"{m['content']}\n\n{wrap_memory_context(memory_block)}"
+                m["content"] = f"{m['content']}\n\n{suffix}"
                 out[i] = m
                 break
         return out
