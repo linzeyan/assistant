@@ -2,7 +2,7 @@ import asyncio
 from unittest.mock import AsyncMock, Mock
 
 from assistant.gateway.approval import TelegramApprover
-from assistant.gateway.telegram import TelegramGateway
+from assistant.gateway.telegram import TelegramGateway, _render_telegram_html
 from assistant.models.types import ModelInfo
 from assistant.tools.base import Tool
 
@@ -143,6 +143,39 @@ async def test_apply_model_choice_handles_stale_index():
     query.edit_message_text = AsyncMock()
     await gw._apply_model_choice(query)
     assert 42 not in gw._selected_model  # nothing recorded
+
+
+# --- Telegram HTML rendering (think collapse + markdown subset, N30) ---
+
+
+def test_render_collapses_think_into_blockquote():
+    out = _render_telegram_html("<think>reasoning here</think>the answer")
+    assert "<blockquote expandable>reasoning here</blockquote>" in out
+    assert out.rstrip().endswith("the answer")
+
+
+def test_render_handles_orphan_think():
+    # Qwen3.x templates inject the opener, so the stream often starts mid-think.
+    out = _render_telegram_html("just reasoning</think>final answer")
+    assert out.startswith("<blockquote expandable>just reasoning</blockquote>")
+    assert "final answer" in out
+
+
+def test_render_code_fence_becomes_pre_and_escapes():
+    out = _render_telegram_html("```go\nif a < b && c > d {}\n```")
+    assert "<pre>" in out and "</pre>" in out
+    assert "&lt;" in out and "&gt;" in out and "&amp;" in out  # escaped inside <pre>
+
+
+def test_render_headings_and_bold():
+    out = _render_telegram_html("### Title\nsome **bold** text")
+    assert "<b>Title</b>" in out and "<b>bold</b>" in out
+
+
+def test_render_escapes_stray_angle_brackets():
+    # A bare < in prose must be escaped or Telegram rejects the whole message.
+    out = _render_telegram_html("compare a < b")
+    assert "&lt;" in out and "<blockquote" not in out
 
 
 # --- interactive approver ---

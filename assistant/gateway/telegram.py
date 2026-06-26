@@ -12,7 +12,9 @@ everyone, and /start tells a user their id so it can be added.
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import logging
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -39,6 +41,57 @@ log = logging.getLogger("assistant.telegram")
 # from auto-selecting a video / embedding model that can't serve a chat turn.
 _CHATTABLE_KINDS = ("llm", "vlm")
 
+# --- Telegram HTML rendering (think collapse + a small markdown subset) ---
+# Telegram's HTML parse mode only allows a few tags (<b> <i> <code> <pre> <blockquote>…),
+# NOT headings — so ### becomes bold. Everything must be HTML-escaped or the whole message
+# is rejected, which is why we render once on the final edit and fall back to plain on error.
+
+_FENCE_RE = re.compile(r"```[^\n]*\n?(.*?)```", re.DOTALL)
+_HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.*)$")
+
+
+def _md_inline(s: str) -> str:
+    s = _html.escape(s, quote=False)
+    s = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", s)  # inline code
+    s = re.sub(r"\*\*([^*\n]+?)\*\*", r"<b>\1</b>", s)  # bold
+    return s
+
+
+def _md_lines(text: str) -> str:
+    out = []
+    for ln in text.split("\n"):
+        h = _HEADING_RE.match(ln)
+        out.append(f"<b>{_md_inline(h.group(1))}</b>" if h else _md_inline(ln))
+    return "\n".join(out)
+
+
+def _md_block(text: str) -> str:
+    out, pos = [], 0
+    for m in _FENCE_RE.finditer(text):  # ``` fences -> <pre>, escaped
+        out.append(_md_lines(text[pos:m.start()]))
+        out.append(f"<pre>{_html.escape(m.group(1), quote=False)}</pre>")
+        pos = m.end()
+    out.append(_md_lines(text[pos:]))
+    return "".join(out)
+
+
+def _render_telegram_html(text: str) -> str:
+    """<think> blocks collapse into an expandable blockquote; the rest gets the markdown
+    subset Telegram supports. Mirrors the GUI's orphan-</think> handling."""
+    out, rest = [], text
+    if "</think>" in rest and ("<think>" not in rest or rest.index("</think>") < rest.index("<think>")):
+        head, _, rest = rest.partition("</think>")
+        out.append(f"<blockquote expandable>{_md_block(head).strip()}</blockquote>")
+    while "<think>" in rest:
+        before, _, after = rest.partition("<think>")
+        out.append(_md_block(before))
+        think, sep, rest = after.partition("</think>")
+        out.append(f"<blockquote expandable>{_md_block(think).strip()}</blockquote>")
+        if not sep:  # unterminated think (a partial stream) — nothing trails it
+            rest = ""
+    out.append(_md_block(rest))
+    return "".join(out)
+
 
 class _StreamEditor:
     """Accumulates streamed text into one Telegram message, throttling edits to
@@ -64,7 +117,7 @@ class _StreamEditor:
             return
         self._shown = text
         self._last = time.monotonic()
-        await self._edit(text)
+        await self._edit(text, rich=final)
 
     async def note(self, line: str) -> None:
         # Transient progress shown only while there's no real content yet, so it
@@ -76,7 +129,19 @@ class _StreamEditor:
     async def set_error(self, detail: str) -> None:
         await self._edit(f"⚠️ {detail}")
 
-    async def _edit(self, text: str) -> None:
+    async def _edit(self, text: str, rich: bool = False) -> None:
+        # Only the final message is rich-rendered (think collapsed, markdown/code). Partial
+        # streaming stays plain — re-rendering half-open think/fences each tick is fragile,
+        # and one malformed tag gets the whole edit rejected.
+        if rich:
+            try:
+                await self._bot.edit_message_text(
+                    _render_telegram_html(text)[:4096], chat_id=self._chat,
+                    message_id=self._mid, parse_mode="HTML",
+                )
+                return
+            except Exception:
+                pass  # bad/over-long HTML -> fall back to the plain edit below
         try:
             await self._bot.edit_message_text(
                 text[:4000], chat_id=self._chat, message_id=self._mid
