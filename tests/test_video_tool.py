@@ -88,6 +88,23 @@ async def test_generate_video_no_backend(tmp_path):
     assert not res.ok and "unavailable" in res.content
 
 
+def test_backend_resolution_and_steps_setters(tmp_path):
+    # WHY: /videoset mutates these defaults at runtime; invalid values must be ignored (an
+    # unknown resolution would crash generation) and 0/neg steps means "use config default".
+    from assistant.models.mlx_video import MlxVideoBackend
+
+    b = MlxVideoBackend(tmp_path)
+    assert b.resolution == "360p" and b.steps is None  # fast defaults out of the box
+    b.set_resolution("720p")
+    assert b.resolution == "720p"
+    b.set_resolution("nonsense")
+    assert b.resolution == "720p"  # invalid ignored, not applied
+    b.set_steps(20)
+    assert b.steps == 20
+    b.set_steps(0)
+    assert b.steps is None
+
+
 def test_resolutions_are_32_aligned_and_default_is_cheapest():
     # WHY: Wan's VAE stride (16) × patch (2) requires width/height divisible by 32, and the
     # default must be the smallest so a clip is fast (a few min) unless the user opts up.

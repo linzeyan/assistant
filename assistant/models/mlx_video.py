@@ -122,6 +122,11 @@ class MlxVideoBackend(VideoService):
         # checkpoint — without it generation can't run. Runtime-switchable via set_checkpoint
         # so the Telegram /video picker (N28) can change it without a restart.
         self._checkpoint = Path(checkpoint) if checkpoint else None
+        # Default generation knobs, runtime-switchable via the Telegram /videoset buttons.
+        # A per-request arg (from the model's tool call) still overrides these; None steps
+        # means "fall back to the checkpoint config" (≈40).
+        self._resolution = DEFAULT_RESOLUTION
+        self._steps: int | None = None
 
     @property
     def checkpoint(self) -> Path | None:
@@ -129,6 +134,21 @@ class MlxVideoBackend(VideoService):
 
     def set_checkpoint(self, checkpoint: Path | None) -> None:
         self._checkpoint = Path(checkpoint) if checkpoint else None
+
+    @property
+    def resolution(self) -> str:
+        return self._resolution
+
+    def set_resolution(self, name: str) -> None:
+        if name.lower() in _RESOLUTIONS:
+            self._resolution = name.lower()
+
+    @property
+    def steps(self) -> int | None:
+        return self._steps
+
+    def set_steps(self, steps: int | None) -> None:
+        self._steps = steps if steps is None or steps > 0 else None
 
     def available(self) -> bool:
         # Check the REAL generation submodule, not just top-level ``mlx_video``: the unrelated
@@ -191,16 +211,17 @@ class MlxVideoBackend(VideoService):
             from mlx_video.models.wan_2 import generate as _genmod
 
         out = self._dir / f"vid_{uuid.uuid4().hex[:8]}.mp4"
-        # Default to a small, fast resolution; everything else (steps/guide/shift/negative)
-        # stays None so the lib falls back to the checkpoint's config defaults.
+        # Precedence: explicit per-request arg > the /videoset default > module default.
+        # Everything left as None lets the lib fall back to the checkpoint's config defaults.
         width, height = _RESOLUTIONS.get(
-            (resolution or DEFAULT_RESOLUTION).lower(), _RESOLUTIONS[DEFAULT_RESOLUTION]
+            (resolution or self._resolution).lower(), _RESOLUTIONS[DEFAULT_RESOLUTION]
         )
+        eff_steps = steps if steps is not None else self._steps
         kwargs: dict = {"width": width, "height": height}
         if num_frames is not None:
             kwargs["num_frames"] = _valid_num_frames(num_frames)
-        if steps is not None:
-            kwargs["steps"] = steps
+        if eff_steps is not None:
+            kwargs["steps"] = eff_steps
         if seed is not None:
             kwargs["seed"] = seed
         if negative_prompt is not None:

@@ -246,6 +246,7 @@ class TelegramGateway:
         app.add_handler(CommandHandler("start", self._on_start))
         app.add_handler(CommandHandler("models", self._on_models))
         app.add_handler(CommandHandler("video", self._on_video))
+        app.add_handler(CommandHandler("videoset", self._on_videoset))
         app.add_handler(CallbackQueryHandler(self._on_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self._on_voice))
@@ -258,6 +259,7 @@ class TelegramGateway:
                     ("start", "Show status and usage"),
                     ("models", "Pick the chat model"),
                     ("video", "Pick the video-generation model"),
+                    ("videoset", "Video defaults: resolution & quality"),
                 ]
             )
         except Exception:
@@ -374,6 +376,58 @@ class TelegramGateway:
             "Pick the video-generation model:", reply_markup=InlineKeyboardMarkup(rows)
         )
 
+    # Quality presets for /videoset; None ("Default") lets the checkpoint config decide (≈40).
+    _STEP_PRESETS = (("Fast 20", 20), ("Balanced 30", 30), ("Quality 40", 40))
+
+    def _videoset_markup(self) -> "InlineKeyboardMarkup":
+        from assistant.models.mlx_video import _RESOLUTIONS
+
+        res, steps = self._video.resolution, self._video.steps
+        res_row = [
+            InlineKeyboardButton(f"{'●' if n == res else '○'} {n}", callback_data=f"vres:{n}")
+            for n in _RESOLUTIONS
+        ]
+        step_row = [
+            InlineKeyboardButton(
+                f"{'●' if v == steps else '○'} {label}", callback_data=f"vsteps:{v}"
+            )
+            for label, v in self._STEP_PRESETS
+        ]
+        default_row = [
+            InlineKeyboardButton(
+                f"{'●' if steps is None else '○'} Default steps", callback_data="vsteps:0"
+            )
+        ]
+        return InlineKeyboardMarkup([res_row, step_row, default_row])
+
+    async def _on_videoset(self, update: "Update", context) -> None:
+        if not await self._ensure_allowed(update):
+            return
+        if self._video is None or not self._video.available():
+            await update.message.reply_text(
+                "Video generation is unavailable (install mlx-video on the backend)."
+            )
+            return
+        await update.message.reply_text(
+            "Video defaults — tap to change. Lower resolution / fewer steps = faster.\n"
+            "(A request like “720p, 5 seconds” still overrides these per clip.)",
+            reply_markup=self._videoset_markup(),
+        )
+
+    async def _apply_videoset_choice(self, query) -> None:
+        # Set the shared backend's default resolution/steps (global, like the /video
+        # checkpoint), then refresh just the keyboard so the ● marks track the new state.
+        if self._video is not None:
+            kind, _, val = (query.data or "").partition(":")
+            if kind == "vres":
+                self._video.set_resolution(val)
+            elif kind == "vsteps":
+                self._video.set_steps(int(val) if val.isdigit() and int(val) > 0 else None)
+        try:
+            await query.edit_message_reply_markup(reply_markup=self._videoset_markup())
+        except Exception:
+            pass  # "not modified" (re-tapping the current choice) is non-fatal
+
     async def _on_message(self, update: "Update", context) -> None:
         if not await self._ensure_allowed(update):
             return
@@ -472,6 +526,9 @@ class TelegramGateway:
             return
         if data.startswith("vchk:"):  # a /video picker tap
             await self._apply_video_choice(query)
+            return
+        if data.startswith("vres:") or data.startswith("vsteps:"):  # a /videoset tap
+            await self._apply_videoset_choice(query)
             return
         decision, _, token = data.partition(":")
         future = self._pending.get(token)

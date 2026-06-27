@@ -56,6 +56,8 @@ class _FakeVideo:
         self._available = available
         self._checkpoint = checkpoint
         self.set_to = "UNSET"
+        self.resolution = "360p"
+        self.steps = None
 
     def available(self):
         return self._available
@@ -67,6 +69,12 @@ class _FakeVideo:
     def set_checkpoint(self, p):
         self._checkpoint = p
         self.set_to = p
+
+    def set_resolution(self, name):
+        self.resolution = name
+
+    def set_steps(self, steps):
+        self.steps = steps
 
 
 def _gateway(
@@ -251,6 +259,36 @@ async def test_apply_video_choice_handles_stale_index(tmp_path):
     await gw._apply_video_choice(query)
     assert video.set_to == "UNSET"  # nothing applied
     query.edit_message_text.assert_awaited_with("That video model is no longer available.")
+
+
+async def test_videoset_taps_set_backend_defaults(tmp_path):
+    # WHY: /videoset buttons set the shared backend's default resolution/steps (a request
+    # still overrides per clip); the menu refreshes so ● tracks the new state.
+    video = _FakeVideo()
+    gw = _gateway(video=video, model_dirs=[tmp_path])
+    query = Mock()
+    query.edit_message_reply_markup = AsyncMock()
+
+    query.data = "vres:720p"
+    await gw._apply_videoset_choice(query)
+    assert video.resolution == "720p"
+
+    query.data = "vsteps:20"
+    await gw._apply_videoset_choice(query)
+    assert video.steps == 20
+
+    query.data = "vsteps:0"  # "Default steps" → back to config default (None)
+    await gw._apply_videoset_choice(query)
+    assert video.steps is None
+    query.edit_message_reply_markup.assert_awaited()
+
+
+def test_videoset_markup_marks_current_resolution(tmp_path):
+    video = _FakeVideo()
+    video.resolution = "480p"
+    gw = _gateway(video=video, model_dirs=[tmp_path])
+    labels = [b.text for row in gw._videoset_markup().inline_keyboard for b in row]
+    assert "● 480p" in labels and "○ 360p" in labels
 
 
 def test_clip_error_caps_runaway_dump():
