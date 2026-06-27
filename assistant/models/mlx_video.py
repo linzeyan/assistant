@@ -15,10 +15,15 @@ The pipeline is chosen by name: ``"wan"`` (``wan_2``) or ``"ltx"`` (``ltx_2``).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator
 from pathlib import Path
+
+# (fraction in [0, 1], short "step/total" label) — reported per denoising step.
+ProgressFn = Callable[[float, str], None]
 
 
 def _valid_num_frames(n: int) -> int:
@@ -31,15 +36,63 @@ def _valid_num_frames(n: int) -> int:
     return n - ((n - 1) % 4)
 
 
+@contextlib.contextmanager
+def _instrument_denoise_progress(genmod, progress: ProgressFn | None) -> Iterator[None]:
+    """Temporarily replace ``genmod.tqdm`` so the diffusion loop reports per-step progress.
+
+    Blaizzy's generate iterates ``tqdm(range(steps), desc="Diffusion")`` with no callback
+    seam, so this is the least-invasive way to surface progress: wrap only that bar (matched
+    by ``desc``) and delegate every other tqdm call through unchanged. ``progress`` is invoked
+    from the generation worker thread, so the agent loop hands us a thread-safe sink. The
+    swap is process-global, but video generation is serialized (one heavy job at a time), and
+    the original is always restored on exit.
+    """
+    if progress is None:
+        yield
+        return
+
+    orig = genmod.tqdm
+
+    def _patched(iterable=None, *args, **kwargs):
+        if iterable is not None and kwargs.get("desc") == "Diffusion":
+            steps = list(iterable)
+            total = len(steps) or 1
+
+            def _stream():
+                for done, item in enumerate(steps):
+                    yield item  # the lib runs one denoising step for this item
+                    try:
+                        progress((done + 1) / total, f"{done + 1}/{total}")
+                    except Exception:
+                        pass  # a progress-sink failure must never break generation
+
+            return _stream()
+        return orig(iterable, *args, **kwargs)
+
+    genmod.tqdm = _patched
+    try:
+        yield
+    finally:
+        genmod.tqdm = orig
+
+
 class VideoService(ABC):
     @abstractmethod
     def available(self) -> bool: ...
 
     @abstractmethod
     async def generate_video(
-        self, prompt: str, *, num_frames: int | None = None, seed: int | None = None
+        self,
+        prompt: str,
+        *,
+        num_frames: int | None = None,
+        seed: int | None = None,
+        progress: ProgressFn | None = None,
     ) -> Path:
-        """Generate a short video and return the path to the saved file."""
+        """Generate a short video and return the path to the saved file.
+
+        ``progress``, when given, is called per denoising step with (fraction, label) so a
+        caller (the agent loop) can stream a progress bar for this minutes-long workload."""
 
 
 class MlxVideoBackend(VideoService):
@@ -74,17 +127,28 @@ class MlxVideoBackend(VideoService):
             return False
 
     async def generate_video(
-        self, prompt: str, *, num_frames: int | None = None, seed: int | None = None
+        self,
+        prompt: str,
+        *,
+        num_frames: int | None = None,
+        seed: int | None = None,
+        progress: ProgressFn | None = None,
     ) -> Path:
         if not self.available():
             raise RuntimeError(
                 "video requires Blaizzy's mlx-video. "
                 'Install with: uv pip install -e ".[video]"'
             )
-        return await asyncio.to_thread(self._generate_sync, prompt, num_frames, seed)
+        return await asyncio.to_thread(
+            self._generate_sync, prompt, num_frames, seed, progress
+        )
 
     def _generate_sync(
-        self, prompt: str, num_frames: int | None, seed: int | None
+        self,
+        prompt: str,
+        num_frames: int | None,
+        seed: int | None,
+        progress: ProgressFn | None = None,
     ) -> Path:
         if self._checkpoint is None or not self._checkpoint.is_dir():
             raise RuntimeError(
@@ -92,12 +156,11 @@ class MlxVideoBackend(VideoService):
                 "`video_checkpoint` to a Wan/LTX model dir (e.g. .../Wan2.2-TI2V-5B-mlx)."
             )
         # Single integration point with mlx-video: "wan" -> models.wan_2, "ltx" -> models.ltx_2.
-        # Both expose generate_video(model_dir, prompt, ..., output_path); adjusting to a new
-        # package version touches only here.
+        # Import the MODULE (not just the function) so we can instrument its denoising bar.
         if self._model == "ltx":
-            from mlx_video.models.ltx_2.generate import generate_video as _generate
+            from mlx_video.models.ltx_2 import generate as _genmod
         else:
-            from mlx_video.models.wan_2.generate import generate_video as _generate
+            from mlx_video.models.wan_2 import generate as _genmod
 
         out = self._dir / f"vid_{uuid.uuid4().hex[:8]}.mp4"
         kwargs: dict = {}
@@ -106,10 +169,14 @@ class MlxVideoBackend(VideoService):
         if seed is not None:
             kwargs["seed"] = seed
         # generate_video writes to output_path and returns None — return the path we chose.
-        _generate(
-            model_dir=str(self._checkpoint),
-            prompt=prompt,
-            output_path=str(out),
-            **kwargs,
-        )
+        # The lib exposes no progress callback, so to stream a per-step bar we temporarily
+        # wrap the module-level tqdm it iterates over the diffusion steps with (desc=
+        # "Diffusion"). Restored in finally so we never leave the lib's tqdm patched.
+        with _instrument_denoise_progress(_genmod, progress):
+            _genmod.generate_video(
+                model_dir=str(self._checkpoint),
+                prompt=prompt,
+                output_path=str(out),
+                **kwargs,
+            )
         return out

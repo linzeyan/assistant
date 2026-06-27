@@ -33,7 +33,10 @@ async def generate_video(args: dict, ctx: ToolContext) -> ToolResult:
         )
     try:
         path = await ctx.video.generate_video(
-            args["prompt"], num_frames=args.get("num_frames"), seed=args.get("seed")
+            args["prompt"],
+            num_frames=args.get("num_frames"),
+            seed=args.get("seed"),
+            progress=ctx.on_progress,  # streams a per-step progress bar (None = no consumer)
         )
     except Exception as exc:
         return ToolResult(False, f"video generation failed: {exc}")

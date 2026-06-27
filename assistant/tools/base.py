@@ -33,6 +33,10 @@ class ToolContext:
     vision: "VisionService | None" = None
     audio: "AudioService | None" = None
     video: "VideoService | None" = None
+    # Sync, thread-safe progress sink set by the agent loop for each tool run: a long tool
+    # (e.g. video denoising in a worker thread) calls on_progress(fraction, label) and the
+    # loop surfaces each tick as a tool_progress event. None when nothing consumes progress.
+    on_progress: "Callable[[float, str], None] | None" = None
     # Where over-budget tool output is spilled in full (S4); None = bound in place, no spill.
     output_spill_dir: Path | None = None
 

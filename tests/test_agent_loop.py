@@ -2,7 +2,8 @@ from assistant.agent.loop import AgentLoop
 from assistant.agent.session import Session
 from assistant.tools import build_registry
 from assistant.tools.approval import PolicyApprover
-from assistant.tools.base import ToolContext
+from assistant.tools.base import Tool, ToolContext, ToolResult
+from assistant.tools.registry import ToolRegistry
 
 
 class FakeLLM:
@@ -34,6 +35,45 @@ def _loop(llm, tmp_path, approval_required: bool) -> AgentLoop:
         PolicyApprover(approval_required=approval_required),
         ToolContext(cwd=tmp_path),
     )
+
+
+async def test_tool_progress_events_streamed(tmp_path):
+    # WHY: a long tool (video denoising) must not look frozen. Ticks reported via
+    # ctx.on_progress are surfaced as tool_progress events, ordered strictly between the
+    # tool_call and its tool_result so a gateway can render a live progress bar.
+    async def slow(args, ctx):
+        ctx.on_progress(0.5, "1/2")
+        ctx.on_progress(1.0, "2/2")
+        return ToolResult(True, "ok")
+
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            name="slow",
+            description="reports progress",
+            parameters={"type": "object", "properties": {}},
+            handler=slow,
+        )
+    )
+    llm = FakeLLM(
+        [
+            [{"type": "tool_calls", "tool_calls": [{"id": "c1", "name": "slow", "arguments": {}}]}],
+            [{"type": "text", "content": "done"}],
+        ]
+    )
+    loop = AgentLoop(
+        llm, reg, PolicyApprover(approval_required=False), ToolContext(cwd=tmp_path)
+    )
+    events = await _collect(loop.run(Session(id="s1"), "go", "m"))
+
+    progress = [e for e in events if e["type"] == "tool_progress"]
+    assert [round(e["fraction"], 2) for e in progress] == [0.5, 1.0]
+    assert progress[0] == {"type": "tool_progress", "id": "c1", "name": "slow",
+                           "fraction": 0.5, "label": "1/2"}
+    types = [e["type"] for e in events]
+    assert types.index("tool_call") < types.index("tool_progress") < types.index("tool_result")
+    # on_progress is scoped to the run and cleared afterwards (no leak into later tools).
+    assert loop._ctx.on_progress is None
 
 
 async def test_tool_then_final_answer(tmp_path):

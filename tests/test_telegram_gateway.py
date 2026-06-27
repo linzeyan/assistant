@@ -4,7 +4,9 @@ from unittest.mock import AsyncMock, Mock
 from assistant.gateway.approval import TelegramApprover
 from assistant.gateway.telegram import (
     TelegramGateway,
+    _clip_caption,
     _clip_error,
+    _progress_bar,
     _render_telegram_html,
 )
 from assistant.models.types import ModelInfo
@@ -374,7 +376,7 @@ async def test_handle_event_sends_generated_video(tmp_path):
     bot.send_video = AsyncMock()
     bot.send_photo = AsyncMock()
     await _gateway()._handle_event(
-        _media_result("generate_video", content=str(clip)), Mock(), bot, 42
+        _media_result("generate_video", content=str(clip)), Mock(), bot, 42, {}
     )
     bot.send_video.assert_awaited_once()
     bot.send_photo.assert_not_awaited()  # routed as video, never as an image
@@ -386,7 +388,7 @@ async def test_handle_event_image_routing_unchanged(tmp_path):
     bot = Mock()
     bot.send_photo = AsyncMock()
     await _gateway()._handle_event(
-        _media_result("generate_image", content=str(img)), Mock(), bot, 42
+        _media_result("generate_image", content=str(img)), Mock(), bot, 42, {}
     )
     bot.send_photo.assert_awaited_once()  # the video addition didn't break images
 
@@ -398,9 +400,47 @@ async def test_handle_event_skips_nonmedia_and_failed_results():
     bot.send_video = AsyncMock()
     bot.send_photo = AsyncMock()
     gw = _gateway()
-    await gw._handle_event(_media_result("web_search", content="snippets"), Mock(), bot, 42)
+    await gw._handle_event(_media_result("web_search", content="snippets"), Mock(), bot, 42, {})
     await gw._handle_event(
-        _media_result("generate_video", ok=False, content="/nope"), Mock(), bot, 42
+        _media_result("generate_video", ok=False, content="/nope"), Mock(), bot, 42, {}
     )
     bot.send_video.assert_not_awaited()
     bot.send_photo.assert_not_awaited()
+
+
+async def test_handle_event_captions_video_with_its_prompt(tmp_path):
+    # WHY: a clip can arrive minutes later (after other turns), so the user can't tell which
+    # request it answers. The tool_call's prompt is remembered and sent as the video caption.
+    clip = tmp_path / "out.mp4"
+    clip.write_bytes(b"\x00\x00")
+    bot = Mock()
+    bot.send_video = AsyncMock()
+    gw = _gateway()
+    tool_args: dict = {}
+    await gw._handle_event(
+        {"type": "tool_call", "id": "c1", "name": "generate_video",
+         "arguments": {"prompt": "a pikachu surfing"}},
+        AsyncMock(), bot, 42, tool_args,
+    )
+    await gw._handle_event(
+        {"type": "tool_result", "id": "c1", "name": "generate_video",
+         "ok": True, "content": str(clip)},
+        AsyncMock(), bot, 42, tool_args,
+    )
+    assert bot.send_video.await_args.kwargs["caption"] == "a pikachu surfing"
+
+
+def test_progress_bar_renders_fraction_and_clamps():
+    assert _progress_bar(0.0, "0/40") == "🎬 Generating video ░░░░░░░░░░░░ 0% (0/40)"
+    assert _progress_bar(0.5, "20/40").startswith("🎬 Generating video ██████░░░░░░ 50%")
+    # out-of-range fractions must clamp, never overrun the bar or show >100%
+    assert _progress_bar(1.5).startswith("🎬 Generating video ████████████ 100%")
+    assert "-" not in _progress_bar(-0.2)
+
+
+def test_clip_caption_caps_at_telegram_limit():
+    assert _clip_caption(None) is None
+    assert _clip_caption("  hi  ") == "hi"
+    long = "x" * 2000
+    out = _clip_caption(long)
+    assert len(out) <= 1024 and out.endswith("…")

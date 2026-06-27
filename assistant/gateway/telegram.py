@@ -111,6 +111,25 @@ def _same_path(a, b) -> bool:
         return False
 
 
+def _clip_caption(text: str | None) -> str | None:
+    """Telegram caps media captions at 1024 chars; keep the head (the prompt's gist) and
+    drop the rest rather than letting send_* reject the whole upload."""
+    if not text:
+        return None
+    text = text.strip()
+    return text if len(text) <= 1024 else text[:1021].rstrip() + "…"
+
+
+def _progress_bar(fraction: float, label: str = "", *, slots: int = 12) -> str:
+    """Render a tool_progress tick as a text bar, e.g. ``🎬 Generating video █████░░░ 42%
+    (17/40)``. Video generation runs for minutes; without this the chat looks frozen."""
+    fraction = 0.0 if fraction < 0 else 1.0 if fraction > 1 else fraction
+    filled = round(fraction * slots)
+    bar = "█" * filled + "░" * (slots - filled)
+    tail = f" ({label})" if label else ""
+    return f"🎬 Generating video {bar} {round(fraction * 100)}%{tail}"
+
+
 class _StreamEditor:
     """Accumulates streamed text into one Telegram message, throttling edits to
     avoid hitting Telegram's per-chat edit rate limits."""
@@ -142,6 +161,18 @@ class _StreamEditor:
         # never clobbers the streamed answer.
         if self._buf.strip():
             return
+        await self._edit(line)
+
+    async def progress(self, line: str) -> None:
+        # Like note(), but for long tools that emit many ticks (video denoising): throttled
+        # and skip-if-unchanged so we stay under Telegram's edit rate limit. The bar may
+        # briefly stand in for any pre-tool preamble; the final flush() restores the answer.
+        if line == self._shown:
+            return
+        if (time.monotonic() - self._last) < self._min:
+            return
+        self._shown = line
+        self._last = time.monotonic()
         await self._edit(line)
 
     async def set_error(self, detail: str) -> None:
@@ -390,11 +421,12 @@ class TelegramGateway:
             self._pending, chat_id, context.bot, self._approval_required
         )
         answer_parts: list[str] = []
+        tool_args: dict[str, dict] = {}  # tool_call id -> arguments, to caption media results
         try:
             async for ev in self._agent.run(session, text, model, approver=approver):
                 if ev["type"] == "assistant_delta":
                     answer_parts.append(ev["content"])
-                await self._handle_event(ev, editor, context.bot, chat_id)
+                await self._handle_event(ev, editor, context.bot, chat_id, tool_args)
             await editor.flush(final=True)
         except Exception as exc:
             log.exception("Telegram turn failed")
@@ -486,35 +518,52 @@ class TelegramGateway:
         except Exception:
             pass
 
-    async def _handle_event(self, ev: dict, editor: _StreamEditor, bot, chat_id) -> None:
+    async def _handle_event(
+        self, ev: dict, editor: _StreamEditor, bot, chat_id, tool_args: dict
+    ) -> None:
         t = ev["type"]
         if t == "assistant_delta":
             editor.add(ev["content"])
             await editor.flush()
         elif t == "tool_call":
             await editor.note(f"⚙️ {ev['name']}…")
+            tool_args[ev.get("id")] = ev.get("arguments", {})  # kept to caption the result
+        elif t == "tool_progress":
+            await editor.progress(_progress_bar(ev["fraction"], ev.get("label", "")))
         elif t == "tool_result" and ev["ok"]:
             # Media tools return a saved file path as their content; play each modality
             # back into the chat by mirroring the image path. Non-media results are
             # text-only (folded into the streamed answer), so they aren't routed here.
             name = ev["name"]
+            # Caption with the generating prompt so the user can tell which request a clip
+            # (which can land minutes later, after other turns) actually belongs to.
+            prompt = (tool_args.get(ev.get("id")) or {}).get("prompt")
             if name in ("generate_image", "edit_image"):
-                await self._send_photo(bot, chat_id, ev["content"])
+                await self._send_photo(bot, chat_id, ev["content"], caption=prompt)
             elif name == "generate_video":
-                await self._send_video(bot, chat_id, ev["content"])
+                await self._send_video(bot, chat_id, ev["content"], caption=prompt)
         elif t == "error":
             await editor.set_error(ev["detail"])
 
-    async def _send_photo(self, bot, chat_id, path: str) -> None:
+    async def _send_photo(self, bot, chat_id, path: str, caption: str | None = None) -> None:
         try:
             with open(path, "rb") as fh:
-                await bot.send_photo(chat_id, photo=fh)
+                await bot.send_photo(
+                    chat_id, photo=fh, caption=_clip_caption(caption),
+                    read_timeout=120, write_timeout=120, connect_timeout=30,
+                )
         except Exception:
             log.exception("failed to send generated image")
 
-    async def _send_video(self, bot, chat_id, path: str) -> None:
+    async def _send_video(self, bot, chat_id, path: str, caption: str | None = None) -> None:
         try:
             with open(path, "rb") as fh:
-                await bot.send_video(chat_id, video=fh)
+                # Generous timeouts: a multi-MB upload plus Telegram's server-side video
+                # processing routinely overruns the short default read_timeout, which logged
+                # the upload as failed even when the clip actually went through (false error).
+                await bot.send_video(
+                    chat_id, video=fh, caption=_clip_caption(caption),
+                    read_timeout=300, write_timeout=300, connect_timeout=30,
+                )
         except Exception:
             log.exception("failed to send generated video")

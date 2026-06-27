@@ -13,12 +13,16 @@ class FakeVideo:
     def __init__(self, available: bool = True):
         self._available = available
         self.calls: list[tuple] = []
+        self.progress_seen = None
 
     def available(self) -> bool:
         return self._available
 
-    async def generate_video(self, prompt, *, num_frames=None, seed=None) -> Path:
+    async def generate_video(self, prompt, *, num_frames=None, seed=None, progress=None) -> Path:
         self.calls.append((prompt, num_frames, seed))
+        self.progress_seen = progress
+        if progress is not None:
+            progress(0.5, "1/2")  # a backend would call this per denoising step
         return Path("/tmp/vid_abc123.mp4")
 
 

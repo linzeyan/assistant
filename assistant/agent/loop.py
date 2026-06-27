@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -158,6 +159,8 @@ class AgentLoop:
                         "arguments": tc["arguments"],
                     }
                     tool = self._registry.get(tc["name"])
+                    result: ToolResult | None = None
+                    run_it = False  # set by whichever branch authorizes execution
                     if tool is None:
                         result = ToolResult(False, f"unknown tool: {tc['name']}")
                     else:
@@ -165,7 +168,7 @@ class AgentLoop:
                         # unresolved "ask" falls through to the interactive/policy approver.
                         decision = self._rule_decision(tool, tc["arguments"])
                         if decision == "allow":
-                            result = await self._run_tool(tool, tc)
+                            run_it = True
                         elif decision == "deny":
                             result = ToolResult(False, f"denied by rule: tool '{tool.name}'")
                         elif tool.needs_approval and getattr(
@@ -183,7 +186,7 @@ class AgentLoop:
                             }
                             if await effective_approver.wait(token):
                                 self._remember(tool, tc["arguments"])  # ask-once-per-session
-                                result = await self._run_tool(tool, tc)
+                                run_it = True
                             else:
                                 result = ToolResult(
                                     False, f"denied: tool '{tool.name}' requires approval"
@@ -193,7 +196,22 @@ class AgentLoop:
                                 False, f"denied: tool '{tool.name}' requires approval"
                             )
                         else:
-                            result = await self._run_tool(tool, tc)
+                            run_it = True
+                    # Run the tool (whichever path allowed it) while forwarding any progress
+                    # it reports as tool_progress events — long media tools stream a bar
+                    # instead of going silent for minutes. Non-reporting tools just resolve.
+                    if run_it:
+                        async for sub in self._run_tool_with_progress(tool, tc):
+                            if sub["type"] == "progress":
+                                yield {
+                                    "type": "tool_progress",
+                                    "id": tc["id"],
+                                    "name": tc["name"],
+                                    "fraction": sub["fraction"],
+                                    "label": sub["label"],
+                                }
+                            else:
+                                result = sub["result"]
                     session.messages.append(
                         {"role": "tool", "tool_call_id": tc["id"], "content": result.content}
                     )
@@ -320,6 +338,36 @@ class AgentLoop:
     def _remember(self, tool, arguments: dict) -> None:
         if self._ask_once:
             self._granted.add((tool.name, resource_of(arguments)))
+
+    async def _run_tool_with_progress(self, tool, tc: dict):
+        """Run a tool, yielding ``{"type": "progress", ...}`` for each tick it reports and a
+        final ``{"type": "result", "result": ToolResult}``.
+
+        Tools call ``ctx.on_progress(fraction, label)`` to report; for a tool that offloads
+        to a worker thread (video gen) that callback fires off-loop, so we marshal ticks onto
+        a queue via ``call_soon_threadsafe`` and drain them while the tool runs. The sink is
+        scoped to this single run and always cleared, so non-reporting tools are unaffected.
+        """
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        self._ctx.on_progress = lambda fraction, label="": loop.call_soon_threadsafe(
+            queue.put_nowait, (fraction, label)
+        )
+        task = asyncio.ensure_future(self._run_tool(tool, tc))
+        try:
+            while not task.done():
+                try:
+                    fraction, label = await asyncio.wait_for(queue.get(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    continue
+                yield {"type": "progress", "fraction": fraction, "label": label}
+            while not queue.empty():  # ticks that landed just before completion
+                fraction, label = queue.get_nowait()
+                yield {"type": "progress", "fraction": fraction, "label": label}
+            yield {"type": "result", "result": task.result()}
+        finally:
+            self._ctx.on_progress = None
+            task.cancel()  # no-op once done; tidies the orphan if the caller stops early
 
     async def _run_tool(self, tool, tc: dict) -> ToolResult:
         # Hook seam (P2): tool_call can veto or mutate args (post-approval, trusted), and
