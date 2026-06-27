@@ -25,6 +25,18 @@ from pathlib import Path
 # (fraction in [0, 1], short "step/total" label) — reported per denoising step.
 ProgressFn = Callable[[float, str], None]
 
+# Named resolutions → (width, height). Wan's VAE stride (16) × patch (2) means dims must be
+# multiples of 32 (the lib floors to that anyway); these are 32-aligned ~16:9 sizes. Default
+# is the smallest: TI2V-5B at 1280×704 takes ~20 min/clip on a Mac, but cost scales with
+# pixel area, so 360p (~4× fewer pixels) brings a short clip down to a few minutes.
+_RESOLUTIONS: dict[str, tuple[int, int]] = {
+    "360p": (640, 352),
+    "480p": (832, 480),
+    "540p": (960, 544),
+    "720p": (1280, 704),
+}
+DEFAULT_RESOLUTION = "360p"
+
 
 def _valid_num_frames(n: int) -> int:
     """Coerce a frame count to the Wan/LTX-required ``4·k + 1`` (the pipeline asserts this).
@@ -85,8 +97,11 @@ class VideoService(ABC):
         self,
         prompt: str,
         *,
+        resolution: str | None = None,
         num_frames: int | None = None,
+        steps: int | None = None,
         seed: int | None = None,
+        negative_prompt: str | None = None,
         progress: ProgressFn | None = None,
     ) -> Path:
         """Generate a short video and return the path to the saved file.
@@ -130,8 +145,11 @@ class MlxVideoBackend(VideoService):
         self,
         prompt: str,
         *,
+        resolution: str | None = None,
         num_frames: int | None = None,
+        steps: int | None = None,
         seed: int | None = None,
+        negative_prompt: str | None = None,
         progress: ProgressFn | None = None,
     ) -> Path:
         if not self.available():
@@ -140,14 +158,24 @@ class MlxVideoBackend(VideoService):
                 'Install with: uv pip install -e ".[video]"'
             )
         return await asyncio.to_thread(
-            self._generate_sync, prompt, num_frames, seed, progress
+            self._generate_sync,
+            prompt,
+            resolution,
+            num_frames,
+            steps,
+            seed,
+            negative_prompt,
+            progress,
         )
 
     def _generate_sync(
         self,
         prompt: str,
+        resolution: str | None,
         num_frames: int | None,
+        steps: int | None,
         seed: int | None,
+        negative_prompt: str | None,
         progress: ProgressFn | None = None,
     ) -> Path:
         if self._checkpoint is None or not self._checkpoint.is_dir():
@@ -163,11 +191,20 @@ class MlxVideoBackend(VideoService):
             from mlx_video.models.wan_2 import generate as _genmod
 
         out = self._dir / f"vid_{uuid.uuid4().hex[:8]}.mp4"
-        kwargs: dict = {}
+        # Default to a small, fast resolution; everything else (steps/guide/shift/negative)
+        # stays None so the lib falls back to the checkpoint's config defaults.
+        width, height = _RESOLUTIONS.get(
+            (resolution or DEFAULT_RESOLUTION).lower(), _RESOLUTIONS[DEFAULT_RESOLUTION]
+        )
+        kwargs: dict = {"width": width, "height": height}
         if num_frames is not None:
             kwargs["num_frames"] = _valid_num_frames(num_frames)
+        if steps is not None:
+            kwargs["steps"] = steps
         if seed is not None:
             kwargs["seed"] = seed
+        if negative_prompt is not None:
+            kwargs["negative_prompt"] = negative_prompt
         # generate_video writes to output_path and returns None — return the path we chose.
         # The lib exposes no progress callback, so to stream a per-step bar we temporarily
         # wrap the module-level tqdm it iterates over the diffusion steps with (desc=

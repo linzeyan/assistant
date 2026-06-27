@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from assistant.models.mlx_video import _valid_num_frames
+from assistant.models.mlx_video import DEFAULT_RESOLUTION, _RESOLUTIONS, _valid_num_frames
 from assistant.tools import build_registry
 from assistant.tools.base import ToolContext
 
@@ -12,14 +12,33 @@ from assistant.tools.base import ToolContext
 class FakeVideo:
     def __init__(self, available: bool = True):
         self._available = available
-        self.calls: list[tuple] = []
+        self.calls: list[dict] = []
         self.progress_seen = None
 
     def available(self) -> bool:
         return self._available
 
-    async def generate_video(self, prompt, *, num_frames=None, seed=None, progress=None) -> Path:
-        self.calls.append((prompt, num_frames, seed))
+    async def generate_video(
+        self,
+        prompt,
+        *,
+        resolution=None,
+        num_frames=None,
+        steps=None,
+        seed=None,
+        negative_prompt=None,
+        progress=None,
+    ) -> Path:
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "resolution": resolution,
+                "num_frames": num_frames,
+                "steps": steps,
+                "seed": seed,
+                "negative_prompt": negative_prompt,
+            }
+        )
         self.progress_seen = progress
         if progress is not None:
             progress(0.5, "1/2")  # a backend would call this per denoising step
@@ -37,7 +56,24 @@ async def test_generate_video_returns_path(tmp_path):
         {"prompt": "a dog surfing", "num_frames": 48, "seed": 7}, ctx
     )
     assert res.ok and res.content.endswith(".mp4")
-    assert backend.calls == [("a dog surfing", 48, 7)]
+    call = backend.calls[0]
+    assert (call["prompt"], call["num_frames"], call["seed"]) == ("a dog surfing", 48, 7)
+    # Unspecified knobs reach the backend as None, so it applies its own defaults (360p etc.).
+    assert call["resolution"] is None and call["steps"] is None
+
+
+async def test_generate_video_forwards_overrides(tmp_path):
+    # WHY: the model maps a user's "720p, 5 seconds, quick draft" onto these args; the tool
+    # must pass them through verbatim rather than swallow them.
+    backend = FakeVideo()
+    ctx = ToolContext(cwd=tmp_path, video=backend)
+    await _tool().handler(
+        {"prompt": "x", "resolution": "720p", "steps": 20, "negative_prompt": "blurry"}, ctx
+    )
+    call = backend.calls[0]
+    assert call["resolution"] == "720p"
+    assert call["steps"] == 20
+    assert call["negative_prompt"] == "blurry"
 
 
 async def test_generate_video_unavailable(tmp_path):
@@ -50,6 +86,16 @@ async def test_generate_video_no_backend(tmp_path):
     ctx = ToolContext(cwd=tmp_path)  # video=None
     res = await _tool().handler({"prompt": "x"}, ctx)
     assert not res.ok and "unavailable" in res.content
+
+
+def test_resolutions_are_32_aligned_and_default_is_cheapest():
+    # WHY: Wan's VAE stride (16) × patch (2) requires width/height divisible by 32, and the
+    # default must be the smallest so a clip is fast (a few min) unless the user opts up.
+    assert DEFAULT_RESOLUTION in _RESOLUTIONS
+    for name, (w, h) in _RESOLUTIONS.items():
+        assert w % 32 == 0 and h % 32 == 0, name
+    areas = {n: w * h for n, (w, h) in _RESOLUTIONS.items()}
+    assert areas[DEFAULT_RESOLUTION] == min(areas.values())
 
 
 def test_valid_num_frames_rounds_to_4n_plus_1():
