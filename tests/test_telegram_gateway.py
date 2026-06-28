@@ -8,6 +8,7 @@ from assistant.gateway.telegram import (
     _clip_error,
     _progress_bar,
     _render_telegram_html,
+    _weak_at_tools,
 )
 from assistant.models.types import ModelInfo
 from assistant.tools.base import Tool
@@ -344,6 +345,31 @@ def test_effective_workspace_prefers_per_chat_over_default():
     assert gw._effective_workspace(42) == "/srv/default"  # falls back to server default
     gw._workspace[42] = "/home/proj"
     assert gw._effective_workspace(42) == "/home/proj"  # this chat's /cd wins
+
+
+def test_weak_at_tools_flags_thinking_models_but_not_coder():
+    # The two models that fabricated "git diff" live must be flagged...
+    assert _weak_at_tools("mlx-community/DeepSeek-R1-Distill-Qwen-32B-MLX-8Bit")
+    assert _weak_at_tools("mlx-community/Qwen3-30B-A3B-8bit")
+    # ...but the tool-caller to prefer must NOT be (it's also -30B-A3B).
+    assert not _weak_at_tools("mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit")
+    assert not _weak_at_tools("mlx-community/Qwen2.5-7B-Instruct")
+
+
+async def test_models_picker_marks_weak_models(tmp_path):
+    models = [ModelInfo("Qwen3-Coder-30B-A3B-Instruct", type="llm"),
+              ModelInfo("DeepSeek-R1-Distill-Qwen-32B", type="llm")]
+    gw = _gateway(models=models)
+    update = Mock()
+    update.effective_chat.id = 42
+    update.effective_user.id = 7
+    update.message.reply_text = AsyncMock()
+    gw._allowed = {7}
+    await gw._on_models(update, Mock())
+    kwargs = update.message.reply_text.await_args.kwargs
+    labels = [b.text for row in kwargs["reply_markup"].inline_keyboard for b in row]
+    assert any("⚠️" in lbl and "DeepSeek-R1" in lbl for lbl in labels)
+    assert not any("⚠️" in lbl and "Coder" in lbl for lbl in labels)
 
 
 def test_clip_error_caps_runaway_dump():

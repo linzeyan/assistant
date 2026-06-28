@@ -41,6 +41,19 @@ log = logging.getLogger("assistant.telegram")
 # from auto-selecting a video / embedding model that can't serve a chat turn.
 _CHATTABLE_KINDS = ("llm", "vlm")
 
+# Reasoning/instruct models that, in practice, don't emit agentic tool calls — they describe
+# what they'd do and fabricate success (observed live: DeepSeek-R1-Distill and Qwen3-30B-A3B
+# both ran "git diff" with ZERO tool calls). Flagged in the /models picker so the user doesn't
+# pick one for coding. Substring match is deliberately narrow: "qwen3-30b-a3b" matches the
+# thinking variant but NOT "qwen3-coder-30b-a3b" (the tool-caller to prefer).
+_WEAK_TOOL_MARKERS = ("deepseek-r1", "r1-distill", "qwq", "qwen3-30b-a3b", "thinking")
+
+
+def _weak_at_tools(model_id: str) -> bool:
+    low = model_id.lower()
+    return any(m in low for m in _WEAK_TOOL_MARKERS)
+
+
 # --- Telegram HTML rendering (think collapse + a small markdown subset) ---
 # Telegram's HTML parse mode only allows a few tags (<b> <i> <code> <pre> <blockquote>…),
 # NOT headings — so ### becomes bold. Everything must be HTML-escaped or the whole message
@@ -352,12 +365,16 @@ class TelegramGateway:
         # button by catalog index and resolve it back on tap (the chattable order is stable).
         rows = [
             [InlineKeyboardButton(
-                f"{'● ' if m.id == current else '○ '}{m.id}", callback_data=f"model:{i}")]
+                f"{'● ' if m.id == current else '○ '}{'⚠️ ' if _weak_at_tools(m.id) else ''}{m.id}",
+                callback_data=f"model:{i}")]
             for i, m in enumerate(models)
         ]
-        await update.message.reply_text(
-            "Pick the chat model:", reply_markup=InlineKeyboardMarkup(rows)
+        note = (
+            "Pick the chat model:\n⚠️ = weak at tool calls; for coding use a *-Coder-Instruct."
+            if any(_weak_at_tools(m.id) for m in models)
+            else "Pick the chat model:"
         )
+        await update.message.reply_text(note, reply_markup=InlineKeyboardMarkup(rows))
 
     def _video_catalog(self):
         # Loadable mlx-video checkpoints across the configured model dirs (cheap filesystem
