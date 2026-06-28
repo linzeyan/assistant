@@ -246,6 +246,8 @@ struct ChatEvent: Decodable {
     let detail: String?
     let token: String?  // approval_request: the id to POST back to /chat/approve
     let usage: Usage?   // done: token accounting for the just-finished turn
+    let summary: String?  // turn_diff: "N files changed (+x/-y)"
+    let diff: String?     // turn_diff: the unified diff of files the turn changed
 
     /// Estimated token counts carried by the terminal `done` event (backend tokens.py).
     struct Usage: Decodable {
@@ -259,7 +261,7 @@ struct ChatEvent: Decodable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case type, content, name, ok, detail, token, usage
+        case type, content, name, ok, detail, token, usage, summary, diff
         case sessionId = "session_id"
     }
 }

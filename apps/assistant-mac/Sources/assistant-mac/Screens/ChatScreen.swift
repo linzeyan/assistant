@@ -4,10 +4,11 @@ import SwiftUI
 
 struct ChatMessage: Identifiable {
     let id = UUID()
-    let role: String  // "user" | "assistant" | "tool" | "media"
+    let role: String  // "user" | "assistant" | "tool" | "media" | "diff"
     var text: String
     var mediaKind: String? = nil  // "image" | "video"
     var mediaPath: String? = nil
+    var diff: String? = nil  // role "diff": the unified diff body, shown collapsible
 }
 
 /// A tool call paused awaiting the user's Approve/Deny.
@@ -227,6 +228,8 @@ private struct MessageRow: View {
     @ViewBuilder private var content: some View {
         if message.role == "media", let kind = message.mediaKind, let path = message.mediaPath {
             MediaView(kind: kind, path: path)
+        } else if message.role == "diff" {
+            DiffBubble(summary: message.text, diff: message.diff ?? "", background: background)
         } else if message.role == "assistant" {
             AssistantBubble(text: message.text, background: background, isStreaming: isStreaming)
         } else {
@@ -241,9 +244,42 @@ private struct MessageRow: View {
     private var background: Color {
         switch message.role {
         case "user": return Color.accentColor.opacity(0.18)
-        case "tool": return Color.secondary.opacity(0.12)
+        case "tool", "diff": return Color.secondary.opacity(0.12)
         default: return Color.gray.opacity(0.12)
         }
+    }
+}
+
+/// A turn's file changes: a summary line that expands to the unified diff (monospaced,
+/// scrollable, selectable). Collapsible so a large diff doesn't dominate the transcript.
+private struct DiffBubble: View {
+    let summary: String
+    let diff: String
+    let background: Color
+    @State private var expanded = true
+
+    var body: some View {
+        Group {
+            if diff.isEmpty {
+                Text(summary)
+            } else {
+                DisclosureGroup(isExpanded: $expanded) {
+                    ScrollView([.horizontal, .vertical]) {
+                        Text(diff)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 4)
+                    }
+                    .frame(maxHeight: 320)
+                } label: {
+                    Text(summary).font(.callout)
+                }
+            }
+        }
+        .padding(10)
+        .background(background)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
 

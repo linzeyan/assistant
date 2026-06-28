@@ -141,6 +141,12 @@ final class ChatModel: ObservableObject {
                     break
                 }
             }
+        case "turn_diff":
+            currentAssistant = nil
+            messages.append(ChatMessage(
+                role: "diff",
+                text: "✏️ \(event.summary ?? "files changed")",
+                diff: event.diff))
         case "error":
             messages.append(ChatMessage(role: "tool", text: "⚠️ \(event.detail ?? "error")"))
         case "done":

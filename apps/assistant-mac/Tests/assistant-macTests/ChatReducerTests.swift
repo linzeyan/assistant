@@ -75,6 +75,18 @@ struct ChatReducerTests {
         #expect(model.messages.isEmpty)
     }
 
+    @Test func turnDiffBecomesDiffRow() throws {
+        let model = ChatModel()
+        var current: Int?
+        model.reduce(
+            try event(#"{"type":"turn_diff","summary":"1 file changed (+1/-0)","diff":"+hi\n"}"#),
+            currentAssistant: &current)
+        #expect(model.messages.count == 1)
+        #expect(model.messages[0].role == "diff")
+        #expect(model.messages[0].text.contains("1 file changed"))
+        #expect(model.messages[0].diff == "+hi\n")
+    }
+
     @Test func errorEventAddsToolRowWithDetail() throws {
         let model = ChatModel()
         var current: Int?
