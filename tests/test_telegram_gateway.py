@@ -532,6 +532,19 @@ async def test_handle_event_sends_generated_video(tmp_path):
     bot.send_photo.assert_not_awaited()  # routed as video, never as an image
 
 
+async def test_handle_event_sends_text_to_speech_as_voice(tmp_path):
+    clip = tmp_path / "out.wav"
+    clip.write_bytes(b"RIFF")  # a real file so _send_audio can open() it
+    bot = Mock()
+    bot.send_voice = AsyncMock()
+    bot.send_photo = AsyncMock()
+    await _gateway()._handle_event(
+        _media_result("text_to_speech", content=str(clip)), Mock(), bot, 42, {}
+    )
+    bot.send_voice.assert_awaited_once()  # routed as a voice message
+    bot.send_photo.assert_not_awaited()
+
+
 async def test_handle_event_image_routing_unchanged(tmp_path):
     img = tmp_path / "out.png"
     img.write_bytes(b"\x89PNG")

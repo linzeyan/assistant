@@ -668,6 +668,8 @@ class TelegramGateway:
                 await self._send_photo(bot, chat_id, ev["content"], caption=prompt)
             elif name == "generate_video":
                 await self._send_video(bot, chat_id, ev["content"], caption=prompt)
+            elif name == "text_to_speech":
+                await self._send_audio(bot, chat_id, ev["content"])
         elif t == "turn_diff":
             await self._send_diff(bot, chat_id, ev)
         elif t == "error":
@@ -695,6 +697,18 @@ class TelegramGateway:
                 )
         except Exception:
             log.exception("failed to send generated video")
+
+    async def _send_audio(self, bot, chat_id, path: str, caption: str | None = None) -> None:
+        # Play a text_to_speech result back as a Telegram voice message (same format mlx-audio
+        # produces for _send_voice_reply), mirroring the image/video result routing.
+        try:
+            with open(path, "rb") as fh:
+                await bot.send_voice(
+                    chat_id, voice=fh, caption=_clip_caption(caption),
+                    read_timeout=120, write_timeout=120, connect_timeout=30,
+                )
+        except Exception:
+            log.exception("failed to send generated audio")
 
     # Above this, a diff is sent inline as an HTML <pre> block; beyond it (or many files),
     # it goes as a .diff document so it isn't truncated at Telegram's 4096-char message cap.
