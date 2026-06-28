@@ -57,7 +57,7 @@ async def test_tool_call_block_prevents_handler_running():
         return ToolResult(True, "ran")
 
     tool = Tool(name="bash", description="", parameters={}, handler=handler, needs_approval=True)
-    result = await _loop(reg)._run_tool(tool, {"id": "1", "arguments": {"command": "ls"}})
+    result = await _loop(reg)._run_tool(tool, {"id": "1", "arguments": {"command": "ls"}}, None)
     assert result.ok is False and "blocked by hook: nope" in result.content
     assert ran == []  # handler never ran
 
@@ -69,7 +69,9 @@ async def test_tool_call_mutation_reaches_handler():
     async def redact(name, args):
         return ToolGate(arguments={"command": "safe"})
 
-    result = await _loop(reg)._run_tool(_echo_tool(), {"id": "1", "arguments": {"command": "danger"}})
+    result = await _loop(reg)._run_tool(
+        _echo_tool(), {"id": "1", "arguments": {"command": "danger"}}, None
+    )
     assert "safe" in result.content and "danger" not in result.content
 
 
@@ -80,7 +82,9 @@ async def test_tool_result_can_be_replaced():
     async def cap(name, result):
         return ToolResult(result.ok, "REPLACED")
 
-    result = await _loop(reg)._run_tool(_echo_tool(), {"id": "1", "arguments": {"command": "ls"}})
+    result = await _loop(reg)._run_tool(
+        _echo_tool(), {"id": "1", "arguments": {"command": "ls"}}, None
+    )
     assert result.content == "REPLACED"
 
 

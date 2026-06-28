@@ -214,6 +214,7 @@ class TelegramGateway:
         audio=None,
         video=None,
         model_dirs=None,
+        default_workspace=None,
     ):
         self._token = token
         self._allowed = set(allowed_users or [])
@@ -236,6 +237,11 @@ class TelegramGateway:
         # precedence over default_model in pick_model, so a Telegram user can switch
         # models without touching config.
         self._selected_model: dict[int, str] = {}
+        # Per-chat working directory, set via /cd. Workspace is per-conversation: confirm it
+        # before a coding session; all turns in this chat then operate there. Falls back to
+        # the server default when unset.
+        self._default_workspace = str(default_workspace) if default_workspace else None
+        self._workspace: dict[int, str] = {}
 
     # --- lifecycle ---
 
@@ -245,6 +251,7 @@ class TelegramGateway:
         app = Application.builder().token(self._token).build()
         app.add_handler(CommandHandler("start", self._on_start))
         app.add_handler(CommandHandler("models", self._on_models))
+        app.add_handler(CommandHandler("cd", self._on_cd))
         app.add_handler(CommandHandler("video", self._on_video))
         app.add_handler(CommandHandler("videoset", self._on_videoset))
         app.add_handler(CallbackQueryHandler(self._on_callback))
@@ -258,6 +265,7 @@ class TelegramGateway:
                 [
                     ("start", "Show status and usage"),
                     ("models", "Pick the chat model"),
+                    ("cd", "Set the working directory for this chat"),
                     ("video", "Pick the video-generation model"),
                     ("videoset", "Video defaults: resolution & quality"),
                 ]
@@ -459,6 +467,27 @@ class TelegramGateway:
         )
         return False
 
+    def _effective_workspace(self, chat_id: int) -> str | None:
+        # This chat's /cd choice wins over the server default; None lets the loop use its own
+        # configured workspace_dir.
+        return self._workspace.get(chat_id) or self._default_workspace
+
+    async def _on_cd(self, update: "Update", context) -> None:
+        chat_id = update.effective_chat.id
+        arg = " ".join(context.args).strip() if getattr(context, "args", None) else ""
+        if not arg:
+            cur = self._effective_workspace(chat_id) or "(server default)"
+            await update.message.reply_text(
+                f"📂 Working directory: {cur}\nUse /cd <path> to change it for this chat."
+            )
+            return
+        path = Path(arg).expanduser()
+        if not path.is_dir():
+            await update.message.reply_text(f"Not a directory: {path}")
+            return
+        self._workspace[chat_id] = str(path.resolve())
+        await update.message.reply_text(f"📂 Working directory set to {self._workspace[chat_id]}")
+
     async def _run_turn(
         self, update: "Update", context, text: str, *, voice_reply: bool
     ) -> None:
@@ -477,7 +506,8 @@ class TelegramGateway:
         answer_parts: list[str] = []
         tool_args: dict[str, dict] = {}  # tool_call id -> arguments, to caption media results
         try:
-            async for ev in self._agent.run(session, text, model, approver=approver):
+            cwd = self._effective_workspace(chat_id)
+            async for ev in self._agent.run(session, text, model, approver=approver, cwd=cwd):
                 if ev["type"] == "assistant_delta":
                     answer_parts.append(ev["content"])
                 await self._handle_event(ev, editor, context.bot, chat_id, tool_args)

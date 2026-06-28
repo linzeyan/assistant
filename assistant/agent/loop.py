@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -75,10 +76,15 @@ class AgentLoop:
         user_text: str,
         model: str,
         approver: ApprovalPolicy | None = None,
+        cwd: str | Path | None = None,
     ) -> AsyncIterator[dict]:
         # Per-run approver lets the Telegram gateway inject an interactive (inline
         # button) approver while the desktop path uses the default policy approver.
         effective_approver = approver or self._approver
+        # Per-run working directory: workspace is per-conversation, so the Telegram gateway
+        # passes the chat's chosen dir here. A copy (not a mutation of the shared ctx) keeps
+        # concurrent turns isolated and leaves the desktop/HTTP default untouched.
+        ctx = self._ctx if cwd is None else replace(self._ctx, cwd=Path(cwd))
         # Prefix stability (S2+S3): the system prompt is STABLE (base + skills index only)
         # and is reinstalled only when its fingerprint changes, so the cacheable prefix
         # stays byte-identical turn-to-turn. Per-turn memory is kept OUT of it and instead
@@ -141,7 +147,7 @@ class AgentLoop:
                         self._trace.record(trace.finalize("answered"))
                     # Return what the agent changed on disk (write/edit) so a gateway can show
                     # a diff / file — code results are first-class, not just the text reply.
-                    diff_event = self._turn_diff_event(turn_snapshots)
+                    diff_event = self._turn_diff_event(turn_snapshots, ctx)
                     if diff_event is not None:
                         yield diff_event
                     # Surface a context-usage readout (estimate): context_tokens is the whole
@@ -212,8 +218,8 @@ class AgentLoop:
                     # it reports as tool_progress events — long media tools stream a bar
                     # instead of going silent for minutes. Non-reporting tools just resolve.
                     if run_it:
-                        self._snapshot_before_edit(tc, turn_snapshots)
-                        async for sub in self._run_tool_with_progress(tool, tc):
+                        self._snapshot_before_edit(tc, turn_snapshots, ctx)
+                        async for sub in self._run_tool_with_progress(tool, tc, ctx):
                             if sub["type"] == "progress":
                                 yield {
                                     "type": "tool_progress",
@@ -351,7 +357,7 @@ class AgentLoop:
         if self._ask_once:
             self._granted.add((tool.name, resource_of(arguments)))
 
-    async def _run_tool_with_progress(self, tool, tc: dict):
+    async def _run_tool_with_progress(self, tool, tc: dict, ctx: ToolContext):
         """Run a tool, yielding ``{"type": "progress", ...}`` for each tick it reports and a
         final ``{"type": "result", "result": ToolResult}``.
 
@@ -362,10 +368,10 @@ class AgentLoop:
         """
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
-        self._ctx.on_progress = lambda fraction, label="": loop.call_soon_threadsafe(
+        ctx.on_progress = lambda fraction, label="": loop.call_soon_threadsafe(
             queue.put_nowait, (fraction, label)
         )
-        task = asyncio.ensure_future(self._run_tool(tool, tc))
+        task = asyncio.ensure_future(self._run_tool(tool, tc, ctx))
         try:
             while not task.done():
                 try:
@@ -378,10 +384,10 @@ class AgentLoop:
                 yield {"type": "progress", "fraction": fraction, "label": label}
             yield {"type": "result", "result": task.result()}
         finally:
-            self._ctx.on_progress = None
+            ctx.on_progress = None
             task.cancel()  # no-op once done; tidies the orphan if the caller stops early
 
-    async def _run_tool(self, tool, tc: dict) -> ToolResult:
+    async def _run_tool(self, tool, tc: dict, ctx: ToolContext) -> ToolResult:
         # Hook seam (P2): tool_call can veto or mutate args (post-approval, trusted), and
         # tool_result can observe or replace the outcome. Centralised here so every run
         # path (rule-allowed, interactively granted, policy-allowed) fires them uniformly.
@@ -389,7 +395,7 @@ class AgentLoop:
         if gate.block:
             return ToolResult(False, f"blocked by hook: {gate.reason}")
         try:
-            result = await tool.handler(gate.arguments, self._ctx)
+            result = await tool.handler(gate.arguments, ctx)
         except Exception as exc:  # never let a tool crash take down the turn
             result = ToolResult(False, f"error running {tool.name}: {exc}")
         return await self._hooks.fire_tool_result(tool.name, result)
@@ -398,7 +404,9 @@ class AgentLoop:
     # out of scope for this first cut (a git-status fallback could catch them later).
     _EDIT_TOOLS = ("write_file", "edit_file")
 
-    def _snapshot_before_edit(self, tc: dict, snapshots: dict[str, bytes | None]) -> None:
+    def _snapshot_before_edit(
+        self, tc: dict, snapshots: dict[str, bytes | None], ctx: ToolContext
+    ) -> None:
         """Record a write/edit target's bytes before its first touch this turn (None when the
         file is new), so the turn diff can show before→after. Only the earliest snap wins."""
         if tc["name"] not in self._EDIT_TOOLS:
@@ -408,7 +416,7 @@ class AgentLoop:
             return
         path = Path(raw)
         if not path.is_absolute():
-            path = self._ctx.cwd / path
+            path = ctx.cwd / path
         key = str(path)
         if key in snapshots:
             return
@@ -417,7 +425,9 @@ class AgentLoop:
         except OSError:
             snapshots[key] = None  # new file — didn't exist before this turn
 
-    def _turn_diff_event(self, snapshots: dict[str, bytes | None]) -> dict | None:
+    def _turn_diff_event(
+        self, snapshots: dict[str, bytes | None], ctx: ToolContext
+    ) -> dict | None:
         """Read each snapshotted file's current bytes and build a turn_diff event, or None if
         nothing net-changed (e.g. an edit that wrote identical content, or a binary-only touch
         that produced no diff lines)."""
@@ -431,7 +441,7 @@ class AgentLoop:
             except OSError:
                 after = None
             try:
-                display = str(path.relative_to(self._ctx.cwd))
+                display = str(path.relative_to(ctx.cwd))
             except ValueError:
                 display = str(path)
             pairs[display] = (before, after)

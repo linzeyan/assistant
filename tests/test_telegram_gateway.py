@@ -315,6 +315,37 @@ async def test_send_diff_large_goes_as_document():
     bot.send_message.assert_not_awaited()
 
 
+async def test_on_cd_sets_per_chat_workspace(tmp_path):
+    gw = _gateway()
+    update = Mock()
+    update.effective_chat.id = 42
+    update.message.reply_text = AsyncMock()
+    context = Mock()
+    context.args = [str(tmp_path)]
+    await gw._on_cd(update, context)
+    assert gw._workspace[42] == str(tmp_path.resolve())
+
+
+async def test_on_cd_rejects_non_directory():
+    gw = _gateway()
+    update = Mock()
+    update.effective_chat.id = 42
+    update.message.reply_text = AsyncMock()
+    context = Mock()
+    context.args = ["/no/such/dir/zzz"]
+    await gw._on_cd(update, context)
+    assert 42 not in gw._workspace  # nothing recorded
+    assert "Not a directory" in update.message.reply_text.call_args.args[0]
+
+
+def test_effective_workspace_prefers_per_chat_over_default():
+    gw = _gateway()
+    gw._default_workspace = "/srv/default"
+    assert gw._effective_workspace(42) == "/srv/default"  # falls back to server default
+    gw._workspace[42] = "/home/proj"
+    assert gw._effective_workspace(42) == "/home/proj"  # this chat's /cd wins
+
+
 def test_clip_error_caps_runaway_dump():
     # A model-load ValueError can list hundreds of weight names (Lance-3B-Video dumped
     # 1606); the reply must stay short, not become a multi-KB key dump.

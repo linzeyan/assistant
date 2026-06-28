@@ -35,6 +35,8 @@ async def build_and_start(settings, app) -> tuple[object | None, str | None]:
         # Same dirs discovery scans for chat models, so /video lists checkpoints from the
         # user's configured model locations (primary + extras).
         model_dirs=[settings.models_dir, *settings.extra_model_dirs],
+        # Shown by /cd when a chat hasn't picked its own working directory yet.
+        default_workspace=settings.workspace_dir,
     )
     try:
         await gateway.start()

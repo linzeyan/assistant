@@ -107,6 +107,38 @@ async def test_turn_diff_emitted_for_file_edits(tmp_path):
     assert types.index("tool_result") < types.index("turn_diff") < types.index("done")
 
 
+async def test_run_cwd_override_directs_tools_and_diff(tmp_path):
+    # WHY: workspace is per-conversation — run(cwd=...) overrides where the edit tools operate
+    # (and where the turn diff is computed) for this turn only, without mutating the shared
+    # ToolContext other turns/entries share.
+    other = tmp_path / "proj"
+    other.mkdir()
+    llm = FakeLLM(
+        [
+            [
+                {
+                    "type": "tool_calls",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "name": "write_file",
+                            "arguments": {"path": "a.py", "content": "x = 1\n"},
+                        }
+                    ],
+                }
+            ],
+            [{"type": "text", "content": "done"}],
+        ]
+    )
+    loop = _loop(llm, tmp_path, approval_required=False)  # base cwd = tmp_path
+    events = await _collect(loop.run(Session(id="s1"), "go", "m", cwd=str(other)))
+    assert (other / "a.py").read_text() == "x = 1\n"  # wrote into the override dir
+    assert not (tmp_path / "a.py").exists()  # not the base cwd
+    td = next(e for e in events if e["type"] == "turn_diff")
+    assert td["files"][0]["path"] == "a.py"  # path shown relative to the override cwd
+    assert loop._ctx.cwd == tmp_path  # shared ctx left untouched
+
+
 async def test_tool_then_final_answer(tmp_path):
     (tmp_path / "x.txt").write_text("FILE BODY")
     llm = FakeLLM(
