@@ -655,7 +655,10 @@ class TelegramGateway:
             await editor.note(f"⚙️ {ev['name']}…")
             tool_args[ev.get("id")] = ev.get("arguments", {})  # kept to caption the result
         elif t == "tool_progress":
-            await editor.progress(_progress_bar(ev["fraction"], ev.get("label", "")))
+            if ev.get("fraction", 0) < 0:  # heartbeat: indeterminate, show elapsed working time
+                await editor.progress(f"🛠️ {ev.get('name', 'working')} … {ev.get('label', '')}")
+            else:
+                await editor.progress(_progress_bar(ev["fraction"], ev.get("label", "")))
         elif t == "tool_result" and ev["ok"]:
             # Media tools return a saved file path as their content; play each modality
             # back into the chat by mirroring the image path. Non-media results are

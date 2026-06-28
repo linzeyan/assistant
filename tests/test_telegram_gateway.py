@@ -593,6 +593,18 @@ async def test_handle_event_captions_video_with_its_prompt(tmp_path):
     assert bot.send_video.await_args.kwargs["caption"] == "a pikachu surfing"
 
 
+async def test_handle_event_heartbeat_renders_generic_working_line():
+    # A heartbeat tick (fraction < 0) must render as a plain "working…" line, NOT the video bar.
+    editor = AsyncMock()
+    await _gateway()._handle_event(
+        {"type": "tool_progress", "name": "bash", "fraction": -1.0, "label": "1:05"},
+        editor, Mock(), 42, {},
+    )
+    line = editor.progress.await_args.args[0]
+    assert "🛠️" in line and "bash" in line and "1:05" in line
+    assert "Generating video" not in line
+
+
 def test_progress_bar_renders_fraction_and_clamps():
     assert _progress_bar(0.0, "0/40") == "🎬 Generating video ░░░░░░░░░░░░ 0% (0/40)"
     assert _progress_bar(0.5, "20/40").startswith("🎬 Generating video ██████░░░░░░ 50%")

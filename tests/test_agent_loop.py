@@ -1,3 +1,5 @@
+import asyncio
+
 from assistant.agent.loop import AgentLoop
 from assistant.agent.session import Session
 from assistant.tools import build_registry
@@ -74,6 +76,29 @@ async def test_tool_progress_events_streamed(tmp_path):
     assert types.index("tool_call") < types.index("tool_progress") < types.index("tool_result")
     # on_progress is scoped to the run and cleared afterwards (no leak into later tools).
     assert loop._ctx.on_progress is None
+
+
+async def test_heartbeat_emitted_for_silent_long_tool(tmp_path):
+    # WHY: a long tool that reports no progress of its own (bash, web fetch) must not look
+    # frozen — the loop emits an elapsed-time heartbeat (fraction < 0) so a gateway can show
+    # "working…".
+    async def slow(args, ctx):
+        await asyncio.sleep(0.3)  # silent: never calls ctx.on_progress
+        return ToolResult(True, "ok")
+
+    reg = ToolRegistry()
+    reg.register(Tool("slow", "", {"type": "object", "properties": {}}, slow))
+    llm = FakeLLM(
+        [
+            [{"type": "tool_calls", "tool_calls": [{"id": "c1", "name": "slow", "arguments": {}}]}],
+            [{"type": "text", "content": "done"}],
+        ]
+    )
+    loop = AgentLoop(llm, reg, PolicyApprover(approval_required=False), ToolContext(cwd=tmp_path))
+    loop._HEARTBEAT_SECS = 0.05  # fire quickly instead of the 5s default
+    events = await _collect(loop.run(Session(id="hb"), "go", "m"))
+    hb = [e for e in events if e["type"] == "tool_progress" and e["fraction"] < 0]
+    assert hb and ":" in hb[0]["label"]  # elapsed "m:ss"
 
 
 async def test_turn_diff_emitted_for_file_edits(tmp_path):

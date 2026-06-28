@@ -385,13 +385,25 @@ class AgentLoop:
             queue.put_nowait, (fraction, label)
         )
         task = asyncio.ensure_future(self._run_tool(tool, tc, ctx))
+        t0 = loop.time()
+        last_emit = t0
         try:
             while not task.done():
                 try:
                     fraction, label = await asyncio.wait_for(queue.get(), timeout=0.25)
+                    yield {"type": "progress", "fraction": fraction, "label": label}
+                    last_emit = loop.time()
                 except asyncio.TimeoutError:
-                    continue
-                yield {"type": "progress", "fraction": fraction, "label": label}
+                    # Heartbeat: a long, silent tool (bash, web fetch) must not look frozen.
+                    # Once it's run a while with no progress of its own, emit an elapsed-time
+                    # tick (fraction <0 marks it indeterminate, not a real bar) so the gateway
+                    # can show "working…". Suppressed while a tool reports real progress.
+                    now = loop.time()
+                    if now - last_emit >= self._HEARTBEAT_SECS:
+                        el = int(now - t0)
+                        yield {"type": "progress", "fraction": -1.0,
+                               "label": f"{el // 60}:{el % 60:02d}"}
+                        last_emit = now
             while not queue.empty():  # ticks that landed just before completion
                 fraction, label = queue.get_nowait()
                 yield {"type": "progress", "fraction": fraction, "label": label}
@@ -414,8 +426,11 @@ class AgentLoop:
         return await self._hooks.fire_tool_result(tool.name, result)
 
     # Tools whose target file we snapshot to build the turn diff. shell-created files are
-    # out of scope for this first cut (a git-status fallback could catch them later).
+    # caught separately via git (see _snapshot_before_shell / _merge_shell_changes).
     _EDIT_TOOLS = ("write_file", "edit_file")
+    # How long a tool may run silently before _run_tool_with_progress emits an elapsed-time
+    # heartbeat. Tests override this on the instance to fire it quickly.
+    _HEARTBEAT_SECS = 5.0
 
     def _snapshot_before_edit(
         self, tc: dict, snapshots: dict[str, bytes | None], ctx: ToolContext
