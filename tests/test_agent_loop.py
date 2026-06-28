@@ -76,6 +76,37 @@ async def test_tool_progress_events_streamed(tmp_path):
     assert loop._ctx.on_progress is None
 
 
+async def test_turn_diff_emitted_for_file_edits(tmp_path):
+    # WHY: code results are first-class — a turn that writes/edits files emits a turn_diff
+    # event (after the edits, before done) so a gateway can return the diff to the user.
+    llm = FakeLLM(
+        [
+            [
+                {
+                    "type": "tool_calls",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "name": "write_file",
+                            "arguments": {"path": "hello.py", "content": "print('hi')\n"},
+                        }
+                    ],
+                }
+            ],
+            [{"type": "text", "content": "done"}],
+        ]
+    )
+    events = await _collect(
+        _loop(llm, tmp_path, approval_required=False).run(Session(id="s1"), "make it", "m")
+    )
+    td = next(e for e in events if e["type"] == "turn_diff")
+    assert td["files"][0]["path"] == "hello.py"
+    assert td["files"][0]["status"] == "added"
+    assert "print('hi')" in td["diff"]
+    types = [e["type"] for e in events]  # ordered: result → diff → done
+    assert types.index("tool_result") < types.index("turn_diff") < types.index("done")
+
+
 async def test_tool_then_final_answer(tmp_path):
     (tmp_path / "x.txt").write_text("FILE BODY")
     llm = FakeLLM(

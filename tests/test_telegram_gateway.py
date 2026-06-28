@@ -291,6 +291,30 @@ def test_videoset_markup_marks_current_resolution(tmp_path):
     assert "● 480p" in labels and "○ 360p" in labels
 
 
+async def test_send_diff_small_goes_inline_as_pre():
+    bot = Mock()
+    bot.send_message = AsyncMock()
+    bot.send_document = AsyncMock()
+    await _gateway()._send_diff(
+        bot, 42, {"summary": "1 file changed (+1/-0)", "files": [{"path": "a"}], "diff": "+hi\n"}
+    )
+    bot.send_message.assert_awaited_once()
+    args, kwargs = bot.send_message.await_args
+    assert kwargs.get("parse_mode") == "HTML" and "<pre>" in args[1]
+    bot.send_document.assert_not_awaited()
+
+
+async def test_send_diff_large_goes_as_document():
+    bot = Mock()
+    bot.send_message = AsyncMock()
+    bot.send_document = AsyncMock()
+    big = "+x\n" * 2000  # well over the inline limit → must be sent as a .diff file
+    await _gateway()._send_diff(bot, 42, {"summary": "big", "files": [{"path": "a"}], "diff": big})
+    bot.send_document.assert_awaited_once()
+    assert bot.send_document.await_args.kwargs["filename"] == "changes.diff"
+    bot.send_message.assert_not_awaited()
+
+
 def test_clip_error_caps_runaway_dump():
     # A model-load ValueError can list hundreds of weight names (Lance-3B-Video dumped
     # 1606); the reply must stay short, not become a multi-KB key dump.

@@ -599,6 +599,8 @@ class TelegramGateway:
                 await self._send_photo(bot, chat_id, ev["content"], caption=prompt)
             elif name == "generate_video":
                 await self._send_video(bot, chat_id, ev["content"], caption=prompt)
+        elif t == "turn_diff":
+            await self._send_diff(bot, chat_id, ev)
         elif t == "error":
             await editor.set_error(ev["detail"])
 
@@ -624,3 +626,42 @@ class TelegramGateway:
                 )
         except Exception:
             log.exception("failed to send generated video")
+
+    # Above this, a diff is sent inline as an HTML <pre> block; beyond it (or many files),
+    # it goes as a .diff document so it isn't truncated at Telegram's 4096-char message cap.
+    _DIFF_INLINE_LIMIT = 3500
+
+    async def _send_diff(self, bot, chat_id, ev: dict) -> None:
+        # Return what the agent changed on disk: a short diff inline, a big one as a file.
+        summary = ev.get("summary") or "files changed"
+        diff = ev.get("diff") or ""
+        header = f"✏️ {summary}"
+        if not diff:  # e.g. binary-only change — still tell the user what changed
+            await self._safe_send_message(bot, chat_id, header)
+            return
+        if len(diff) <= self._DIFF_INLINE_LIMIT and len(ev.get("files", [])) <= 10:
+            html = f"{_html.escape(header)}\n<pre>{_html.escape(diff)}</pre>"
+            try:
+                await bot.send_message(chat_id, html, parse_mode="HTML")
+                return
+            except Exception:
+                pass  # over-long / bad HTML → fall through to the document path
+        tmp = Path(tempfile.gettempdir()) / f"changes_{chat_id}.diff"
+        try:
+            tmp.write_text(diff, encoding="utf-8")
+            with open(tmp, "rb") as fh:
+                await bot.send_document(
+                    chat_id, document=fh, filename="changes.diff",
+                    caption=_clip_caption(header),
+                    read_timeout=120, write_timeout=120, connect_timeout=30,
+                )
+        except Exception:
+            log.exception("failed to send turn diff")
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    async def _safe_send_message(self, bot, chat_id, text: str) -> None:
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception:
+            log.exception("failed to send message")

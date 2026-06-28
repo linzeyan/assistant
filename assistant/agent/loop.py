@@ -6,12 +6,14 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from datetime import datetime
+from pathlib import Path
 
 from assistant.tools.approval import ApprovalPolicy, Rule, resource_of
 from assistant.tools.base import ToolContext, ToolResult
 from assistant.tools.registry import ToolRegistry
 
 from .compaction import CompactionManager
+from .diff import build_turn_changes
 from .hooks import HookRegistry
 from .llm_client import AsyncLLM
 from .prompt import build_system_prompt, wrap_datetime_context, wrap_memory_context
@@ -108,6 +110,10 @@ class AgentLoop:
         # P0 trace: assemble a per-turn record as the loop runs; recorded at each exit point.
         trace = TurnTrace.new(session.id, model, user_text) if self._trace else None
         step: TraceStep | None = None  # current iteration's step; visible to the except below
+        # Turn-scoped file snapshots (abs path -> bytes before its first edit this turn) so we
+        # can return a diff of what the agent changed (Spring 2 P2/P3). Local, not instance
+        # state, so concurrent turns don't clobber each other.
+        turn_snapshots: dict[str, bytes | None] = {}
 
         try:
             for _ in range(self._max_iters):
@@ -133,6 +139,11 @@ class AgentLoop:
                         trace.steps.append(step)
                         trace.final_text = answer
                         self._trace.record(trace.finalize("answered"))
+                    # Return what the agent changed on disk (write/edit) so a gateway can show
+                    # a diff / file — code results are first-class, not just the text reply.
+                    diff_event = self._turn_diff_event(turn_snapshots)
+                    if diff_event is not None:
+                        yield diff_event
                     # Surface a context-usage readout (estimate): context_tokens is the whole
                     # conversation's footprint — the number compaction (S6) keys off — and
                     # output_tokens is this reply. Heuristic; see agent/tokens.py.
@@ -201,6 +212,7 @@ class AgentLoop:
                     # it reports as tool_progress events — long media tools stream a bar
                     # instead of going silent for minutes. Non-reporting tools just resolve.
                     if run_it:
+                        self._snapshot_before_edit(tc, turn_snapshots)
                         async for sub in self._run_tool_with_progress(tool, tc):
                             if sub["type"] == "progress":
                                 yield {
@@ -381,3 +393,62 @@ class AgentLoop:
         except Exception as exc:  # never let a tool crash take down the turn
             result = ToolResult(False, f"error running {tool.name}: {exc}")
         return await self._hooks.fire_tool_result(tool.name, result)
+
+    # Tools whose target file we snapshot to build the turn diff. shell-created files are
+    # out of scope for this first cut (a git-status fallback could catch them later).
+    _EDIT_TOOLS = ("write_file", "edit_file")
+
+    def _snapshot_before_edit(self, tc: dict, snapshots: dict[str, bytes | None]) -> None:
+        """Record a write/edit target's bytes before its first touch this turn (None when the
+        file is new), so the turn diff can show before→after. Only the earliest snap wins."""
+        if tc["name"] not in self._EDIT_TOOLS:
+            return
+        raw = (tc.get("arguments") or {}).get("path")
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.is_absolute():
+            path = self._ctx.cwd / path
+        key = str(path)
+        if key in snapshots:
+            return
+        try:
+            snapshots[key] = path.read_bytes()
+        except OSError:
+            snapshots[key] = None  # new file — didn't exist before this turn
+
+    def _turn_diff_event(self, snapshots: dict[str, bytes | None]) -> dict | None:
+        """Read each snapshotted file's current bytes and build a turn_diff event, or None if
+        nothing net-changed (e.g. an edit that wrote identical content, or a binary-only touch
+        that produced no diff lines)."""
+        if not snapshots:
+            return None
+        pairs: dict[str, tuple[bytes | None, bytes | None]] = {}
+        for key, before in snapshots.items():
+            path = Path(key)
+            try:
+                after = path.read_bytes()
+            except OSError:
+                after = None
+            try:
+                display = str(path.relative_to(self._ctx.cwd))
+            except ValueError:
+                display = str(path)
+            pairs[display] = (before, after)
+        changes = build_turn_changes(pairs)
+        if not changes.files:
+            return None
+        return {
+            "type": "turn_diff",
+            "summary": changes.summary(),
+            "files": [
+                {
+                    "path": f.path,
+                    "status": f.status,
+                    "additions": f.additions,
+                    "deletions": f.deletions,
+                }
+                for f in changes.files
+            ],
+            "diff": changes.diff,
+        }
