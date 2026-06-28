@@ -15,6 +15,7 @@ from assistant.tools.registry import ToolRegistry
 
 from .compaction import CompactionManager
 from .diff import build_turn_changes
+from .git_changes import dirty_paths, head_bytes, repo_root
 from .hooks import HookRegistry
 from .llm_client import AsyncLLM
 from .prompt import (
@@ -126,6 +127,9 @@ class AgentLoop:
         # can return a diff of what the agent changed (Spring 2 P2/P3). Local, not instance
         # state, so concurrent turns don't clobber each other.
         turn_snapshots: dict[str, bytes | None] = {}
+        # git baseline captured on the first bash call, so the turn diff can also show files
+        # shell touched (not just write/edit targets). Empty until then; see _git_changes.py.
+        shell_state: dict = {}
 
         try:
             for _ in range(self._max_iters):
@@ -151,8 +155,10 @@ class AgentLoop:
                         trace.steps.append(step)
                         trace.final_text = answer
                         self._trace.record(trace.finalize("answered"))
-                    # Return what the agent changed on disk (write/edit) so a gateway can show
-                    # a diff / file — code results are first-class, not just the text reply.
+                    # Return what the agent changed on disk so a gateway can show a diff —
+                    # code results are first-class, not just the text reply. Fold in any
+                    # shell-touched files (via git) before building the diff.
+                    self._merge_shell_changes(shell_state, turn_snapshots)
                     diff_event = self._turn_diff_event(turn_snapshots, ctx)
                     if diff_event is not None:
                         yield diff_event
@@ -225,6 +231,7 @@ class AgentLoop:
                     # instead of going silent for minutes. Non-reporting tools just resolve.
                     if run_it:
                         self._snapshot_before_edit(tc, turn_snapshots, ctx)
+                        self._snapshot_before_shell(tc, shell_state, ctx)
                         async for sub in self._run_tool_with_progress(tool, tc, ctx):
                             if sub["type"] == "progress":
                                 yield {
@@ -430,6 +437,45 @@ class AgentLoop:
             snapshots[key] = path.read_bytes()
         except OSError:
             snapshots[key] = None  # new file — didn't exist before this turn
+
+    def _snapshot_before_shell(
+        self, tc: dict, state: dict, ctx: ToolContext
+    ) -> None:
+        """On the first bash call, record git's pre-shell baseline so the turn diff can later
+        show what shell changed. Snapshots only the already-dirty files' bytes (their true
+        'before'); clean files fall back to their committed content at merge time."""
+        if tc["name"] != "bash" or state.get("captured"):
+            return
+        state["captured"] = True
+        root = repo_root(ctx.cwd)
+        state["root"] = root
+        if root is None:
+            return  # not a git repo — shell changes simply aren't captured
+        pre = dirty_paths(root)
+        pre_bytes: dict[str, bytes | None] = {}
+        for rel in pre:
+            try:
+                pre_bytes[rel] = (root / rel).read_bytes()
+            except OSError:
+                pre_bytes[rel] = None
+        state["pre_bytes"] = pre_bytes
+
+    def _merge_shell_changes(self, state: dict, snapshots: dict[str, bytes | None]) -> None:
+        """Fold shell-touched files into the snapshots so they flow through the diff builder.
+        'before' = pre-shell bytes for files already dirty, else committed (HEAD) bytes for
+        files clean before shell, else None for new untracked files. Files unchanged net of
+        the turn are dropped later by the diff builder (before == after)."""
+        root = state.get("root")
+        if root is None:
+            return
+        pre_bytes = state.get("pre_bytes", {})
+        for rel in dirty_paths(root):
+            abspath = str(root / rel)
+            if abspath in snapshots:
+                continue  # write/edit already captured this file
+            snapshots[abspath] = (
+                pre_bytes[rel] if rel in pre_bytes else head_bytes(root, rel)
+            )
 
     def _turn_diff_event(
         self, snapshots: dict[str, bytes | None], ctx: ToolContext

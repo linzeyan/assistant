@@ -139,6 +139,34 @@ async def test_run_cwd_override_directs_tools_and_diff(tmp_path):
     assert loop._ctx.cwd == tmp_path  # shared ctx left untouched
 
 
+async def test_turn_diff_includes_shell_created_files(tmp_path):
+    # WHY: write/edit snapshots can't see files the bash tool creates. In a git repo the loop
+    # discovers them and folds them into the turn diff, so "make a file via shell" still
+    # returns what changed.
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
+    (tmp_path / "seed.txt").write_text("x\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "init"], check=True)
+
+    llm = FakeLLM(
+        [
+            [{"type": "tool_calls", "tool_calls": [
+                {"id": "c1", "name": "bash", "arguments": {"command": "echo hi > made.txt"}}]}],
+            [{"type": "text", "content": "done"}],
+        ]
+    )
+    events = await _collect(
+        _loop(llm, tmp_path, approval_required=False).run(Session(id="sh"), "make a file", "m")
+    )
+    td = next(e for e in events if e["type"] == "turn_diff")
+    # macOS tmp lives under a /private symlink so the path may be absolute; match by suffix.
+    assert any(f["path"].endswith("made.txt") and f["status"] == "added" for f in td["files"])
+
+
 async def test_tool_then_final_answer(tmp_path):
     (tmp_path / "x.txt").write_text("FILE BODY")
     llm = FakeLLM(
