@@ -17,7 +17,12 @@ from .compaction import CompactionManager
 from .diff import build_turn_changes
 from .hooks import HookRegistry
 from .llm_client import AsyncLLM
-from .prompt import build_system_prompt, wrap_datetime_context, wrap_memory_context
+from .prompt import (
+    build_system_prompt,
+    wrap_datetime_context,
+    wrap_memory_context,
+    wrap_workspace_context,
+)
 from .session import Session
 from .tokens import estimate_messages_tokens, estimate_tokens
 from .trace import TraceStep, TraceStore, TurnTrace
@@ -111,6 +116,7 @@ class AgentLoop:
         # which has no clock — stops hallucinating "today" from its training cutoff.
         context_blocks = [
             wrap_datetime_context(datetime.now().astimezone()),
+            wrap_workspace_context(ctx.cwd),
             wrap_memory_context(memory_block) if memory_block else "",
         ]
         # P0 trace: assemble a per-turn record as the loop runs; recorded at each exit point.

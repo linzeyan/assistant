@@ -266,6 +266,35 @@ async def test_forwards_max_output_tokens_to_llm(tmp_path):
     assert captured.get("max_tokens") == 2048
 
 
+async def test_injects_working_directory_into_user_turn(tmp_path):
+    """A local model has no idea where it is, so a bare 'git diff' gets a guessed path. The
+    per-turn working directory (here a run(cwd=...) override, as /cd sets) must reach the model
+    on the latest user turn so shell/file commands execute in the workspace."""
+    captured: dict = {}
+
+    class CapturingLLM:
+        def stream_chat(self, messages, model, tools=None, **params):
+            captured["messages"] = messages
+
+            async def gen():
+                yield {"type": "text", "content": "ok"}
+
+            return gen()
+
+    other = tmp_path / "proj"
+    other.mkdir()
+    loop = AgentLoop(
+        CapturingLLM(),
+        build_registry(),
+        PolicyApprover(approval_required=False),
+        ToolContext(cwd=tmp_path),
+    )
+    await _collect(loop.run(Session(id="w1"), "git diff", "m", cwd=str(other)))
+    last_user = [m for m in captured["messages"] if m["role"] == "user"][-1]
+    assert "Working directory:" in last_user["content"]
+    assert str(other) in last_user["content"]  # the /cd override, not the base cwd
+
+
 async def test_injects_current_date_into_user_turn(tmp_path):
     """A local model has no clock; the current date rides the latest user message (not the
     system prompt) so 'today' isn't hallucinated from the training cutoff. Verified by

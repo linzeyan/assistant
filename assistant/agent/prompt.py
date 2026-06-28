@@ -62,6 +62,18 @@ def wrap_memory_context(memory_block: str) -> str:
     return f"<memory-context reference-only>\n{memory_block}\n</memory-context>"
 
 
+def wrap_workspace_context(cwd) -> str:
+    """The agent's working directory as a reference block riding the *current user turn* (never
+    the cacheable system prefix, S3). Without it a local model has no idea where it is, so a
+    bare "git diff" / file request gets a guessed path (observed: a model ran `cd /Users/Shared
+    && ls -la` instead of running git in the workspace) rather than executing in the workspace."""
+    return (
+        f"<workspace reference-only>\nWorking directory: {cwd}\n"
+        "Run shell and file commands here; relative paths resolve against it.\n"
+        "</workspace>"
+    )
+
+
 def wrap_datetime_context(now: datetime) -> str:
     """Current date/time as a reference block that rides the *current user turn*, never the
     system prompt (which must stay a byte-stable cacheable prefix, S3). Local models have no

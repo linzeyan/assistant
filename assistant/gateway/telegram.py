@@ -242,13 +242,22 @@ class TelegramGateway:
         # the server default when unset.
         self._default_workspace = str(default_workspace) if default_workspace else None
         self._workspace: dict[int, str] = {}
+        # Per-chat turn lock: with concurrent_updates(True) two quick messages would otherwise
+        # run turns on the same session at once and race its history. See _run_turn.
+        self._turn_locks: dict[int, asyncio.Lock] = {}
 
     # --- lifecycle ---
 
     async def start(self) -> None:
         if not _PTB_AVAILABLE:
             raise RuntimeError("python-telegram-bot is not installed")
-        app = Application.builder().token(self._token).build()
+        # concurrent_updates: a coding turn blocks its handler on `await future` while it waits
+        # for the user's inline Approve tap. With PTB's default sequential dispatch, that tap's
+        # callback update can never be processed (the single worker is busy in the message
+        # handler) — so approval always timed out to DENY. Processing updates concurrently lets
+        # the approval callback resolve the waiting turn. (Tools needing approval — write/edit/
+        # shell — were the first to hit this; media tools don't require approval.)
+        app = Application.builder().token(self._token).concurrent_updates(True).build()
         app.add_handler(CommandHandler("start", self._on_start))
         app.add_handler(CommandHandler("models", self._on_models))
         app.add_handler(CommandHandler("cd", self._on_cd))
@@ -488,38 +497,51 @@ class TelegramGateway:
         self._workspace[chat_id] = str(path.resolve())
         await update.message.reply_text(f"📂 Working directory set to {self._workspace[chat_id]}")
 
+    def _chat_lock(self, chat_id: int) -> asyncio.Lock:
+        lock = self._turn_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._turn_locks[chat_id] = lock
+        return lock
+
     async def _run_turn(
         self, update: "Update", context, text: str, *, voice_reply: bool
     ) -> None:
         chat_id = update.effective_chat.id
-        model = await self.pick_model(chat_id)
-        if model is None:
-            await update.message.reply_text("No model is available. Load one first.")
-            return
+        # Serialize turns within a chat: with concurrent_updates(True) a second message could
+        # otherwise start a turn on the same session while the first is mid-flight, racing the
+        # shared history. Approval callbacks don't go through here, so they stay unblocked.
+        async with self._chat_lock(chat_id):
+            model = await self.pick_model(chat_id)
+            if model is None:
+                await update.message.reply_text("No model is available. Load one first.")
+                return
 
-        session = self._sessions.get_or_create(f"tg:{chat_id}", model=model)
-        placeholder = await update.message.reply_text("…")
-        editor = _StreamEditor(context.bot, chat_id, placeholder.message_id)
-        approver = TelegramApprover(
-            self._pending, chat_id, context.bot, self._approval_required
-        )
-        answer_parts: list[str] = []
-        tool_args: dict[str, dict] = {}  # tool_call id -> arguments, to caption media results
-        try:
-            cwd = self._effective_workspace(chat_id)
-            async for ev in self._agent.run(session, text, model, approver=approver, cwd=cwd):
-                if ev["type"] == "assistant_delta":
-                    answer_parts.append(ev["content"])
-                await self._handle_event(ev, editor, context.bot, chat_id, tool_args)
-            await editor.flush(final=True)
-        except Exception as exc:
-            log.exception("Telegram turn failed")
-            await editor.set_error(str(exc))
-            return
-        if voice_reply:
-            await self._send_voice_reply(
-                context.bot, chat_id, "".join(answer_parts).strip()
+            session = self._sessions.get_or_create(f"tg:{chat_id}", model=model)
+            placeholder = await update.message.reply_text("…")
+            editor = _StreamEditor(context.bot, chat_id, placeholder.message_id)
+            approver = TelegramApprover(
+                self._pending, chat_id, context.bot, self._approval_required
             )
+            answer_parts: list[str] = []
+            tool_args: dict[str, dict] = {}  # tool_call id -> args, to caption media results
+            try:
+                cwd = self._effective_workspace(chat_id)
+                async for ev in self._agent.run(
+                    session, text, model, approver=approver, cwd=cwd
+                ):
+                    if ev["type"] == "assistant_delta":
+                        answer_parts.append(ev["content"])
+                    await self._handle_event(ev, editor, context.bot, chat_id, tool_args)
+                await editor.flush(final=True)
+            except Exception as exc:
+                log.exception("Telegram turn failed")
+                await editor.set_error(str(exc))
+                return
+            if voice_reply:
+                await self._send_voice_reply(
+                    context.bot, chat_id, "".join(answer_parts).strip()
+                )
 
     async def _transcribe_message(self, update: "Update", context) -> str | None:
         media = update.message.voice or update.message.audio

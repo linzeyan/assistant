@@ -378,6 +378,37 @@ async def test_approver_auto_approves_when_not_required():
     bot.send_message.assert_not_awaited()
 
 
+async def test_on_callback_approve_resolves_pending_future():
+    # WHY: the live deadlock (approval taps did nothing) hid that _on_callback's ok:/no:
+    # routing was never unit-tested. Pin it: an "ok:<token>" tap resolves that token's
+    # waiting future to True so the agent loop proceeds.
+    gw = _gateway()
+    fut = asyncio.get_event_loop().create_future()
+    gw._pending["abc123"] = fut
+    query = Mock()
+    query.data = "ok:abc123"
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+    update = Mock()
+    update.callback_query = query
+    await gw._on_callback(update, Mock())
+    assert fut.result() is True
+
+
+async def test_on_callback_deny_resolves_future_false():
+    gw = _gateway()
+    fut = asyncio.get_event_loop().create_future()
+    gw._pending["abc123"] = fut
+    query = Mock()
+    query.data = "no:abc123"
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+    update = Mock()
+    update.callback_query = query
+    await gw._on_callback(update, Mock())
+    assert fut.result() is False
+
+
 async def test_approver_resolves_on_user_tap():
     pending: dict = {}
     bot = Mock()
