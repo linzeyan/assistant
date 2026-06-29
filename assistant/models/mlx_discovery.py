@@ -82,6 +82,9 @@ _ENCODER_TYPES = {
 # Diffusion video model_type tags (Wan family: sound/text/image-to-video). These are
 # generative video, not chat — see classify_kind for why misclassifying them matters.
 _VIDEO_TYPES = {"s2v", "ti2v", "t2v", "i2v"}
+# Diffusion image-pipeline class/arch markers (FLUX, Qwen-Image via mflux). A diffusers
+# pipeline declares its class in model_index.json (_class_name "FluxPipeline" / "QwenImage…").
+_IMAGE_CLASS_MARKERS = ("flux", "qwenimage", "qwen_image", "stablediffusion")
 
 
 def _read_config(d: Path) -> dict:
@@ -89,6 +92,24 @@ def _read_config(d: Path) -> dict:
         return json.loads((d / "config.json").read_text())
     except (OSError, ValueError):
         return {}
+
+
+def _read_model_index(d: Path) -> dict:
+    """diffusers pipelines (FLUX / Qwen-Image) declare their class in model_index.json, not
+    config.json — read it so classify_kind can tell an image pipeline from a chat model."""
+    try:
+        return json.loads((d / "model_index.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _is_image_model(cfg: dict, d: Path) -> bool:
+    archs = cfg.get("architectures") or []
+    blob = f"{(archs[0] if archs else '')} {cfg.get('_class_name') or ''}".lower()
+    if any(m in blob for m in _IMAGE_CLASS_MARKERS) and "video" not in blob:
+        return True
+    cls = str(_read_model_index(d).get("_class_name") or "").lower()
+    return any(m in cls for m in _IMAGE_CLASS_MARKERS) and "video" not in cls
 
 
 def classify_kind(d: Path) -> str:
@@ -103,6 +124,12 @@ def classify_kind(d: Path) -> str:
     # "No safetensors found" (weights are diffusion_pytorch_model-*, not LM format).
     if mtype in _VIDEO_TYPES or "wan" in cls_name or "video" in cls_name:
         return "video"
+    # Diffusion image pipelines (FLUX / Qwen-Image via mflux). Checked before the vae→video
+    # rule below because an image checkpoint also ships a VAE — the FLUX/Qwen-Image pipeline
+    # class is the distinguishing signal. Keeps them under the Models "Image" tab rather than
+    # fail-opening to "llm".
+    if _is_image_model(cfg, d):
+        return "image"
     # A chat-arch config (Qwen-VL / causal-LM) that ALSO ships a diffusion VAE is really a
     # generation / "omni" checkpoint, not a clean chat model — e.g. Lance-3B-Video declares
     # model_type qwen2_5_vl but carries extra generation heads + a vae.safetensors that

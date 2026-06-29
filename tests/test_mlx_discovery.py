@@ -155,6 +155,24 @@ def test_classify_kind_omni_with_vae_is_not_chattable(tmp_path):
     assert classify_kind(d) == "video"  # not "vlm" → excluded from the chat list
 
 
+def test_classify_kind_image_via_pipeline_class(tmp_path):
+    # A FLUX/Qwen-Image diffusers checkpoint declares its pipeline in model_index.json and
+    # also ships a VAE — without the image branch it would read as "video" (the vae rule) or
+    # "llm". It belongs under the Models "Image" tab.
+    d = tmp_path / "flux"
+    d.mkdir()
+    (d / "model_index.json").write_text(json.dumps({"_class_name": "FluxPipeline"}))
+    (d / "vae.safetensors").write_bytes(b"\x00")  # image checkpoints carry a VAE too
+    assert classify_kind(d) == "image"
+
+
+def test_classify_kind_qwen_image_via_arch(tmp_path):
+    d = tmp_path / "qi"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"architectures": ["QwenImageTransformer2DModel"]}))
+    assert classify_kind(d) == "image"
+
+
 def _make_video_ckpt(d: Path, *, dual: bool = False, t5: bool = True, vae: bool = True) -> Path:
     """A converted-MLX Wan checkpoint: config + vae + t5_encoder + transformer weight(s)."""
     d.mkdir(parents=True, exist_ok=True)
