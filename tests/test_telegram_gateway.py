@@ -78,8 +78,34 @@ class _FakeVideo:
         self.steps = steps
 
 
+class _FakeImages:
+    def __init__(self, available=True):
+        self._available = available
+        self.model = "schnell"
+        self._w, self._h = 1024, 1024
+        self.steps = None
+
+    def available(self):
+        return self._available
+
+    def set_model(self, name):
+        self.model = name
+
+    @property
+    def size(self):
+        return (self._w, self._h)
+
+    def set_size(self, name):
+        if name in ("512", "768", "1024"):
+            self._w = self._h = int(name)
+
+    def set_steps(self, steps):
+        self.steps = steps
+
+
 def _gateway(
-    allowed=None, models=None, default=None, audio=None, video=None, model_dirs=None
+    allowed=None, models=None, default=None, audio=None, video=None, images=None,
+    model_dirs=None
 ) -> TelegramGateway:
     return TelegramGateway(
         token="x",
@@ -90,6 +116,7 @@ def _gateway(
         default_model=default,
         audio=audio,
         video=video,
+        images=images,
         model_dirs=model_dirs,
     )
 
@@ -273,6 +300,33 @@ async def test_apply_video_choice_handles_stale_index(tmp_path):
     await gw._apply_video_choice(query)
     assert video.set_to == "UNSET"  # nothing applied
     query.edit_message_text.assert_awaited_with("That video model is no longer available.")
+
+
+async def test_apply_image_choice_sets_backend_model():
+    images = _FakeImages()
+    gw = _gateway(images=images)
+    query = Mock()
+    query.data = "imodel:dev"
+    query.edit_message_reply_markup = AsyncMock()
+    await gw._apply_image_choice(query)
+    assert images.model == "dev"  # /image picker switched the alias
+    query.edit_message_reply_markup.assert_awaited()
+
+
+async def test_apply_imageset_choice_sets_size_and_steps():
+    images = _FakeImages()
+    gw = _gateway(images=images)
+    query = Mock()
+    query.edit_message_reply_markup = AsyncMock()
+    query.data = "isize:768"
+    await gw._apply_imageset_choice(query)
+    assert images.size == (768, 768)
+    query.data = "isteps:8"
+    await gw._apply_imageset_choice(query)
+    assert images.steps == 8
+    query.data = "isteps:0"  # "Default steps" → clear
+    await gw._apply_imageset_choice(query)
+    assert images.steps is None
 
 
 async def test_videoset_taps_set_backend_defaults(tmp_path):

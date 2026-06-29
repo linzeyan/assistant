@@ -226,6 +226,7 @@ class TelegramGateway:
         approval_required: bool = True,
         audio=None,
         video=None,
+        images=None,
         model_dirs=None,
         default_workspace=None,
         default_store=None,
@@ -248,6 +249,9 @@ class TelegramGateway:
         # picker (N28). The picker sets the backend's active checkpoint at runtime.
         self._video = video
         self._video_dirs = [Path(d) for d in (model_dirs or [])]
+        # Optional image-generation backend (MlxImageBackend). Powers /image (pick the mflux
+        # alias) and /imageset (default size & steps), which set the backend's knobs at runtime.
+        self._images = images
         self._app = None
         self._pending: dict[str, asyncio.Future] = {}
         # Per-chat model override, set via the /models inline-keyboard picker. Takes
@@ -280,6 +284,8 @@ class TelegramGateway:
         app.add_handler(CommandHandler("cd", self._on_cd))
         app.add_handler(CommandHandler("video", self._on_video))
         app.add_handler(CommandHandler("videoset", self._on_videoset))
+        app.add_handler(CommandHandler("image", self._on_image))
+        app.add_handler(CommandHandler("imageset", self._on_imageset))
         app.add_handler(CallbackQueryHandler(self._on_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self._on_voice))
@@ -294,6 +300,8 @@ class TelegramGateway:
                     ("cd", "Set the working directory for this chat"),
                     ("video", "Pick the video-generation model"),
                     ("videoset", "Video defaults: resolution & quality"),
+                    ("image", "Pick the image-generation model"),
+                    ("imageset", "Image defaults: size & steps"),
                 ]
             )
         except Exception:
@@ -468,6 +476,102 @@ class TelegramGateway:
         except Exception:
             pass  # "not modified" (re-tapping the current choice) is non-fatal
 
+    # --- image generation pickers (/image, /imageset) — mirror the /video pair ---
+
+    async def _on_image(self, update: "Update", context) -> None:
+        if not await self._ensure_allowed(update):
+            return
+        if self._images is None or not self._images.available():
+            await update.message.reply_text(
+                "Image generation is unavailable (install mflux on the backend)."
+            )
+            return
+        from assistant.images.mlx_backend import IMAGE_MODELS
+
+        current = self._images.model
+        rows = [
+            [InlineKeyboardButton(
+                f"{'● ' if name == current else '○ '}{name}", callback_data=f"imodel:{name}")]
+            for name in IMAGE_MODELS
+        ]
+        await update.message.reply_text(
+            "Pick the image-generation model (schnell = fast, dev = higher quality):",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    # Step presets for /imageset; None ("Default") lets the alias decide (schnell 4 / dev 20).
+    _IMAGE_STEP_PRESETS = (("Fast 4", 4), ("Balanced 8", 8), ("Quality 20", 20))
+
+    def _imageset_markup(self) -> "InlineKeyboardMarkup":
+        from assistant.images.mlx_backend import IMAGE_SIZES
+
+        cur_size = f"{self._images.size[0]}"  # presets are square → width identifies them
+        steps = self._images.steps
+        size_row = [
+            InlineKeyboardButton(
+                f"{'●' if n == cur_size else '○'} {n}", callback_data=f"isize:{n}"
+            )
+            for n in IMAGE_SIZES
+        ]
+        step_row = [
+            InlineKeyboardButton(
+                f"{'●' if v == steps else '○'} {label}", callback_data=f"isteps:{v}"
+            )
+            for label, v in self._IMAGE_STEP_PRESETS
+        ]
+        default_row = [
+            InlineKeyboardButton(
+                f"{'●' if steps is None else '○'} Default steps", callback_data="isteps:0"
+            )
+        ]
+        return InlineKeyboardMarkup([size_row, step_row, default_row])
+
+    async def _on_imageset(self, update: "Update", context) -> None:
+        if not await self._ensure_allowed(update):
+            return
+        if self._images is None or not self._images.available():
+            await update.message.reply_text(
+                "Image generation is unavailable (install mflux on the backend)."
+            )
+            return
+        await update.message.reply_text(
+            "Image defaults — tap to change. A request like “512x512” still overrides these.",
+            reply_markup=self._imageset_markup(),
+        )
+
+    async def _apply_image_choice(self, query) -> None:
+        # Point the shared image backend at the chosen mflux alias. Global, like /video.
+        name = (query.data or "").partition(":")[2]
+        if self._images is not None and name:
+            self._images.set_model(name)
+        try:
+            await self._on_image_refresh(query)
+        except Exception:
+            pass
+
+    async def _on_image_refresh(self, query) -> None:
+        from assistant.images.mlx_backend import IMAGE_MODELS
+
+        current = self._images.model
+        rows = [
+            [InlineKeyboardButton(
+                f"{'● ' if name == current else '○ '}{name}", callback_data=f"imodel:{name}")]
+            for name in IMAGE_MODELS
+        ]
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+
+    async def _apply_imageset_choice(self, query) -> None:
+        if self._images is not None:
+            kind, _, val = (query.data or "").partition(":")
+            if kind == "isize":
+                self._images.set_size(val)
+            elif kind == "isteps":
+                self._images.set_steps(int(val) if val.isdigit() and int(val) > 0 else None)
+        try:
+            await query.edit_message_reply_markup(reply_markup=self._imageset_markup())
+        except Exception:
+            pass  # "not modified" (re-tapping the current choice) is non-fatal
+
     async def _on_message(self, update: "Update", context) -> None:
         if not await self._ensure_allowed(update):
             return
@@ -604,6 +708,12 @@ class TelegramGateway:
             return
         if data.startswith("vres:") or data.startswith("vsteps:"):  # a /videoset tap
             await self._apply_videoset_choice(query)
+            return
+        if data.startswith("imodel:"):  # an /image picker tap
+            await self._apply_image_choice(query)
+            return
+        if data.startswith("isize:") or data.startswith("isteps:"):  # an /imageset tap
+            await self._apply_imageset_choice(query)
             return
         decision, _, token = data.partition(":")
         future = self._pending.get(token)

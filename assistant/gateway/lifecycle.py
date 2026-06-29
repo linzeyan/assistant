@@ -32,6 +32,7 @@ async def build_and_start(settings, app) -> tuple[object | None, str | None]:
         approval_required=settings.approval_required,
         audio=app.state.audio,
         video=getattr(app.state, "video", None),
+        images=getattr(app.state, "images", None),
         # Same dirs discovery scans for chat models, so /video lists checkpoints from the
         # user's configured model locations (primary + extras).
         model_dirs=[settings.models_dir, *settings.extra_model_dirs],
