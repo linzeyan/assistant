@@ -344,8 +344,8 @@ async def test_image_choices_include_disk_models_and_select_path(tmp_path):
     images = _FakeImages()
     gw = _gateway(images=images, model_dirs=[str(tmp_path)])
     tokens = {t: v for t, _, v in gw._image_choices()}
-    assert "schnell" in tokens and "dev" in tokens  # mflux aliases still offered
-    assert tokens["z-image-turbo-8bit"] == str(model)  # disk model present, value = its path
+    assert "schnell" not in tokens and "dev" not in tokens  # mflux aliases removed
+    assert tokens["z-image-turbo-8bit"] == str(model)  # only on-disk checkpoints are offered
 
     query = Mock()
     query.data = "imodel:z-image-turbo-8bit"
@@ -737,11 +737,14 @@ async def test_handle_event_heartbeat_renders_generic_working_line():
 
 
 def test_progress_bar_renders_fraction_and_clamps():
-    assert _progress_bar(0.0, "0/40") == "🎬 Generating video ░░░░░░░░░░░░ 0% (0/40)"
-    assert _progress_bar(0.5, "20/40").startswith("🎬 Generating video ██████░░░░░░ 50%")
+    vid = {"name": "generate_video"}
+    assert _progress_bar(0.0, "0/40", **vid) == "🎬 Generating video ░░░░░░░░░░░░ 0% (0/40)"
+    assert _progress_bar(0.5, "20/40", **vid).startswith("🎬 Generating video ██████░░░░░░ 50%")
     # out-of-range fractions must clamp, never overrun the bar or show >100%
-    assert _progress_bar(1.5).startswith("🎬 Generating video ████████████ 100%")
-    assert "-" not in _progress_bar(-0.2)
+    assert _progress_bar(1.5, **vid).startswith("🎬 Generating video ████████████ 100%")
+    assert "-" not in _progress_bar(-0.2, **vid)
+    # Fusion renders with its own label, not the video one (it was mislabelled "Generating video").
+    assert _progress_bar(0.2, "panel 1/4", name="fusion").startswith("🔀 Fusion")
 
 
 def test_clip_caption_caps_at_telegram_limit():

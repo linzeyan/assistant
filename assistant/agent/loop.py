@@ -130,6 +130,11 @@ class AgentLoop:
         # git baseline captured on the first bash call, so the turn diff can also show files
         # shell touched (not just write/edit targets). Empty until then; see _git_changes.py.
         shell_state: dict = {}
+        # Absolute paths this turn's generate_image/edit_image produced. The agent sometimes
+        # follows an image generation with a needless view_image on its own output — loading a
+        # heavy vision model to redescribe a picture the user already received. We skip that
+        # deterministically below rather than relying on the model not to do it.
+        generated_images: set[str] = set()
 
         try:
             for _ in range(self._max_iters):
@@ -194,7 +199,16 @@ class AgentLoop:
                     tool = self._registry.get(tc["name"])
                     result: ToolResult | None = None
                     run_it = False  # set by whichever branch authorizes execution
-                    if tool is None:
+                    # Short-circuit a view_image on an image we just generated this turn (the
+                    # user already has it; viewing it only spins up a vision model).
+                    _vp = tc["arguments"].get("path") if tc["name"] == "view_image" else None
+                    if _vp is not None and (
+                        _vp in generated_images or str(ctx.cwd / _vp) in generated_images
+                    ):
+                        result = ToolResult(
+                            True, "(image already generated and shown to the user)"
+                        )
+                    elif tool is None:
                         result = ToolResult(False, f"unknown tool: {tc['name']}")
                     else:
                         # S5: rules + ask-once decide allow/deny before any prompt; only an
@@ -247,6 +261,13 @@ class AgentLoop:
                                 }
                             else:
                                 result = sub["result"]
+                    # Remember images we produced so a follow-up view_image on them is skipped.
+                    if (
+                        tc["name"] in ("generate_image", "edit_image")
+                        and result is not None
+                        and result.ok
+                    ):
+                        generated_images.add(result.content)
                     session.messages.append(
                         {"role": "tool", "tool_call_id": tc["id"], "content": result.content}
                     )

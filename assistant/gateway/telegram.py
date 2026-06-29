@@ -133,14 +133,25 @@ def _clip_caption(text: str | None) -> str | None:
     return text if len(text) <= 1024 else text[:1021].rstrip() + "…"
 
 
-def _progress_bar(fraction: float, label: str = "", *, slots: int = 12) -> str:
-    """Render a tool_progress tick as a text bar, e.g. ``🎬 Generating video █████░░░ 42%
-    (17/40)``. Video generation runs for minutes; without this the chat looks frozen."""
+# Per-tool progress styling (icon, verb), keyed by the tool name on the tool_progress event.
+# Unmapped tools fall back to a generic "🛠️ <name>" so a new long tool still renders sensibly
+# instead of being mislabelled as the wrong modality (Fusion was showing "Generating video").
+_PROGRESS_STYLE = {
+    "generate_video": ("🎬", "Generating video"),
+    "fusion": ("🔀", "Fusion"),
+}
+
+
+def _progress_bar(fraction: float, label: str = "", *, name: str = "", slots: int = 12) -> str:
+    """Render a tool_progress tick as a text bar, e.g. ``🔀 Fusion █████░░░ 42% (panel 1/4: …)``
+    or ``🎬 Generating video …``. Long tools (video denoising, the Fusion panel) run for
+    minutes; without this the chat looks frozen."""
     fraction = 0.0 if fraction < 0 else 1.0 if fraction > 1 else fraction
     filled = round(fraction * slots)
     bar = "█" * filled + "░" * (slots - filled)
+    icon, verb = _PROGRESS_STYLE.get(name, ("🛠️", name or "Working"))
     tail = f" ({label})" if label else ""
-    return f"🎬 Generating video {bar} {round(fraction * 100)}%{tail}"
+    return f"{icon} {verb} {bar} {round(fraction * 100)}%{tail}"
 
 
 class _StreamEditor:
@@ -512,12 +523,18 @@ class TelegramGateway:
             return
         if self._images is None or not self._images.available():
             await update.message.reply_text(
-                "Image generation is unavailable (install mflux on the backend)."
+                "Image generation is unavailable (install mflux/mlx-gen on the backend)."
+            )
+            return
+        if not self._image_choices():
+            await update.message.reply_text(
+                "No image models found. Place an mlx-gen checkpoint (e.g. z-image-turbo) in a "
+                "model dir, or set image_model to an mflux alias (schnell/dev)."
             )
             return
         await update.message.reply_text(
-            "Pick the image-generation model (schnell = fast, dev = higher quality; "
-            "on-disk mlx-gen checkpoints generate via the mlxgen CLI):",
+            "Pick the image-generation model (on-disk mlx-gen checkpoints generate via the "
+            "mlxgen CLI):",
             reply_markup=self._image_markup(),
         )
 
@@ -854,7 +871,9 @@ class TelegramGateway:
             if ev.get("fraction", 0) < 0:  # heartbeat: indeterminate, show elapsed working time
                 await editor.progress(f"🛠️ {ev.get('name', 'working')} … {ev.get('label', '')}")
             else:
-                await editor.progress(_progress_bar(ev["fraction"], ev.get("label", "")))
+                await editor.progress(
+                    _progress_bar(ev["fraction"], ev.get("label", ""), name=ev.get("name", ""))
+                )
         elif t == "tool_result" and ev["ok"]:
             # Media tools return a saved file path as their content; play each modality
             # back into the chat by mirroring the image path. Non-media results are

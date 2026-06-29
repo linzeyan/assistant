@@ -45,6 +45,7 @@ from assistant.agent.fusion import FusionEngine
 from assistant.models.default_store import DefaultModelStore
 from assistant.models.per_model_store import PerModelStore
 from assistant.models.mlx_audio import MlxAudioBackend
+from assistant.models.mlx_discovery import discover_image_checkpoints
 from assistant.models.mlx_embeddings import MlxEmbeddingBackend
 from assistant.models.mlx_video import MlxVideoBackend
 from assistant.models.mlx_vlm import MlxVLMBackend
@@ -153,12 +154,22 @@ async def lifespan(app: FastAPI):
     memory = FileMemoryProvider(settings.memory_dir, embedder=embedder)
     images = MlxImageBackend(
         settings.images_dir,
-        model=settings.image_model,
         edit_quantize=settings.image_edit_quantize,
         width=settings.image_default_width,
         height=settings.image_default_height,
         steps=settings.image_default_steps,
     )
+    # Resolve the default image model: prefer a local mlx-gen checkpoint matching the configured
+    # name (→ its on-disk path, so it routes to the mlxgen CLI and generates in seconds); fall
+    # back to the first discovered one. Leaving it unset (no local checkpoints) makes the first
+    # generate fail loudly with "no image model selected" rather than silently downloading FLUX.
+    _img_models = discover_image_checkpoints(
+        [Path(settings.models_dir), *(Path(d) for d in settings.extra_model_dirs)]
+    )
+    if _img_models:
+        pref = settings.image_model
+        chosen = next((m for m in _img_models if pref and pref in m.id), _img_models[0])
+        images.set_model(str(chosen.path))
     vision = MlxVLMBackend(model=settings.vlm_model)
     audio = MlxAudioBackend(
         settings.audio_dir,

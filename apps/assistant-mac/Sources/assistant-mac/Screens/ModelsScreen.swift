@@ -8,6 +8,10 @@ struct ModelsScreen: View {
     // short delay so a click registers as visible feedback (the copy is otherwise silent).
     @State private var copiedID: String?
     @State private var kindTab: ModelKindTab = .all
+    // Model ids whose inline "Generation settings" panel is open. A DisclosureGroup inside a
+    // List row doesn't toggle reliably on tap, so we drive expansion ourselves from an explicit
+    // chevron (oMLX-style), which also matches the row's other affordances.
+    @State private var expandedSettings: Set<String> = []
 
     /// Models tab sub-filters by capability. "Chat" is the catch-all for anything loadable in
     /// the Chat picker (llm/vlm + unknown types that fail-open to chat).
@@ -146,6 +150,22 @@ struct ModelsScreen: View {
                             Task { await controller.setDefaultModel(model.id) }
                         }
                         .disabled(!isChatLoadable(model.type) || model.id == controller.defaultModel)
+                        // Expand the per-model generation settings (oMLX-style chevron). Chat
+                        // models only — sampler settings don't apply to image/video/embedding.
+                        if isChatLoadable(model.type) {
+                            Button {
+                                if expandedSettings.contains(model.id) {
+                                    expandedSettings.remove(model.id)
+                                } else {
+                                    expandedSettings.insert(model.id)
+                                }
+                            } label: {
+                                Image(systemName: expandedSettings.contains(model.id)
+                                    ? "chevron.down" : "chevron.right")
+                            }
+                            .buttonStyle(.borderless).foregroundStyle(.secondary)
+                            .help("Generation settings")
+                        }
                         // Delete from disk (local models only; cached entries are shared).
                         Button(role: .destructive) { pendingDelete = model } label: {
                             Image(systemName: "trash")
@@ -156,13 +176,8 @@ struct ModelsScreen: View {
                             ? "Cached models are shared — remove with hf cache tools"
                             : "Delete this model from disk")
                     }
-                    // Per-model generation overrides (oMLX-style); chat models only —
-                    // sampler settings don't apply to image/video/embedding kinds.
-                    if isChatLoadable(model.type) {
-                        DisclosureGroup("Generation settings") {
-                            ModelSettingsView(modelID: model.id).padding(.top, 4)
-                        }
-                        .font(.caption).foregroundStyle(.secondary)
+                    if isChatLoadable(model.type) && expandedSettings.contains(model.id) {
+                        ModelSettingsView(modelID: model.id).padding(.top, 4)
                     }
                   }
                 }

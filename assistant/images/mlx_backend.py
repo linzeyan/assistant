@@ -31,11 +31,12 @@ IMAGE_SIZES: dict[str, tuple[int, int]] = {
     "1024": (1024, 1024),
 }
 DEFAULT_IMAGE_SIZE = "1024"
-# mflux text-to-image aliases the /image picker offers. Unlike video (an on-disk checkpoint),
-# mflux resolves these internally, so the picker needs no filesystem discovery. On-disk mlx-gen
-# checkpoints (z-image-turbo, qwen-image-edit-2511, fibo) are offered *in addition*, discovered
-# from the model dirs — see discover_image_checkpoints; they route to the mlxgen CLI below.
-IMAGE_MODELS = ("schnell", "dev")
+# mflux text-to-image aliases. Empty by default: the schnell/dev aliases pull a multi-GB FLUX.1
+# checkpoint from HuggingFace on first use (looks frozen) and the user has fast local mlx-gen
+# models, so the /image picker offers only on-disk checkpoints (discover_image_checkpoints) that
+# route to the mlxgen CLI. The mflux in-venv path below stays as a fallback if a model is ever
+# pointed at an mflux alias directly.
+IMAGE_MODELS: tuple[str, ...] = ()
 
 # mlx-gen models generate via the `mlxgen` CLI (a uv-tool install), not mflux in-venv.
 _MLXGEN_TIMEOUT_S = 1800  # a large 8-bit checkpoint can take many minutes per image
@@ -56,7 +57,7 @@ class MlxImageBackend(MediaService):
     def __init__(
         self,
         images_dir: Path,
-        model: str = "schnell",
+        model: str = "",  # resolved at startup to a local image checkpoint (see main.py)
         *,
         edit_quantize: int | None = None,
         width: int | None = None,
@@ -189,6 +190,11 @@ class MlxImageBackend(MediaService):
             raise RuntimeError(
                 "image generation requires mflux. Install it with: pip install mflux"
             )
+        if not self._model:
+            raise RuntimeError(
+                "no image model selected; pick one with /image (Telegram) or place an mlx-gen "
+                "checkpoint in your model dirs."
+            )
         return await asyncio.to_thread(
             self._generate_sync, prompt, steps, seed, width, height
         )
@@ -237,6 +243,10 @@ class MlxImageBackend(MediaService):
         if not self.available():
             raise RuntimeError(
                 "image editing requires mflux>=0.18 (uv pip install -U mflux)"
+            )
+        if not self._model:
+            raise RuntimeError(
+                "no image model selected; pick an edit-capable checkpoint with /image (Telegram)."
             )
         return await asyncio.to_thread(
             self._edit_sync, prompt, list(image_paths), steps, seed, width, height, guidance

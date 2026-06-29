@@ -379,3 +379,52 @@ async def test_injects_current_date_into_user_turn(tmp_path):
     assert any(
         m.get("role") == "user" and m["content"] == "今天美股狀況" for m in session.messages
     )
+
+
+async def test_view_image_skipped_for_freshly_generated_image(tmp_path):
+    # The agent sometimes calls view_image on an image it just generated; that only loads a
+    # vision model to redescribe output the user already has. The loop must short-circuit it.
+    img = tmp_path / "gen.png"
+
+    class _Images:
+        def available(self):
+            return True
+
+        async def generate_image(self, prompt, **kw):
+            img.write_bytes(b"\x89PNG")
+            return img
+
+    class _Vision:
+        def __init__(self):
+            self.calls = 0
+
+        def available(self):
+            return True
+
+        async def describe(self, paths, q):
+            self.calls += 1
+            return "described"
+
+    vision = _Vision()
+    llm = FakeLLM(
+        [
+            [{"type": "tool_calls", "tool_calls": [
+                {"id": "c1", "name": "generate_image", "arguments": {"prompt": "a nebula"}}]}],
+            [{"type": "tool_calls", "tool_calls": [
+                {"id": "c2", "name": "view_image", "arguments": {"path": str(img)}}]}],
+            [{"type": "text", "content": "done"}],
+        ]
+    )
+    loop = AgentLoop(
+        llm,
+        build_registry(),
+        PolicyApprover(approval_required=False),
+        ToolContext(cwd=tmp_path, images=_Images(), vision=vision),
+    )
+    events = await _collect(loop.run(Session(id="vi"), "make a nebula and look", "m"))
+    results = [e for e in events if e["type"] == "tool_result"]
+    assert results[0]["name"] == "generate_image" and results[0]["ok"]
+    view_res = results[1]
+    assert view_res["name"] == "view_image" and view_res["ok"]
+    assert "already generated" in view_res["content"]
+    assert vision.calls == 0  # the vision model was never loaded
