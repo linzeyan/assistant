@@ -245,13 +245,14 @@ class TelegramGateway:
         # Optional audio backend (mlx-audio): enables voice-in (STT) and voice-out
         # (TTS). Absent/unavailable -> the gateway stays text-only.
         self._audio = audio
-        # Optional video-generation backend (MlxVideoBackend) + the model dirs to scan for
-        # loadable mlx-video checkpoints — together they power the /video generation-model
-        # picker (N28). The picker sets the backend's active checkpoint at runtime.
+        # Optional video-generation backend (MlxVideoBackend). The model dirs (shared with image
+        # discovery below) are scanned for loadable mlx-video checkpoints — together they power
+        # the /video picker (N28), which sets the backend's active checkpoint at runtime.
         self._video = video
-        self._video_dirs = [Path(d) for d in (model_dirs or [])]
+        self._model_dirs = [Path(d) for d in (model_dirs or [])]
         # Optional image-generation backend (MlxImageBackend). Powers /image (pick the mflux
-        # alias) and /imageset (default size & steps), which set the backend's knobs at runtime.
+        # alias OR an on-disk mlx-gen checkpoint discovered from _model_dirs) and /imageset
+        # (default size & steps), which set the backend's knobs at runtime.
         self._images = images
         # Optional Fusion engine (panel+judge). Powers /fusion (toggle + pick panel & judge).
         self._fusion = fusion
@@ -401,7 +402,7 @@ class TelegramGateway:
         # that would fail at generation time. Stable order → a button index resolves on tap.
         from assistant.models.mlx_discovery import discover_video_checkpoints
 
-        return discover_video_checkpoints(self._video_dirs)
+        return discover_video_checkpoints(self._model_dirs)
 
     async def _on_video(self, update: "Update", context) -> None:
         if not await self._ensure_allowed(update):
@@ -483,6 +484,29 @@ class TelegramGateway:
 
     # --- image generation pickers (/image, /imageset) — mirror the /video pair ---
 
+    def _image_choices(self) -> list[tuple[str, str, str]]:
+        """(callback_token, display, value) for the /image picker. value is what set_model
+        stores: an mflux alias (schnell/dev) or an mlx-gen checkpoint's absolute path. Built from
+        one source so the picker and the tap-handler agree on the token↔value mapping."""
+        from assistant.images.mlx_backend import IMAGE_MODELS
+        from assistant.models.mlx_discovery import discover_image_checkpoints
+
+        out: list[tuple[str, str, str]] = [(name, name, name) for name in IMAGE_MODELS]
+        for m in discover_image_checkpoints(self._model_dirs):
+            # token = id (fits Telegram's 64-byte callback_data); display = leaf name; value = path
+            out.append((m.id, m.id.split("/")[-1], str(m.path)))
+        return out
+
+    def _image_markup(self) -> "InlineKeyboardMarkup":
+        current = self._images.model
+        rows = [
+            [InlineKeyboardButton(
+                f"{'● ' if value == current else '○ '}{display}",
+                callback_data=f"imodel:{token}")]
+            for token, display, value in self._image_choices()
+        ]
+        return InlineKeyboardMarkup(rows)
+
     async def _on_image(self, update: "Update", context) -> None:
         if not await self._ensure_allowed(update):
             return
@@ -491,17 +515,10 @@ class TelegramGateway:
                 "Image generation is unavailable (install mflux on the backend)."
             )
             return
-        from assistant.images.mlx_backend import IMAGE_MODELS
-
-        current = self._images.model
-        rows = [
-            [InlineKeyboardButton(
-                f"{'● ' if name == current else '○ '}{name}", callback_data=f"imodel:{name}")]
-            for name in IMAGE_MODELS
-        ]
         await update.message.reply_text(
-            "Pick the image-generation model (schnell = fast, dev = higher quality):",
-            reply_markup=InlineKeyboardMarkup(rows),
+            "Pick the image-generation model (schnell = fast, dev = higher quality; "
+            "on-disk mlx-gen checkpoints generate via the mlxgen CLI):",
+            reply_markup=self._image_markup(),
         )
 
     # Step presets for /imageset; None ("Default") lets the alias decide (schnell 4 / dev 20).
@@ -545,25 +562,16 @@ class TelegramGateway:
         )
 
     async def _apply_image_choice(self, query) -> None:
-        # Point the shared image backend at the chosen mflux alias. Global, like /video.
-        name = (query.data or "").partition(":")[2]
-        if self._images is not None and name:
-            self._images.set_model(name)
+        # Point the shared image backend at the chosen model (mflux alias or mlx-gen path).
+        # Global, like /video. Resolve the callback token back to its value via _image_choices.
+        token = (query.data or "").partition(":")[2]
+        if self._images is not None and token:
+            value = next((v for t, _, v in self._image_choices() if t == token), token)
+            self._images.set_model(value)
         try:
-            await self._on_image_refresh(query)
+            await query.edit_message_reply_markup(reply_markup=self._image_markup())
         except Exception:
             pass
-
-    async def _on_image_refresh(self, query) -> None:
-        from assistant.images.mlx_backend import IMAGE_MODELS
-
-        current = self._images.model
-        rows = [
-            [InlineKeyboardButton(
-                f"{'● ' if name == current else '○ '}{name}", callback_data=f"imodel:{name}")]
-            for name in IMAGE_MODELS
-        ]
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
 
     async def _apply_imageset_choice(self, query) -> None:
         if self._images is not None:

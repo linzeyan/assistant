@@ -334,6 +334,26 @@ async def test_apply_image_choice_sets_backend_model():
     query.edit_message_reply_markup.assert_awaited()
 
 
+async def test_image_choices_include_disk_models_and_select_path(tmp_path):
+    # A component-layout mlx-gen checkpoint under a scanned model dir is offered alongside the
+    # mflux aliases; picking it points the backend at the on-disk path (which routes to mlxgen).
+    model = tmp_path / "z-image-turbo-8bit"
+    for comp in ("transformer", "vae"):
+        (model / comp).mkdir(parents=True)
+        (model / comp / "0.safetensors").write_bytes(b"\x00" * 16)
+    images = _FakeImages()
+    gw = _gateway(images=images, model_dirs=[str(tmp_path)])
+    tokens = {t: v for t, _, v in gw._image_choices()}
+    assert "schnell" in tokens and "dev" in tokens  # mflux aliases still offered
+    assert tokens["z-image-turbo-8bit"] == str(model)  # disk model present, value = its path
+
+    query = Mock()
+    query.data = "imodel:z-image-turbo-8bit"
+    query.edit_message_reply_markup = AsyncMock()
+    await gw._apply_image_choice(query)
+    assert images.model == str(model)  # backend now points at the disk path
+
+
 async def test_apply_imageset_choice_sets_size_and_steps():
     images = _FakeImages()
     gw = _gateway(images=images)

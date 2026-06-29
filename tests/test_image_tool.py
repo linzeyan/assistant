@@ -1,9 +1,11 @@
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from assistant.images.mlx_backend import MlxImageBackend
+import assistant.images.mlx_backend as mlx_backend
+from assistant.images.mlx_backend import MlxImageBackend, _mlxgen_exe
 from assistant.tools import build_registry
 from assistant.tools.base import ToolContext
 
@@ -74,14 +76,92 @@ def test_mlx_backend_seeds_defaults_from_config(tmp_path):
     assert backend.size == (512, 512) and backend.steps == 6
 
 
-def test_mlx_backend_available_reflects_mflux_presence(tmp_path):
+def test_mlx_backend_available_reflects_either_backend(tmp_path):
+    # available() is True if EITHER mflux (in-venv, for schnell/dev) or the mlxgen CLI (for
+    # on-disk mlx-gen checkpoints) is present, so /image stays usable with just one installed.
     backend = MlxImageBackend(tmp_path)
-    assert backend.available() == (importlib.util.find_spec("mflux") is not None)
+    expected = importlib.util.find_spec("mflux") is not None or _mlxgen_exe() is not None
+    assert backend.available() == expected
 
 
 async def test_mlx_backend_raises_when_unavailable(tmp_path):
     backend = MlxImageBackend(tmp_path)
     if backend.available():
-        pytest.skip("mflux is installed in this environment")
+        pytest.skip("mflux/mlxgen is installed in this environment")
     with pytest.raises(RuntimeError):
+        await backend.generate_image("x")
+
+
+def test_is_mlxgen_model_only_for_disk_path(tmp_path):
+    backend = MlxImageBackend(tmp_path / "out")
+    backend.set_model("schnell")
+    assert backend._is_mlxgen_model() is False  # an mflux alias is not a directory
+    disk = tmp_path / "z-image-turbo-8bit"
+    disk.mkdir()
+    backend.set_model(str(disk))
+    assert backend._is_mlxgen_model() is True
+
+
+def test_build_mlxgen_cmd_txt2img_and_edit(tmp_path):
+    backend = MlxImageBackend(tmp_path, width=1024, height=1024)
+    backend.set_model("/models/z-image")
+    out = tmp_path / "o.png"
+    cmd = backend._build_mlxgen_cmd(
+        "mlxgen", out, "hi", steps=6, seed=1, width=None, height=None, image_paths=None
+    )
+    assert cmd == [
+        "mlxgen", "generate", "--model", "/models/z-image", "--prompt", "hi",
+        "--width", "1024", "--height", "1024", "--output", str(out),
+        "--steps", "6", "--seed", "1",
+    ]
+    # A single edit image uses --image-path (mlxgen's compat flag, as in the Makefile); steps
+    # default off when unset.
+    edit1 = backend._build_mlxgen_cmd(
+        "mlxgen", out, "edit", steps=None, seed=None, width=None, height=None,
+        image_paths=["/a.png"],
+    )
+    assert "--image-path" in edit1 and "/a.png" in edit1 and "--steps" not in edit1
+    # Multiple images repeat --image (multi-reference edit).
+    edit2 = backend._build_mlxgen_cmd(
+        "mlxgen", out, "edit", steps=None, seed=None, width=None, height=None,
+        image_paths=["/a.png", "/b.png"],
+    )
+    assert edit2.count("--image") == 2
+
+
+async def test_generate_routes_to_mlxgen_for_disk_model(tmp_path, monkeypatch):
+    model_dir = tmp_path / "z-image-turbo-8bit"
+    model_dir.mkdir()
+    backend = MlxImageBackend(tmp_path / "out")
+    backend.set_model(str(model_dir))
+    monkeypatch.setattr(mlx_backend, "_mlxgen_exe", lambda: "/usr/bin/mlxgen")
+    captured: dict = {}
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        out = Path(cmd[cmd.index("--output") + 1])
+        out.write_bytes(b"\x89PNG")  # pretend an image was produced
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(mlx_backend.subprocess, "run", fake_run)
+    p = await backend.generate_image("a doraemon", steps=6, seed=3, width=768, height=768)
+    assert p.is_file()
+    cmd = captured["cmd"]
+    assert cmd[:2] == ["/usr/bin/mlxgen", "generate"]
+    assert str(model_dir) in cmd
+    assert cmd[cmd.index("--seed") + 1] == "3"
+    assert cmd[cmd.index("--width") + 1] == "768"
+
+
+async def test_mlxgen_generate_raises_on_failure(tmp_path, monkeypatch):
+    model_dir = tmp_path / "z-image-turbo-8bit"
+    model_dir.mkdir()
+    backend = MlxImageBackend(tmp_path / "out")
+    backend.set_model(str(model_dir))
+    monkeypatch.setattr(mlx_backend, "_mlxgen_exe", lambda: "/usr/bin/mlxgen")
+    monkeypatch.setattr(
+        mlx_backend.subprocess, "run",
+        lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
+    )
+    with pytest.raises(RuntimeError, match="boom"):
         await backend.generate_image("x")

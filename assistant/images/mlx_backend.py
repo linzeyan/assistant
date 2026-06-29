@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import shutil
+import subprocess
 import uuid
 from pathlib import Path
 
@@ -30,8 +32,24 @@ IMAGE_SIZES: dict[str, tuple[int, int]] = {
 }
 DEFAULT_IMAGE_SIZE = "1024"
 # mflux text-to-image aliases the /image picker offers. Unlike video (an on-disk checkpoint),
-# mflux resolves these internally, so the picker needs no filesystem discovery.
+# mflux resolves these internally, so the picker needs no filesystem discovery. On-disk mlx-gen
+# checkpoints (z-image-turbo, qwen-image-edit-2511, fibo) are offered *in addition*, discovered
+# from the model dirs — see discover_image_checkpoints; they route to the mlxgen CLI below.
 IMAGE_MODELS = ("schnell", "dev")
+
+# mlx-gen models generate via the `mlxgen` CLI (a uv-tool install), not mflux in-venv.
+_MLXGEN_TIMEOUT_S = 1800  # a large 8-bit checkpoint can take many minutes per image
+
+
+def _mlxgen_exe() -> str | None:
+    """Resolve the mlxgen binary. The GUI-spawned backend's PATH frequently lacks ~/.local/bin
+    (the uv-tool shim dir), so fall back to the conventional install path explicitly rather than
+    relying on PATH alone."""
+    exe = shutil.which("mlxgen")
+    if exe:
+        return exe
+    fallback = Path.home() / ".local" / "bin" / "mlxgen"
+    return str(fallback) if fallback.exists() else None
 
 
 class MlxImageBackend(MediaService):
@@ -82,7 +100,81 @@ class MlxImageBackend(MediaService):
         self._steps = steps if steps and steps > 0 else None
 
     def available(self) -> bool:
-        return importlib.util.find_spec("mflux") is not None
+        # Either backend counts: mflux (in-venv) serves the schnell/dev aliases, the mlxgen CLI
+        # serves on-disk mlx-gen checkpoints. /image stays usable if only one is installed.
+        return importlib.util.find_spec("mflux") is not None or _mlxgen_exe() is not None
+
+    def _is_mlxgen_model(self) -> bool:
+        # A disk-path model is an mlx-gen checkpoint → route to the mlxgen CLI. mflux's in-venv
+        # loader can't read these; aliases (schnell/dev) are not directories, so they stay on
+        # the mflux path.
+        return Path(self._model).is_dir()
+
+    def _build_mlxgen_cmd(
+        self,
+        exe: str,
+        out: Path,
+        prompt: str,
+        *,
+        steps: int | None,
+        seed: int | None,
+        width: int | None,
+        height: int | None,
+        image_paths: list[str] | None,
+    ) -> list[str]:
+        """Assemble the `mlxgen generate` argv (factored out so it's unit-testable without
+        actually invoking the CLI). Mirrors the proven invocations in the mlx-dir Makefile."""
+        cmd = [
+            exe, "generate",
+            "--model", self._model,
+            "--prompt", prompt,
+            "--width", str(width or self._width),
+            "--height", str(height or self._height),
+            "--output", str(out),
+        ]
+        eff_steps = steps or self._steps
+        if eff_steps:
+            cmd += ["--steps", str(eff_steps)]
+        if seed is not None:
+            cmd += ["--seed", str(seed)]
+        # img2img / edit input. --image-path is mlxgen's single-image compat flag (what the
+        # Makefile uses); --image repeats for multi-reference edits.
+        if image_paths:
+            if len(image_paths) == 1:
+                cmd += ["--image-path", image_paths[0]]
+            else:
+                for p in image_paths:
+                    cmd += ["--image", p]
+        return cmd
+
+    def _mlxgen_generate(
+        self,
+        prompt: str,
+        *,
+        steps: int | None,
+        seed: int | None,
+        width: int | None,
+        height: int | None,
+        image_paths: list[str] | None,
+    ) -> Path:
+        exe = _mlxgen_exe()
+        if exe is None:
+            raise RuntimeError(
+                "mlx-gen CLI not found; install it with: uv tool install mlx-gen"
+            )
+        out = self._dir / f"{'edit' if image_paths else 'img'}_{uuid.uuid4().hex[:8]}.png"
+        cmd = self._build_mlxgen_cmd(
+            exe, out, prompt, steps=steps, seed=seed,
+            width=width, height=height, image_paths=image_paths,
+        )
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=_MLXGEN_TIMEOUT_S, check=False
+        )
+        # mlxgen returns 0 even when it only printed help, so also require the file to exist.
+        if proc.returncode != 0 or not out.is_file():
+            tail = (proc.stderr or proc.stdout or "").strip()[-500:]
+            raise RuntimeError(f"mlxgen generate failed (exit {proc.returncode}): {tail}")
+        return out
 
     async def generate_image(
         self,
@@ -109,6 +201,10 @@ class MlxImageBackend(MediaService):
         width: int | None,
         height: int | None,
     ) -> Path:
+        if self._is_mlxgen_model():
+            return self._mlxgen_generate(
+                prompt, steps=steps, seed=seed, width=width, height=height, image_paths=None
+            )
         # Lazy, isolated import (mflux >= 0.18 layout): Flux1 lives under the txt2img
         # variant package and generate_image takes flat kwargs (no Config object).
         from mflux.models.flux.variants.txt2img.flux import Flux1
@@ -156,6 +252,12 @@ class MlxImageBackend(MediaService):
         height: int | None,
         guidance: float | None,
     ) -> Path:
+        if self._is_mlxgen_model():
+            # mlxgen auto-routes to the edit/img2img path from the presence of --image-path.
+            return self._mlxgen_generate(
+                prompt, steps=steps, seed=seed, width=width, height=height,
+                image_paths=image_paths,
+            )
         # Qwen-Image-Edit via mflux >= 0.18. The qwen edit module is absent on older mflux,
         # so an ImportError here is surfaced as a clear "upgrade mflux" rather than a crash.
         try:

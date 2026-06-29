@@ -30,11 +30,26 @@ class DiscoveredModel:
     size_bytes: int = 0  # on-disk footprint, so the GUI can show / manage capacity
 
 
+def _is_component_pipeline(d: Path) -> bool:
+    # mlx-gen image checkpoints (z-image-turbo, qwen-image-edit-2511, fibo) save the diffusers
+    # pipeline split into component subdirs — transformer/ + vae/ (+ text_encoder/, tokenizer/) —
+    # with NO top-level config.json or model_index.json and NO config.json even inside the
+    # components (just sharded *.safetensors + an index). So the standard gate misses them
+    # entirely. The transformer+vae directory pair is the structural signal of a diffusion
+    # image model; it's what we key discovery + classification on.
+    return (d / "transformer").is_dir() and (d / "vae").is_dir()
+
+
 def _has_config(d: Path) -> bool:
     # diffusers image/video pipelines (FLUX, Qwen-Image) ship model_index.json instead of a
     # top-level config.json; accepting it keeps those checkpoints from silently vanishing from
-    # the Models list (they still need real weights via _has_weights).
-    return (d / "config.json").is_file() or (d / "model_index.json").is_file()
+    # the Models list (they still need real weights via _has_weights). mlx-gen's component-split
+    # checkpoints have neither file, so fall back to the structural transformer+vae signal.
+    return (
+        (d / "config.json").is_file()
+        or (d / "model_index.json").is_file()
+        or _is_component_pipeline(d)
+    )
 
 
 def _dir_size(d: Path) -> int:
@@ -117,6 +132,15 @@ def _is_image_model(cfg: dict, d: Path) -> bool:
 
 def classify_kind(d: Path) -> str:
     cfg = _read_config(d)
+    # mlx-gen component-split pipelines carry no config.json / model_index.json (see
+    # _is_component_pipeline). They are diffusion *image* models unless the dir name marks them
+    # as video. Checked first because the config-based logic below would read an empty config
+    # and fail-open to "llm", hiding them from the Models "Image" tab.
+    if not cfg and not (d / "model_index.json").is_file() and _is_component_pipeline(d):
+        name = d.name.lower()
+        if any(t in name for t in ("wan", "video", "ltx", "i2v", "t2v", "ti2v")):
+            return "video"
+        return "image"
     archs = cfg.get("architectures") or []
     arch = (archs[0] if archs else "").lower()
     mtype = str(cfg.get("model_type") or "").lower()
@@ -215,6 +239,21 @@ def discover_video_checkpoints(dirs: list[Path]) -> list[DiscoveredModel]:
     for base in dirs:
         for m in discover_local(base):
             if m.kind == "video" and m.id not in seen and is_video_checkpoint(m.path):
+                found.append(m)
+                seen.add(m.id)
+    return found
+
+
+def discover_image_checkpoints(dirs: list[Path]) -> list[DiscoveredModel]:
+    """Image-kind models across the given model dirs (flat + org/<model> layouts, via
+    discover_local), deduped by id with earlier dirs winning. Used by the Telegram /image picker
+    so mlx-gen disk checkpoints (z-image-turbo, qwen-image-edit-2511, …) are offered alongside
+    the built-in mflux aliases. These generate via the mlxgen CLI, not mflux in-venv."""
+    found: list[DiscoveredModel] = []
+    seen: set[str] = set()
+    for base in dirs:
+        for m in discover_local(base):
+            if m.kind == "image" and m.id not in seen:
                 found.append(m)
                 seen.add(m.id)
     return found

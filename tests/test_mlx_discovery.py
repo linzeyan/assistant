@@ -6,6 +6,7 @@ from pathlib import Path
 from assistant.models.mlx_discovery import (
     classify_kind,
     discover_hf_cache,
+    discover_image_checkpoints,
     discover_local,
     discover_models,
     discover_video_checkpoints,
@@ -217,6 +218,41 @@ def test_is_video_checkpoint_requires_converted_layout(tmp_path):
     # Missing any required component → not loadable by mlx-video.
     assert not is_video_checkpoint(_make_video_ckpt(tmp_path / "no_t5", t5=False))
     assert not is_video_checkpoint(_make_video_ckpt(tmp_path / "no_vae", vae=False))
+
+
+def _make_component_pipeline(d: Path) -> Path:
+    """An mlx-gen image checkpoint: diffusers components split into subdirs (transformer/ + vae/)
+    with sharded weights and NO top-level config.json / model_index.json."""
+    d.mkdir(parents=True, exist_ok=True)
+    for comp in ("transformer", "vae", "text_encoder"):
+        (d / comp).mkdir()
+        (d / comp / "0.safetensors").write_bytes(b"\x00" * 16)
+    return d
+
+
+def test_classify_component_pipeline_is_image(tmp_path):
+    # z-image-turbo / qwen-image-edit-2511: no config anywhere, only the transformer+vae dirs.
+    # Without the structural signal it fail-opens to "llm" and never reaches the Image tab.
+    d = _make_component_pipeline(tmp_path / "z-image-turbo-8bit")
+    assert classify_kind(d) == "image"
+
+
+def test_classify_component_pipeline_video_by_name(tmp_path):
+    # The same component layout with a video-marked dir name routes to video, not image.
+    d = _make_component_pipeline(tmp_path / "Wan2.2-t2v-component")
+    assert classify_kind(d) == "video"
+
+
+def test_discover_image_checkpoints_finds_component_models(tmp_path):
+    org = tmp_path / "AbstractFramework"
+    _make_component_pipeline(org / "z-image-turbo-8bit")
+    _make_component_pipeline(org / "qwen-image-edit-2511-8bit")
+    _make_model(tmp_path / "qwen3-8b")  # a chat model must NOT show up here
+    found = {m.id for m in discover_image_checkpoints([tmp_path])}
+    assert found == {
+        "AbstractFramework/z-image-turbo-8bit",
+        "AbstractFramework/qwen-image-edit-2511-8bit",
+    }
 
 
 def test_discover_video_checkpoints_excludes_raw_hf_dir(tmp_path):
