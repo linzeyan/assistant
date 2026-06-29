@@ -45,7 +45,11 @@ from assistant.agent.fusion import FusionEngine
 from assistant.models.default_store import DefaultModelStore
 from assistant.models.per_model_store import PerModelStore
 from assistant.models.mlx_audio import MlxAudioBackend
-from assistant.models.mlx_discovery import discover_image_checkpoints
+from assistant.models.mlx_discovery import (
+    discover_models,
+    is_video_checkpoint,
+    smallest_of_kind,
+)
 from assistant.models.mlx_embeddings import MlxEmbeddingBackend
 from assistant.models.mlx_video import MlxVideoBackend
 from assistant.models.mlx_vlm import MlxVLMBackend
@@ -152,6 +156,15 @@ async def lifespan(app: FastAPI):
         else None
     )
     memory = FileMemoryProvider(settings.memory_dir, embedder=embedder)
+    # One discovery pass to default each category to its smallest (most memory-frugal) discovered
+    # model rather than hardcoding a model name — so the defaults follow what the user actually
+    # has, and a tiny default never OOMs on start. The user can still switch per category.
+    discovered = discover_models(
+        settings.models_dir,
+        include_hf_cache=settings.hf_cache,
+        extra_dirs=settings.extra_model_dirs,
+    )
+
     images = MlxImageBackend(
         settings.images_dir,
         edit_quantize=settings.image_edit_quantize,
@@ -159,27 +172,36 @@ async def lifespan(app: FastAPI):
         height=settings.image_default_height,
         steps=settings.image_default_steps,
     )
-    # Resolve the default image model: prefer a local mlx-gen checkpoint matching the configured
-    # name (→ its on-disk path, so it routes to the mlxgen CLI and generates in seconds); fall
-    # back to the first discovered one. Leaving it unset (no local checkpoints) makes the first
-    # generate fail loudly with "no image model selected" rather than silently downloading FLUX.
-    _img_models = discover_image_checkpoints(
-        [Path(settings.models_dir), *(Path(d) for d in settings.extra_model_dirs)]
-    )
-    if _img_models:
+    # Default image model: an explicit image_model is matched as an id substring; otherwise the
+    # smallest discovered image checkpoint. Resolved to an on-disk path so it routes to the mlxgen
+    # CLI (generates in seconds). Unset + none discovered → the first generate fails loud with
+    # "no image model selected" rather than silently pulling a multi-GB FLUX download.
+    _images_found = [m for m in discovered if m.kind == "image"]
+    if _images_found:
         pref = settings.image_model
-        chosen = next((m for m in _img_models if pref and pref in m.id), _img_models[0])
-        images.set_model(str(chosen.path))
+        chosen = next(
+            (m for m in _images_found if pref and pref in m.id), None
+        ) or smallest_of_kind(discovered, {"image"})
+        if chosen:
+            images.set_model(str(chosen.path))
     vision = MlxVLMBackend(model=settings.vlm_model)
     audio = MlxAudioBackend(
         settings.audio_dir,
         stt_model=settings.stt_model,
         tts_model=settings.tts_model,
     )
+    # Default video checkpoint: the smallest loadable mlx-video checkpoint when none configured.
+    video_checkpoint = settings.video_checkpoint
+    if video_checkpoint is None:
+        _videos = [
+            m for m in discovered if m.kind == "video" and is_video_checkpoint(m.path)
+        ]
+        if _videos:
+            video_checkpoint = min(_videos, key=lambda m: m.size_bytes).path
     video = MlxVideoBackend(
         settings.video_dir,
         model=settings.video_model,
-        checkpoint=settings.video_checkpoint,
+        checkpoint=video_checkpoint,
     )
     ctx = ToolContext(
         cwd=settings.workspace_dir,
@@ -193,10 +215,16 @@ async def lifespan(app: FastAPI):
     )
 
     app.state.model_service = model_service
-    # Backend-authoritative default chat model (seeded from config), shared by the API and the
-    # Telegram gateway so the GUI's "Default" applies to both. See models/default_store.py.
+    # Backend-authoritative default chat model, shared by the API and the Telegram gateway so the
+    # GUI's "Default" applies to both. Seeded from config, or — when unset — the smallest
+    # chattable model discovered, so a fresh install starts on its lightest model instead of an
+    # arbitrary first one. The seed is only a fallback; a user's saved "Default" still wins.
+    chat_seed = settings.default_model
+    if not chat_seed:
+        smallest_chat = smallest_of_kind(discovered, {"llm", "vlm"})
+        chat_seed = smallest_chat.id if smallest_chat else None
     app.state.default_model_store = DefaultModelStore(
-        settings.home_dir / "default_model.json", seed=settings.default_model
+        settings.home_dir / "default_model.json", seed=chat_seed
     )
     app.state.per_model_store = per_model_store
     app.state.fusion = fusion

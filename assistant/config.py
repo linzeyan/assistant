@@ -143,12 +143,12 @@ class Settings(BaseSettings):
     default_model: str | None = None
 
     # --- image generation / editing ---
-    # Preferred default image model, matched as a substring against discovered local image
-    # checkpoints (resolved to the on-disk path at startup) — defaults to z-image-turbo, which
-    # generates locally in seconds. Falls back to the first discovered checkpoint. (The old
-    # mflux aliases schnell/dev pulled a multi-GB FLUX download on first use, so they're no
-    # longer the default; set this to "schnell"/"dev" to use mflux directly.)
-    image_model: str = "z-image-turbo"
+    # Optional image-model preference, matched as a substring against discovered local image
+    # checkpoints (resolved to the on-disk path at startup). Empty (default) → the smallest
+    # discovered image checkpoint is used, so there's no hardcoded model name and the default is
+    # the most memory-frugal one available. (Set to "schnell"/"dev" to use mflux's FLUX.1 directly
+    # — note that pulls a multi-GB download on first use.)
+    image_model: str = ""
     images_dir: Path = XDG_DATA_DIR / "images"
     # Default output size / steps, runtime-switchable from the Telegram /imageset picker and the
     # GUI. A per-request tool arg still overrides these; steps None lets the model pick a sane

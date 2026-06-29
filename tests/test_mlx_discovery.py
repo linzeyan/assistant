@@ -220,6 +220,22 @@ def test_is_video_checkpoint_requires_converted_layout(tmp_path):
     assert not is_video_checkpoint(_make_video_ckpt(tmp_path / "no_vae", vae=False))
 
 
+def test_smallest_of_kind_picks_fewest_bytes():
+    from assistant.models.mlx_discovery import DiscoveredModel, smallest_of_kind
+
+    models = [
+        DiscoveredModel("big-llm", Path("/a"), "local", "llm", 100),
+        DiscoveredModel("small-llm", Path("/b"), "local", "llm", 10),
+        DiscoveredModel("img", Path("/c"), "local", "image", 5),
+        DiscoveredModel("unknown-size", Path("/d"), "local", "llm", 0),
+    ]
+    assert smallest_of_kind(models, {"llm"}).id == "small-llm"
+    assert smallest_of_kind(models, {"llm", "image"}).id == "img"  # cross-kind, fewest bytes wins
+    assert smallest_of_kind(models, {"vlm"}) is None  # no model of that kind
+    # A zero/unknown size means "not measured" — never picked as the smallest.
+    assert smallest_of_kind([models[3]], {"llm"}) is None
+
+
 def _make_component_pipeline(d: Path) -> Path:
     """An mlx-gen image checkpoint: diffusers components split into subdirs (transformer/ + vae/)
     with sharded weights and NO top-level config.json / model_index.json."""

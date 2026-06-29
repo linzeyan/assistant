@@ -244,6 +244,16 @@ def discover_video_checkpoints(dirs: list[Path]) -> list[DiscoveredModel]:
     return found
 
 
+def smallest_of_kind(
+    models: list[DiscoveredModel], kinds: set[str]
+) -> DiscoveredModel | None:
+    """The smallest (fewest on-disk bytes → lightest to load) discovered model among the given
+    kinds, or None. Used to default each category to its most memory-frugal model instead of
+    hardcoding a model name — the user can still switch, and a tiny default never OOMs on start."""
+    candidates = [m for m in models if m.kind in kinds and m.size_bytes > 0]
+    return min(candidates, key=lambda m: m.size_bytes, default=None)
+
+
 def discover_image_checkpoints(dirs: list[Path]) -> list[DiscoveredModel]:
     """Image-kind models across the given model dirs (flat + org/<model> layouts, via
     discover_local), deduped by id with earlier dirs winning. Used by the Telegram /image picker
