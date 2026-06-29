@@ -123,6 +123,16 @@ final class BackendController: ObservableObject {
         backend.stop()
     }
 
+    /// User-initiated backend shutdown from the menu bar — distinct from app Quit: stop the
+    /// managed child and suppress the health monitor's auto-restart, but leave the app running.
+    /// Frees model RAM and avoids a redundant in-process engine when the user is serving models
+    /// elsewhere (e.g. an external `omlx serve`). Reversible via `start()` ("Start Backend").
+    func stopBackend() {
+        stop()  // SIGTERM the child + cancel auto-restart (sets expectingExit)
+        reachable = false  // reflect the deliberate stop immediately, before the next probe
+        modelBackendReady = false
+    }
+
     /// Re-evaluate the first-run gate when the app regains focus. macOS keeps the process
     /// alive after the window closes, so the launch-time gate never re-fires — without
     /// this, deleting config.toml and reopening the app wouldn't re-trigger setup. Only
