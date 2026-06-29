@@ -10,6 +10,8 @@
     <string>com.ricky.assistant</string>
     <key>CFBundleExecutable</key>
     <string>assistant-mac</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
