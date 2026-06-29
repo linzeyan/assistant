@@ -21,6 +21,19 @@ async def list_models(request: Request):
     }
 
 
+@router.get("/fusion")
+async def get_fusion(request: Request):
+    return request.app.state.fusion.config
+
+
+@router.put("/fusion")
+async def set_fusion(request: Request):
+    body = await request.json()
+    return request.app.state.fusion.configure(
+        enabled=body.get("enabled"), panel=body.get("panel"), judge=body.get("judge")
+    )
+
+
 @router.get("/models/default")
 async def get_default_model(request: Request):
     return {"default": request.app.state.default_model_store.value}

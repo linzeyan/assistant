@@ -146,6 +146,10 @@ class AgentLoop:
                         yield {"type": "assistant_delta", "content": ev["content"]}
                     elif ev["type"] == "tool_calls":
                         tool_calls = ev["tool_calls"]
+                    else:
+                        # Forward any other event the model layer emits (e.g. Fusion's panel
+                        # tool_progress) straight to the gateway/SSE consumer.
+                        yield ev
 
                 if not tool_calls:
                     answer = "".join(text_parts)

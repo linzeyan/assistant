@@ -41,6 +41,7 @@ from assistant.api import (
 from assistant.config import Settings, get_settings
 from assistant.images.mlx_backend import MlxImageBackend
 from assistant.memory.file_provider import FileMemoryProvider
+from assistant.agent.fusion import FusionEngine
 from assistant.models.default_store import DefaultModelStore
 from assistant.models.per_model_store import PerModelStore
 from assistant.models.mlx_audio import MlxAudioBackend
@@ -65,12 +66,13 @@ _QUIET_PATHS = frozenset({"/status", "/downloads", "/preflight"})
 _BUNDLED_SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 
 
-def _build_model_service(settings: Settings, per_model=None):
+def _build_model_service(settings: Settings, per_model=None, fusion=None):
     """Construct the configured model backend behind the ``ModelService`` seam.
 
     Returns ``(service, cleanup)``; ``cleanup`` is an async callable that releases
     backend-specific resources (an HTTP client for omlx, loaded engines for mlx).
-    ``per_model`` (a PerModelStore) supplies per-model generation overrides to the mlx backend.
+    ``per_model`` (a PerModelStore) supplies per-model generation overrides to the mlx backend;
+    ``fusion`` (a FusionEngine) surfaces the virtual "fusion" panel+judge model.
     """
     if settings.model_backend == "omlx":
         from assistant.models.omlx_client import OmlxClient
@@ -102,6 +104,7 @@ def _build_model_service(settings: Settings, per_model=None):
         include_hf_cache=settings.hf_cache,
         extra_model_dirs=settings.extra_model_dirs,
         per_model=per_model,
+        fusion=fusion,
     )
 
     async def cleanup() -> None:
@@ -125,7 +128,16 @@ async def lifespan(app: FastAPI):
     # Per-model generation overrides (oMLX-style), shared by the mlx backend (applied at chat
     # time) and the /models/{id}/settings API (read/write).
     per_model_store = PerModelStore(settings.home_dir / "per_model_settings.json")
-    model_service, cleanup = _build_model_service(settings, per_model=per_model_store)
+    # Fusion engine (panel+judge virtual model); persisted config, editable via PUT /fusion.
+    fusion = FusionEngine(
+        settings.home_dir / "fusion.json",
+        enabled=settings.fusion_enabled,
+        panel=settings.fusion_panel,
+        judge=settings.fusion_judge,
+    )
+    model_service, cleanup = _build_model_service(
+        settings, per_model=per_model_store, fusion=fusion
+    )
 
     registry = build_registry()
     approver = PolicyApprover(settings.approval_required)
@@ -176,6 +188,7 @@ async def lifespan(app: FastAPI):
         settings.home_dir / "default_model.json", seed=settings.default_model
     )
     app.state.per_model_store = per_model_store
+    app.state.fusion = fusion
     app.state.skills = skills
     app.state.memory = memory
     app.state.images = images

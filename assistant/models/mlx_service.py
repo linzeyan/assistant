@@ -22,6 +22,8 @@ import shutil
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from assistant.agent.fusion import FUSION_MODEL_ID
+
 from .mlx_discovery import DiscoveredModel, discover_models
 from .mlx_engine import MlxEnginePool
 from .service import ModelService
@@ -74,6 +76,7 @@ class MlxModelService(ModelService):
         pool: MlxEnginePool | None = None,
         available_override: bool | None = None,
         per_model=None,
+        fusion=None,
     ):
         self._models_dir = Path(models_dir)
         self._extra_dirs = [Path(d) for d in (extra_model_dirs or [])]
@@ -82,6 +85,8 @@ class MlxModelService(ModelService):
         # Optional per-model generation overrides (PerModelStore). Merged into stream params so
         # each model's saved temperature/top_p/top_k/max_tokens apply automatically at chat time.
         self._per_model = per_model
+        # Optional Fusion engine (panel+judge), surfaced as the virtual "fusion" model.
+        self._fusion = fusion
         # available_override lets tests exercise the pool/discovery logic with a fake
         # loader on machines without mlx-lm installed.
         self._available_override = available_override
@@ -174,13 +179,23 @@ class MlxModelService(ModelService):
             return []
         await self._refresh_catalog()
         loaded = set(self._pool.loaded_ids())
-        return [
+        models = [
             ModelInfo(
                 id=m.id, type=m.kind, loaded=m.id in loaded,
                 source=m.source, size_bytes=m.size_bytes,
             )
             for m in self._catalog.values()
         ]
+        # Surface Fusion as a selectable virtual model (panel+judge) when configured.
+        if self._fusion is not None and self._fusion.enabled:
+            models.insert(
+                0,
+                ModelInfo(
+                    id=FUSION_MODEL_ID, type="llm", loaded=False,
+                    source="virtual", size_bytes=0,
+                ),
+            )
+        return models
 
     async def delete(self, model_id: str) -> None:
         """Remove a model's files from disk. Only models the user placed in their own
@@ -198,6 +213,8 @@ class MlxModelService(ModelService):
         self._catalog.pop(model_id, None)
 
     async def load(self, model_id: str) -> None:
+        if model_id == FUSION_MODEL_ID:
+            return  # virtual model: nothing to load (its panel models load on demand)
         entry = await self._entry_for(model_id)
         self._require_chat_model(entry)
         await self._pool.load(model_id, entry.path)
@@ -219,6 +236,12 @@ class MlxModelService(ModelService):
     def stream_chat(
         self, messages: list[dict], model: str, tools: list[dict] | None = None, **params
     ) -> AsyncIterator[dict]:
+        # The virtual "fusion" model runs panel+judge instead of a single engine. It gets no
+        # tools (first cut is text-only) and isn't subject to per-model overrides.
+        if model == FUSION_MODEL_ID and self._fusion is not None and self._fusion.enabled:
+            return self._fusion.answer(
+                self, messages, max_tokens=params.get("max_tokens", 1024)
+            )
         known = {
             t["function"]["name"]
             for t in (tools or [])

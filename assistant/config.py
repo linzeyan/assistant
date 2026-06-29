@@ -165,6 +165,13 @@ class Settings(BaseSettings):
     # .../Wan-AI/Wan2.2-TI2V-5B-mlx.
     video_checkpoint: Path | None = None
 
+    # --- fusion (multi-model panel + judge, exposed as the virtual "fusion" model) ---
+    # Seed values; the live config is persisted (home_dir/fusion.json) and editable at runtime
+    # via PUT /fusion. Only takes effect with a non-empty panel AND a judge.
+    fusion_enabled: bool = False
+    fusion_panel: list[str] = Field(default_factory=list)
+    fusion_judge: str | None = None
+
     # --- telegram (wired in a later phase) ---
     telegram_token: str | None = None
     telegram_allowed_users: list[int] = Field(default_factory=list)

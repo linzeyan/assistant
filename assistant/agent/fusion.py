@@ -1,0 +1,136 @@
+"""Fusion: local multi-model panel + judge, exposed as one virtual model.
+
+The user picks the "fusion" model and a turn runs as: each panel model answers the same prompt
+*independently and sequentially* (one resident at a time, so 16 GB stays safe — the engine pool
+evicts the previous model on the next load), then a judge model reads all candidates and streams
+a single synthesized answer. The goal is accuracy, not cost: several models cross-checking each
+other beats one model alone on reasoning/research questions. First cut is text-only — the panel
+gets no tools (a tool-using fusion is a much larger design, left for later).
+
+Config (enabled / panel / judge) is persisted so it survives restarts and can be changed live
+from the API; the model service treats fusion as a normal model id everywhere else.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import AsyncIterator
+from pathlib import Path
+
+log = logging.getLogger("assistant")
+
+FUSION_MODEL_ID = "fusion"
+
+_JUDGE_SYSTEM = (
+    "You are the judge of a multi-model panel. Several models answered the same question "
+    "independently. Compare them, reconcile disagreements, and produce the single most accurate "
+    "answer. Prefer claims best supported by reasoning over majority vote; if a candidate is "
+    "wrong on an important point, briefly correct it. Do not mention that you are a judge or "
+    "refer to 'candidates' in your final answer — just give the best answer."
+)
+
+
+def _last_user(messages: list[dict]) -> str:
+    for m in reversed(messages):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            return m["content"]
+    return ""
+
+
+def _judge_messages(messages: list[dict], candidates: list[tuple[str, str]]) -> list[dict]:
+    question = _last_user(messages)
+    blocks = "\n\n".join(
+        f"### Candidate {i} (model: {model})\n{text.strip() or '(no answer)'}"
+        for i, (model, text) in enumerate(candidates, 1)
+    )
+    user = (
+        f"## Question\n{question}\n\n"
+        f"## Panel answers\n{blocks}\n\n"
+        "## Task\nSynthesize the single most accurate answer to the question."
+    )
+    return [{"role": "system", "content": _JUDGE_SYSTEM}, {"role": "user", "content": user}]
+
+
+class FusionEngine:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        enabled: bool = False,
+        panel: list[str] | None = None,
+        judge: str | None = None,
+    ):
+        self._path = Path(path)
+        self._enabled = enabled
+        self._panel = list(panel or [])
+        self._judge = judge
+        if self._path.exists():
+            try:
+                raw = json.loads(self._path.read_text())
+                self._enabled = bool(raw.get("enabled", self._enabled))
+                self._panel = list(raw.get("panel", self._panel))
+                self._judge = raw.get("judge", self._judge)
+            except (OSError, ValueError):
+                log.warning("could not read fusion config at %s", self._path)
+
+    @property
+    def enabled(self) -> bool:
+        # Only actually usable with at least one panel model AND a judge — otherwise the virtual
+        # model would be offered but fail at generation time.
+        return bool(self._enabled and self._panel and self._judge)
+
+    @property
+    def config(self) -> dict:
+        return {"enabled": self._enabled, "panel": list(self._panel), "judge": self._judge}
+
+    def configure(
+        self,
+        *,
+        enabled: bool | None = None,
+        panel: list[str] | None = None,
+        judge: str | None = None,
+    ) -> dict:
+        if enabled is not None:
+            self._enabled = bool(enabled)
+        if panel is not None:
+            self._panel = list(panel)
+        if judge is not None:
+            self._judge = judge or None
+        try:
+            self._path.write_text(json.dumps(self.config))
+        except OSError:
+            log.exception("could not persist fusion config to %s", self._path)
+        return self.config
+
+    async def answer(
+        self, service, messages: list[dict], *, max_tokens: int = 1024, **_ignored
+    ) -> AsyncIterator[dict]:
+        """Run panel → judge, yielding loop-compatible events: tool_progress for the panel/judge
+        phases and the judge's text deltas as the answer. ``service`` is the model service (used
+        for each sub-generation); the panel runs with no tools."""
+        panel, judge = list(self._panel), self._judge
+        n = len(panel)
+        candidates: list[tuple[str, str]] = []
+        for i, model in enumerate(panel, 1):
+            yield {
+                "type": "tool_progress",
+                "name": "fusion",
+                "fraction": (i - 1) / (n + 1),
+                "label": f"panel {i}/{n}: {model}",
+            }
+            parts: list[str] = []
+            async for ev in service.stream_chat(messages, model, max_tokens=max_tokens):
+                if ev.get("type") == "text":
+                    parts.append(ev["content"])
+            candidates.append((model, "".join(parts)))
+        yield {
+            "type": "tool_progress",
+            "name": "fusion",
+            "fraction": n / (n + 1),
+            "label": f"judge: {judge}",
+        }
+        async for ev in service.stream_chat(
+            _judge_messages(messages, candidates), judge, max_tokens=max_tokens
+        ):
+            yield ev  # judge text deltas flow straight through as the answer
