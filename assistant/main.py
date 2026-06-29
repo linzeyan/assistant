@@ -42,6 +42,7 @@ from assistant.config import Settings, get_settings
 from assistant.images.mlx_backend import MlxImageBackend
 from assistant.memory.file_provider import FileMemoryProvider
 from assistant.models.default_store import DefaultModelStore
+from assistant.models.per_model_store import PerModelStore
 from assistant.models.mlx_audio import MlxAudioBackend
 from assistant.models.mlx_embeddings import MlxEmbeddingBackend
 from assistant.models.mlx_video import MlxVideoBackend
@@ -64,11 +65,12 @@ _QUIET_PATHS = frozenset({"/status", "/downloads", "/preflight"})
 _BUNDLED_SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 
 
-def _build_model_service(settings: Settings):
+def _build_model_service(settings: Settings, per_model=None):
     """Construct the configured model backend behind the ``ModelService`` seam.
 
     Returns ``(service, cleanup)``; ``cleanup`` is an async callable that releases
     backend-specific resources (an HTTP client for omlx, loaded engines for mlx).
+    ``per_model`` (a PerModelStore) supplies per-model generation overrides to the mlx backend.
     """
     if settings.model_backend == "omlx":
         from assistant.models.omlx_client import OmlxClient
@@ -99,6 +101,7 @@ def _build_model_service(settings: Settings):
         max_loaded=settings.max_loaded_models,
         include_hf_cache=settings.hf_cache,
         extra_model_dirs=settings.extra_model_dirs,
+        per_model=per_model,
     )
 
     async def cleanup() -> None:
@@ -119,7 +122,10 @@ async def lifespan(app: FastAPI):
         except OSError:
             pass
 
-    model_service, cleanup = _build_model_service(settings)
+    # Per-model generation overrides (oMLX-style), shared by the mlx backend (applied at chat
+    # time) and the /models/{id}/settings API (read/write).
+    per_model_store = PerModelStore(settings.home_dir / "per_model_settings.json")
+    model_service, cleanup = _build_model_service(settings, per_model=per_model_store)
 
     registry = build_registry()
     approver = PolicyApprover(settings.approval_required)
@@ -169,6 +175,7 @@ async def lifespan(app: FastAPI):
     app.state.default_model_store = DefaultModelStore(
         settings.home_dir / "default_model.json", seed=settings.default_model
     )
+    app.state.per_model_store = per_model_store
     app.state.skills = skills
     app.state.memory = memory
     app.state.images = images

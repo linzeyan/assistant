@@ -73,11 +73,15 @@ class MlxModelService(ModelService):
         extra_model_dirs: list[Path] | None = None,
         pool: MlxEnginePool | None = None,
         available_override: bool | None = None,
+        per_model=None,
     ):
         self._models_dir = Path(models_dir)
         self._extra_dirs = [Path(d) for d in (extra_model_dirs or [])]
         self._include_hf = include_hf_cache
         self._pool = pool or MlxEnginePool(max_loaded=max_loaded)
+        # Optional per-model generation overrides (PerModelStore). Merged into stream params so
+        # each model's saved temperature/top_p/top_k/max_tokens apply automatically at chat time.
+        self._per_model = per_model
         # available_override lets tests exercise the pool/discovery logic with a fake
         # loader on machines without mlx-lm installed.
         self._available_override = available_override
@@ -220,6 +224,10 @@ class MlxModelService(ModelService):
             for t in (tools or [])
             if isinstance(t.get("function"), dict) and t["function"].get("name")
         }
+        # The model's saved overrides win over the caller's defaults (e.g. a per-model
+        # max_tokens overrides the loop's global cap; temperature/top_p/top_k are added).
+        if self._per_model is not None:
+            params = {**params, **self._per_model.get(model)}
         return self._stream(messages, model, tools, known, **params)
 
     async def _stream(

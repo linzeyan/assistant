@@ -80,6 +80,7 @@ struct ModelsScreen: View {
                 .padding(.horizontal).padding(.bottom, 8)
 
                 List(filteredModels) { model in
+                  VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             HStack(spacing: 6) {
@@ -155,6 +156,15 @@ struct ModelsScreen: View {
                             ? "Cached models are shared — remove with hf cache tools"
                             : "Delete this model from disk")
                     }
+                    // Per-model generation overrides (oMLX-style); chat models only —
+                    // sampler settings don't apply to image/video/embedding kinds.
+                    if isChatLoadable(model.type) {
+                        DisclosureGroup("Generation settings") {
+                            ModelSettingsView(modelID: model.id).padding(.top, 4)
+                        }
+                        .font(.caption).foregroundStyle(.secondary)
+                    }
+                  }
                 }
             }
         }
@@ -197,5 +207,72 @@ struct ModelsScreen: View {
         }
         if model.source == "hf_cache" { parts.append("HuggingFace cache") }
         return parts.joined(separator: " · ")
+    }
+}
+
+/// A small editor for one model's saved generation overrides (temperature/top_p/top_k/
+/// max_tokens). Empty fields = unset (the global default applies). Save sends the full set as
+/// a replace, so blanking a field and saving clears it. Loaded lazily when the row expands.
+struct ModelSettingsView: View {
+    @EnvironmentObject var controller: BackendController
+    let modelID: String
+    @State private var temperature = ""
+    @State private var topP = ""
+    @State private var topK = ""
+    @State private var maxTokens = ""
+    @State private var saving = false
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                field("Temperature", $temperature)
+                field("Top-p", $topP)
+                field("Top-k", $topK)
+                field("Max tokens", $maxTokens)
+            }
+            HStack(spacing: 8) {
+                Button("Save") { Task { await save() } }.disabled(saving)
+                Button("Clear") {
+                    temperature = ""; topP = ""; topK = ""; maxTokens = ""
+                    Task { await save() }
+                }.disabled(saving)
+                if saving { ProgressView().controlSize(.small) }
+                if let error { Text(error).foregroundStyle(.red) }
+            }
+        }
+        .textFieldStyle(.roundedBorder)
+        .task { await load() }
+    }
+
+    private func field(_ label: String, _ binding: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            TextField("—", text: binding).frame(width: 78)
+        }
+    }
+
+    private func load() async {
+        guard let s = try? await controller.client.modelSettings(modelID).settings else { return }
+        temperature = s.temperature.map { String($0) } ?? ""
+        topP = s.topP.map { String($0) } ?? ""
+        topK = s.topK.map { String($0) } ?? ""
+        maxTokens = s.maxTokens.map { String($0) } ?? ""
+    }
+
+    private func save() async {
+        saving = true
+        defer { saving = false }
+        var body: [String: Any] = [:]
+        if let v = Double(temperature) { body["temperature"] = v }
+        if let v = Double(topP) { body["top_p"] = v }
+        if let v = Int(topK) { body["top_k"] = v }
+        if let v = Int(maxTokens) { body["max_tokens"] = v }
+        do {
+            try await controller.client.setModelSettings(modelID, body)
+            error = nil
+        } catch {
+            self.error = "save failed"
+        }
     }
 }

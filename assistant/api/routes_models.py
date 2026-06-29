@@ -33,6 +33,18 @@ async def set_default_model(request: Request):
     return {"default": request.app.state.default_model_store.value}
 
 
+@router.get("/models/{model_id:path}/settings")
+async def get_model_settings(model_id: str, request: Request):
+    return {"model": model_id, "settings": request.app.state.per_model_store.get(model_id)}
+
+
+@router.put("/models/{model_id:path}/settings")
+async def set_model_settings(model_id: str, request: Request):
+    body = await request.json()
+    settings = request.app.state.per_model_store.set(model_id, body.get("settings") or {})
+    return {"model": model_id, "settings": settings}
+
+
 @router.post("/models/{model_id:path}/load")
 async def load_model(model_id: str, request: Request):
     try:

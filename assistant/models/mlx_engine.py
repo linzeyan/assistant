@@ -108,6 +108,25 @@ def _render_prompt(templater, messages: list[dict], tools: list[dict] | None) ->
         return templater(messages, add_generation_prompt=True, tokenize=False)
 
 
+def _sampler_kwargs(
+    temperature: float | None, top_p: float | None, top_k: int | None
+) -> dict:
+    """Build mlx-lm's ``sampler`` kwarg from per-model overrides, or {} when none are set (so
+    the library keeps its own greedy/default sampling). Isolated so the mlx-lm import stays
+    lazy and a sampler-API change touches only here."""
+    if temperature is None and top_p is None and top_k is None:
+        return {}
+    from mlx_lm.sample_utils import make_sampler
+
+    return {
+        "sampler": make_sampler(
+            temp=float(temperature) if temperature is not None else 0.0,
+            top_p=float(top_p) if top_p is not None else 0.0,
+            top_k=int(top_k) if top_k is not None else 0,
+        )
+    }
+
+
 class MlxEngine:
     """A loaded mlx-lm model + tokenizer that streams text for one chat turn."""
 
@@ -120,6 +139,9 @@ class MlxEngine:
         messages: list[dict],
         tools: list[dict] | None = None,
         max_tokens: int = 1024,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
         **_ignored,
     ) -> Iterator[str]:
         # Imported lazily: MLX is a heavy, Apple-Silicon-only dependency.
@@ -130,7 +152,11 @@ class MlxEngine:
         # tools-kwarg fallback without masking real template errors.
         prompt = _render_prompt(self._tokenizer.apply_chat_template, messages, tools)
         for response in stream_generate(
-            self._model, self._tokenizer, prompt, max_tokens=max_tokens
+            self._model,
+            self._tokenizer,
+            prompt,
+            max_tokens=max_tokens,
+            **_sampler_kwargs(temperature, top_p, top_k),
         ):
             text = getattr(response, "text", None)
             if text:

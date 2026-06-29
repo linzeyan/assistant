@@ -49,6 +49,24 @@ struct DefaultModelDTO: Decodable {
     enum CodingKeys: String, CodingKey { case model = "default" }
 }
 
+/// One model's saved generation overrides (GET /models/{id}/settings). All optional — an
+/// unset field means the global default applies.
+struct ModelSettingsDTO: Decodable {
+    let settings: Values
+    struct Values: Decodable {
+        let temperature: Double?
+        let topP: Double?
+        let topK: Int?
+        let maxTokens: Int?
+        enum CodingKeys: String, CodingKey {
+            case temperature
+            case topP = "top_p"
+            case topK = "top_k"
+            case maxTokens = "max_tokens"
+        }
+    }
+}
+
 struct SkillDTO: Decodable, Identifiable, Hashable {
     var id: String { name }
     let name: String

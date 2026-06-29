@@ -37,6 +37,12 @@ struct AssistantClient {
     func setDefaultModel(_ id: String) async throws {
         try await sendJSONNoDecode("PUT", "/models/default", body: ["model": id])
     }
+    func modelSettings(_ id: String) async throws -> ModelSettingsDTO {
+        try await get("/models/\(id)/settings")
+    }
+    func setModelSettings(_ id: String, _ settings: [String: Any]) async throws {
+        try await sendJSONNoDecode("PUT", "/models/\(id)/settings", body: ["settings": settings])
+    }
     func loadModel(_ id: String) async throws { try await post("/models/\(id)/load") }
     func unloadModel(_ id: String) async throws { try await post("/models/\(id)/unload") }
     func deleteModel(_ id: String) async throws {
