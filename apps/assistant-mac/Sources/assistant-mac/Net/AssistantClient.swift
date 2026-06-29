@@ -33,6 +33,10 @@ struct AssistantClient {
         return try await get("/memory/search?q=\(q)")
     }
 
+    func defaultModel() async throws -> DefaultModelDTO { try await get("/models/default") }
+    func setDefaultModel(_ id: String) async throws {
+        try await sendJSONNoDecode("PUT", "/models/default", body: ["model": id])
+    }
     func loadModel(_ id: String) async throws { try await post("/models/\(id)/load") }
     func unloadModel(_ id: String) async throws { try await post("/models/\(id)/unload") }
     func deleteModel(_ id: String) async throws {

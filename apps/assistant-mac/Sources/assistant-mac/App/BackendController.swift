@@ -226,6 +226,11 @@ final class BackendController: ObservableObject {
             models = result.models
             reachable = true  // the calls succeeded — the HTTP backend is up
             modelBackendReady = result.reachable
+            // The default lives on the backend now (shared with Telegram); adopt it so the GUI
+            // reflects it. try? keeps an older backend without the route from breaking refresh.
+            if let backendDefault = (try? await client.defaultModel())?.model, !backendDefault.isEmpty {
+                defaultModel = backendDefault
+            }
             if selectedModel == nil || !models.contains(where: { $0.id == selectedModel }) {
                 // Prefer the user's persisted default (if still present), then a loaded
                 // model, then the first listed.
@@ -247,6 +252,19 @@ final class BackendController: ObservableObject {
             lastError = String(describing: error)
             reachable = false
             modelBackendReady = false
+        }
+    }
+
+    /// Make `id` the default chat model: update the local UI immediately, switch the current
+    /// session to it (existing behavior), and persist to the backend so the Telegram gateway
+    /// shares the same default. The local-first order keeps the button feeling instant.
+    func setDefaultModel(_ id: String) async {
+        defaultModel = id
+        selectedModel = id
+        do {
+            try await client.setDefaultModel(id)
+        } catch {
+            modelActionError = "Set default failed — \(error)"
         }
     }
 

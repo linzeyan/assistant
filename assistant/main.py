@@ -41,6 +41,7 @@ from assistant.api import (
 from assistant.config import Settings, get_settings
 from assistant.images.mlx_backend import MlxImageBackend
 from assistant.memory.file_provider import FileMemoryProvider
+from assistant.models.default_store import DefaultModelStore
 from assistant.models.mlx_audio import MlxAudioBackend
 from assistant.models.mlx_embeddings import MlxEmbeddingBackend
 from assistant.models.mlx_video import MlxVideoBackend
@@ -160,6 +161,11 @@ async def lifespan(app: FastAPI):
     )
 
     app.state.model_service = model_service
+    # Backend-authoritative default chat model (seeded from config), shared by the API and the
+    # Telegram gateway so the GUI's "Default" applies to both. See models/default_store.py.
+    app.state.default_model_store = DefaultModelStore(
+        settings.home_dir / "default_model.json", seed=settings.default_model
+    )
     app.state.skills = skills
     app.state.memory = memory
     app.state.images = images

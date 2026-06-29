@@ -228,6 +228,7 @@ class TelegramGateway:
         video=None,
         model_dirs=None,
         default_workspace=None,
+        default_store=None,
     ):
         self._token = token
         self._allowed = set(allowed_users or [])
@@ -235,6 +236,9 @@ class TelegramGateway:
         self._sessions = sessions
         self._models = model_service
         self._default_model = default_model
+        # Live backend default (GUI "Default" → store), preferred over the config snapshot in
+        # pick_model so Telegram and the desktop agree on the default model.
+        self._default_store = default_store
         self._approval_required = approval_required
         # Optional audio backend (mlx-audio): enables voice-in (STT) and voice-out
         # (TTS). Absent/unavailable -> the gateway stays text-only.
@@ -324,14 +328,16 @@ class TelegramGateway:
         models = [m for m in await self._models.list_models() if m.type in _CHATTABLE_KINDS]
         if not models:
             return None
-        # Order of preference: this chat's explicit /models pick, then the configured
-        # default, then an already-loaded model (avoids a load stall), then the first.
+        # Order of preference: this chat's explicit /models pick, then the live backend
+        # default (the GUI's "Default", shared via the store), then an already-loaded model
+        # (avoids a load stall), then the first.
         chosen = self._selected_model.get(chat_id) if chat_id is not None else None
         if chosen and any(m.id == chosen for m in models):
             return chosen
-        if self._default_model:
+        default = self._default_store.value if self._default_store else self._default_model
+        if default:
             for m in models:
-                if m.id == self._default_model:
+                if m.id == default:
                     return m.id
         for m in models:
             if m.loaded:

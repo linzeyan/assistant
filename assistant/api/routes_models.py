@@ -21,6 +21,18 @@ async def list_models(request: Request):
     }
 
 
+@router.get("/models/default")
+async def get_default_model(request: Request):
+    return {"default": request.app.state.default_model_store.value}
+
+
+@router.put("/models/default")
+async def set_default_model(request: Request):
+    body = await request.json()
+    request.app.state.default_model_store.set(body.get("model"))
+    return {"default": request.app.state.default_model_store.value}
+
+
 @router.post("/models/{model_id:path}/load")
 async def load_model(model_id: str, request: Request):
     try:

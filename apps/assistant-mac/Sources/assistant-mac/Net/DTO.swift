@@ -43,6 +43,12 @@ struct ModelsDTO: Decodable {
     let reachable: Bool
 }
 
+/// The backend-authoritative default chat model (GET /models/default). Shared with Telegram.
+struct DefaultModelDTO: Decodable {
+    let model: String?
+    enum CodingKeys: String, CodingKey { case model = "default" }
+}
+
 struct SkillDTO: Decodable, Identifiable, Hashable {
     var id: String { name }
     let name: String

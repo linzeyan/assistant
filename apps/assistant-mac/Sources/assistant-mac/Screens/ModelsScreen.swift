@@ -106,10 +106,10 @@ struct ModelsScreen: View {
                         }
                         // "Default" persists the model the Chat tab starts on, and switches
                         // the current session to it too. The reverse never happens: the Chat
-                        // picker only changes the session, never the persisted default.
+                        // picker only changes the session, never the persisted default. The
+                        // default now lives on the backend so Telegram uses it as well.
                         Button("Default") {
-                            controller.defaultModel = model.id
-                            controller.selectedModel = model.id
+                            Task { await controller.setDefaultModel(model.id) }
                         }
                         .disabled(!isChatLoadable(model.type) || model.id == controller.defaultModel)
                         // Delete from disk (local models only; cached entries are shared).

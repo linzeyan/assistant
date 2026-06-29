@@ -161,6 +161,19 @@ async def test_pick_model_selected_overrides_default():
     assert await gw.pick_model(99) == "a"  # a different chat still gets the default
 
 
+async def test_pick_model_prefers_backend_default_store(tmp_path):
+    # WHY: the GUI "Default" now persists to a backend store; Telegram must read THAT (not the
+    # construction-time config snapshot) so both entries agree on the default model.
+    from assistant.models.default_store import DefaultModelStore
+
+    models = [ModelInfo("a", type="llm"), ModelInfo("b", type="llm")]
+    gw = _gateway(models=models, default="a")  # config default = "a"
+    store = DefaultModelStore(tmp_path / "d.json", seed=None)
+    store.set("b")
+    gw._default_store = store
+    assert await gw.pick_model() == "b"  # backend store wins over config "a"
+
+
 async def test_pick_model_stale_selection_falls_back():
     # A pick that's since been deleted must not be returned — fall back to normal order.
     gw = _gateway(models=[ModelInfo("a", type="llm")], default="a")

@@ -37,6 +37,8 @@ async def build_and_start(settings, app) -> tuple[object | None, str | None]:
         model_dirs=[settings.models_dir, *settings.extra_model_dirs],
         # Shown by /cd when a chat hasn't picked its own working directory yet.
         default_workspace=settings.workspace_dir,
+        # Live backend default model (GUI "Default"), so Telegram's default matches the desktop.
+        default_store=getattr(app.state, "default_model_store", None),
     )
     try:
         await gateway.start()
