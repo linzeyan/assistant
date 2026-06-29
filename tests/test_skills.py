@@ -16,6 +16,19 @@ def test_scan_and_index(tmp_path):
     assert "alpha" in idx and idx["alpha"].description == "A skill"
 
 
+def test_bundled_investigate_skill_is_discoverable():
+    # Spring4 SB.1: the engine was complete but the shelf was empty. The bundled `investigate`
+    # skill must ship at repo-root/skills (where main.py points _BUNDLED_SKILLS_DIR) with a
+    # frontmatter that parses and a trigger-y description, or pull-and-follow can't be measured.
+    bundled = Path(__file__).resolve().parent.parent / "skills"
+    idx = scan_skills([bundled])
+    assert "investigate" in idx, "bundled investigate skill missing"
+    desc = idx["investigate"].description.lower()
+    assert "root cause" in desc and ("broken" in desc or "error" in desc)
+    body = idx["investigate"].path.read_text()
+    assert "no root cause, no fix" in body.lower()  # the Iron Law survived distillation
+
+
 def test_store_reload_and_read_body(tmp_path):
     bundled, user = tmp_path / "bundled", tmp_path / "user"
     bundled.mkdir()

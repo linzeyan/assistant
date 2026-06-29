@@ -32,3 +32,12 @@ def test_system_prompt_has_no_date():
 
 def test_memory_context_is_reference_only_block():
     assert wrap_memory_context("a fact").startswith("<memory-context reference-only>")
+
+
+def test_system_prompt_has_skill_use_policy():
+    # SB.2: a static policy nudging the model to skill_view a clearly-matching skill rather than
+    # improvise. Lives in the cacheable prefix (not per-turn), so it must be in build_system_prompt
+    # regardless of the skills index passed.
+    p = build_system_prompt("(skills index)")
+    assert "Using skills" in p
+    assert "skill_view" in p

@@ -39,6 +39,13 @@ output a script for other software: emit the generate_image / generate_video too
 action, passing the user's request as the prompt. "generate / draw / make a video of X" means \
 call the tool now.
 
+Using skills:
+- The "Available skills" list below names reusable workflows for specific situations. When a \
+request clearly matches one — for example a debugging ask ("why is this broken", "it's \
+erroring", "it crashed", "this test fails") matches the investigate skill — call \
+skill_view(name) FIRST and follow that workflow step by step, instead of improvising an \
+ad-hoc answer.
+
 Self-improvement:
 - After solving a non-trivial, reusable task, consider saving the procedure as a \
 skill via skill_manage(action="create").
