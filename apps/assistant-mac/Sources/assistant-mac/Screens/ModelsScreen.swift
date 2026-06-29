@@ -7,6 +7,30 @@ struct ModelsScreen: View {
     // The id whose copy icon currently shows the "copied" checkmark; cleared after a
     // short delay so a click registers as visible feedback (the copy is otherwise silent).
     @State private var copiedID: String?
+    @State private var kindTab: ModelKindTab = .all
+
+    /// Models tab sub-filters by capability. "Chat" is the catch-all for anything loadable in
+    /// the Chat picker (llm/vlm + unknown types that fail-open to chat).
+    private enum ModelKindTab: String, CaseIterable, Identifiable {
+        case all = "All", chat = "Chat", image = "Image", video = "Video", embedding = "Embedding"
+        var id: String { rawValue }
+    }
+
+    private var filteredModels: [ModelDTO] {
+        controller.models.filter { matches(kindTab, $0.type) }
+    }
+
+    private func matches(_ tab: ModelKindTab, _ type: String?) -> Bool {
+        switch tab {
+        case .all: return true
+        case .image: return type == "image"
+        case .video: return type == "video"
+        case .embedding: return type == "embedding"
+        // Fail-open: nil/unknown types land under Chat (they're chat-loadable), matching
+        // isChatLoadable's "anything but embedding" philosophy.
+        case .chat: return !["image", "video", "embedding"].contains(type ?? "")
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -46,7 +70,16 @@ struct ModelsScreen: View {
                     description: Text("Fetch one from the Downloads tab, or drop weights in the models dir.")
                 )
             } else {
-                List(controller.models) { model in
+                // Sub-tabs by capability (S3.2d). "Chat" is llm+vlm+unknown (anything
+                // loadable in the Chat picker); image/video/embedding are their own tabs.
+                Picker("", selection: $kindTab) {
+                    ForEach(ModelKindTab.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .padding(.horizontal).padding(.bottom, 8)
+
+                List(filteredModels) { model in
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             HStack(spacing: 6) {
