@@ -145,6 +145,12 @@ class Settings(BaseSettings):
     # --- image generation / editing ---
     image_model: str = "schnell"  # mflux alias (schnell/dev); used when mflux present
     images_dir: Path = XDG_DATA_DIR / "images"
+    # Default output size / steps, runtime-switchable from the Telegram /imageset picker and the
+    # GUI. A per-request tool arg still overrides these; steps None lets the model pick a sane
+    # default for its alias (schnell ≈4, dev ≈20).
+    image_default_width: int = 1024
+    image_default_height: int = 1024
+    image_default_steps: int | None = None
     # Optional quantization (8/4) for the large Qwen-Image-Edit model used by edit_image,
     # to fit tighter unified memory; None = full precision.
     image_edit_quantize: int | None = None

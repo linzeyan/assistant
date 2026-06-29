@@ -137,6 +137,9 @@ async def lifespan(app: FastAPI):
         settings.images_dir,
         model=settings.image_model,
         edit_quantize=settings.image_edit_quantize,
+        width=settings.image_default_width,
+        height=settings.image_default_height,
+        steps=settings.image_default_steps,
     )
     vision = MlxVLMBackend(model=settings.vlm_model)
     audio = MlxAudioBackend(

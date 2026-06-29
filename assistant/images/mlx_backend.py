@@ -21,10 +21,29 @@ from pathlib import Path
 
 from .service import MediaService
 
+# Named square sizes offered by the /imageset picker and the GUI. The tool still accepts an
+# arbitrary width/height; these are just the one-tap presets (FLUX trains at 1024).
+IMAGE_SIZES: dict[str, tuple[int, int]] = {
+    "512": (512, 512),
+    "768": (768, 768),
+    "1024": (1024, 1024),
+}
+DEFAULT_IMAGE_SIZE = "1024"
+# mflux text-to-image aliases the /image picker offers. Unlike video (an on-disk checkpoint),
+# mflux resolves these internally, so the picker needs no filesystem discovery.
+IMAGE_MODELS = ("schnell", "dev")
+
 
 class MlxImageBackend(MediaService):
     def __init__(
-        self, images_dir: Path, model: str = "schnell", *, edit_quantize: int | None = None
+        self,
+        images_dir: Path,
+        model: str = "schnell",
+        *,
+        edit_quantize: int | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        steps: int | None = None,
     ):
         self._dir = Path(images_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -32,6 +51,35 @@ class MlxImageBackend(MediaService):
         # Optional quantization for the large Qwen-Image-Edit model (8/4) to fit tighter
         # unified memory; None = full precision.
         self._edit_quantize = edit_quantize
+        # Runtime-switchable defaults (Telegram /imageset, GUI). A per-request tool arg still
+        # overrides these; steps None lets _generate_sync pick a per-alias default.
+        self._width = width or IMAGE_SIZES[DEFAULT_IMAGE_SIZE][0]
+        self._height = height or IMAGE_SIZES[DEFAULT_IMAGE_SIZE][1]
+        self._steps = steps if steps and steps > 0 else None
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def set_model(self, name: str) -> None:
+        if name:
+            self._model = name
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return (self._width, self._height)
+
+    def set_size(self, name: str) -> None:
+        """Set the default output size from a named preset (see IMAGE_SIZES)."""
+        if name in IMAGE_SIZES:
+            self._width, self._height = IMAGE_SIZES[name]
+
+    @property
+    def steps(self) -> int | None:
+        return self._steps
+
+    def set_steps(self, steps: int | None) -> None:
+        self._steps = steps if steps and steps > 0 else None
 
     def available(self) -> bool:
         return importlib.util.find_spec("mflux") is not None
@@ -66,12 +114,14 @@ class MlxImageBackend(MediaService):
         from mflux.models.flux.variants.txt2img.flux import Flux1
 
         flux = Flux1.from_name(self._model)
+        # Precedence: explicit per-request arg > the /imageset default > a per-alias fallback.
+        eff_steps = steps or self._steps or (4 if self._model == "schnell" else 20)
         image = flux.generate_image(
             seed=seed if seed is not None else 0,
             prompt=prompt,
-            num_inference_steps=steps or (4 if self._model == "schnell" else 20),
-            height=height or 1024,
-            width=width or 1024,
+            num_inference_steps=eff_steps,
+            height=height or self._height,
+            width=width or self._width,
         )
         out = self._dir / f"img_{uuid.uuid4().hex[:8]}.png"
         image.save(path=str(out))

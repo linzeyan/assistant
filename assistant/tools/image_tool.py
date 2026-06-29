@@ -22,6 +22,8 @@ from .registry import registry
             "prompt": {"type": "string"},
             "steps": {"type": "integer", "description": "Inference steps (optional)."},
             "seed": {"type": "integer", "description": "Random seed (optional)."},
+            "width": {"type": "integer", "description": "Output width in px (optional)."},
+            "height": {"type": "integer", "description": "Output height in px (optional)."},
         },
         "required": ["prompt"],
     },
@@ -34,7 +36,11 @@ async def generate_image(args: dict, ctx: ToolContext) -> ToolResult:
         )
     try:
         path = await ctx.images.generate_image(
-            args["prompt"], steps=args.get("steps"), seed=args.get("seed")
+            args["prompt"],
+            steps=args.get("steps"),
+            seed=args.get("seed"),
+            width=args.get("width"),
+            height=args.get("height"),
         )
     except Exception as exc:
         return ToolResult(False, f"image generation failed: {exc}")
@@ -62,6 +68,10 @@ async def generate_image(args: dict, ctx: ToolContext) -> ToolResult:
             },
             "steps": {"type": "integer", "description": "Inference steps (optional)."},
             "seed": {"type": "integer", "description": "Random seed (optional)."},
+            "guidance": {
+                "type": "number",
+                "description": "Guidance scale — how strictly to follow the instruction (optional).",
+            },
         },
         "required": ["prompt"],
     },
@@ -87,7 +97,11 @@ async def edit_image(args: dict, ctx: ToolContext) -> ToolResult:
         paths.append(str(p))
     try:
         out = await ctx.images.edit_image(
-            args["prompt"], paths, steps=args.get("steps"), seed=args.get("seed")
+            args["prompt"],
+            paths,
+            steps=args.get("steps"),
+            seed=args.get("seed"),
+            guidance=args.get("guidance"),
         )
     except Exception as exc:
         return ToolResult(False, f"image edit failed: {exc}")
