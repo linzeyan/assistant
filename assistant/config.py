@@ -151,10 +151,11 @@ class Settings(BaseSettings):
     image_model: str = ""
     images_dir: Path = XDG_DATA_DIR / "images"
     # Default output size / steps, runtime-switchable from the Telegram /imageset picker and the
-    # GUI. A per-request tool arg still overrides these; steps None lets the model pick a sane
-    # default for its alias (schnell ≈4, dev ≈20).
-    image_default_width: int = 1024
-    image_default_height: int = 1024
+    # GUI. A per-request tool arg still overrides these. 512² by default — lighter/faster on
+    # constrained memory; bump to 768/1024 per request or via /imageset. steps None lets the
+    # backend pick a sane per-model default.
+    image_default_width: int = 512
+    image_default_height: int = 512
     image_default_steps: int | None = None
     # Optional quantization (8/4) for the large Qwen-Image-Edit model used by edit_image,
     # to fit tighter unified memory; None = full precision.

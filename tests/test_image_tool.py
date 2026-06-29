@@ -58,7 +58,7 @@ async def test_generate_image_passes_size_through(tmp_path):
 def test_mlx_backend_runtime_knobs(tmp_path):
     # The /imageset + GUI knobs are pure state (no mflux), so they're testable anywhere.
     backend = MlxImageBackend(tmp_path)
-    assert backend.size == (1024, 1024)  # default
+    assert backend.size == (512, 512)  # default (lighter/faster)
     backend.set_size("768")
     assert backend.size == (768, 768)
     backend.set_size("bogus")  # unknown preset is ignored, not an error

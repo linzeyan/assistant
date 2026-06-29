@@ -30,7 +30,7 @@ IMAGE_SIZES: dict[str, tuple[int, int]] = {
     "768": (768, 768),
     "1024": (1024, 1024),
 }
-DEFAULT_IMAGE_SIZE = "1024"
+DEFAULT_IMAGE_SIZE = "512"  # lighter/faster default; bump per request or via /imageset
 # mflux text-to-image aliases. Empty by default: the schnell/dev aliases pull a multi-GB FLUX.1
 # checkpoint from HuggingFace on first use (looks frozen) and the user has fast local mlx-gen
 # models, so the /image picker offers only on-disk checkpoints (discover_image_checkpoints) that
