@@ -31,7 +31,10 @@ class DiscoveredModel:
 
 
 def _has_config(d: Path) -> bool:
-    return (d / "config.json").is_file()
+    # diffusers image/video pipelines (FLUX, Qwen-Image) ship model_index.json instead of a
+    # top-level config.json; accepting it keeps those checkpoints from silently vanishing from
+    # the Models list (they still need real weights via _has_weights).
+    return (d / "config.json").is_file() or (d / "model_index.json").is_file()
 
 
 def _dir_size(d: Path) -> int:
@@ -118,11 +121,16 @@ def classify_kind(d: Path) -> str:
     arch = (archs[0] if archs else "").lower()
     mtype = str(cfg.get("model_type") or "").lower()
     cls_name = str(cfg.get("_class_name") or "").lower()
+    # A diffusers pipeline declares its class in model_index.json (no config.json); fold it in
+    # so a pipeline-only Wan/LTX dir still routes to video instead of fail-opening to "llm".
+    idx_cls = str(_read_model_index(d).get("_class_name") or "").lower()
     # Diffusion video models (Wan S2V/TI2V/T2V/I2V …) declare a video model_type or a
     # WanModel diffusers class. They are NOT chattable: without this they fail-open to
     # "llm" below and pollute the chat model list, where loading one as an LLM dies with
     # "No safetensors found" (weights are diffusion_pytorch_model-*, not LM format).
-    if mtype in _VIDEO_TYPES or "wan" in cls_name or "video" in cls_name:
+    if mtype in _VIDEO_TYPES or any(
+        "wan" in c or "video" in c or "ltx" in c for c in (cls_name, idx_cls)
+    ):
         return "video"
     # Diffusion image pipelines (FLUX / Qwen-Image via mflux). Checked before the vae→video
     # rule below because an image checkpoint also ships a VAE — the FLUX/Qwen-Image pipeline

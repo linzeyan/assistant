@@ -173,6 +173,28 @@ def test_classify_kind_qwen_image_via_arch(tmp_path):
     assert classify_kind(d) == "image"
 
 
+def test_classify_kind_video_via_model_index(tmp_path):
+    # A diffusers Wan pipeline declares its class in model_index.json (no config.json). Without
+    # folding that in it would fail-open to "llm" and pollute the chat list.
+    d = tmp_path / "wanp"
+    d.mkdir()
+    (d / "model_index.json").write_text(json.dumps({"_class_name": "WanPipeline"}))
+    assert classify_kind(d) == "video"
+
+
+def test_discover_includes_diffusers_without_config_json(tmp_path):
+    # A FLUX checkpoint carries model_index.json (not config.json) + weights in subdirs. It must
+    # not silently vanish from the Models list just because it lacks a top-level config.json.
+    from assistant.models.mlx_discovery import discover_local
+
+    d = tmp_path / "FLUX.1-schnell"
+    (d / "transformer").mkdir(parents=True)
+    (d / "model_index.json").write_text(json.dumps({"_class_name": "FluxPipeline"}))
+    (d / "transformer" / "diffusion.safetensors").write_bytes(b"\x00" * 16)
+    found = {m.id: m for m in discover_local(tmp_path)}
+    assert "FLUX.1-schnell" in found and found["FLUX.1-schnell"].kind == "image"
+
+
 def _make_video_ckpt(d: Path, *, dual: bool = False, t5: bool = True, vae: bool = True) -> Path:
     """A converted-MLX Wan checkpoint: config + vae + t5_encoder + transformer weight(s)."""
     d.mkdir(parents=True, exist_ok=True)
