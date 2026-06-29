@@ -49,6 +49,13 @@ struct DefaultModelDTO: Decodable {
     enum CodingKeys: String, CodingKey { case model = "default" }
 }
 
+/// Fusion config (GET/PUT /fusion): the panel models + judge for the virtual "fusion" model.
+struct FusionConfigDTO: Decodable {
+    let enabled: Bool
+    let panel: [String]
+    let judge: String?
+}
+
 /// One model's saved generation overrides (GET /models/{id}/settings). All optional — an
 /// unset field means the global default applies.
 struct ModelSettingsDTO: Decodable {

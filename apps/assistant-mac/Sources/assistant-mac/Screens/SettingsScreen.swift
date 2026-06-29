@@ -21,6 +21,10 @@ struct SettingsScreen: View {
     @State private var bindNote: String?
     @State private var backendKindNote: String?
     @State private var agentNote: String?
+
+    @State private var fusionEnabled = false
+    @State private var fusionPanel: Set<String> = []
+    @State private var fusionJudge: String?
     // Gateways (S9): the token field is write-only (blank = keep current); the rest is status.
     @State private var telegramTokenInput: String = ""
     @State private var telegramAllowlist: String = ""
@@ -181,8 +185,62 @@ struct SettingsScreen: View {
                     + "Applies to the next reply — no restart.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
+
+            fusionSection
         }
         .formStyle(.grouped)
+        .task { await loadFusion() }
+    }
+
+    /// Chat models eligible for a Fusion panel/judge — excludes embedding/image/video kinds and
+    /// the virtual "fusion" model itself.
+    private var fusionCandidates: [String] {
+        controller.models
+            .filter { !["embedding", "image", "video"].contains($0.type ?? "") && $0.id != "fusion" }
+            .map(\.id)
+    }
+
+    private var fusionSection: some View {
+        Section("Fusion (panel + judge)") {
+            Toggle("Enable Fusion", isOn: $fusionEnabled)
+                .onChange(of: fusionEnabled) { _, _ in Task { await saveFusion() } }
+            if fusionCandidates.isEmpty {
+                Text("No chat models available yet.").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("Panel — each model answers, then the judge synthesizes one answer:")
+                    .font(.caption).foregroundStyle(.secondary)
+                ForEach(fusionCandidates, id: \.self) { id in
+                    Toggle(isOn: Binding(
+                        get: { fusionPanel.contains(id) },
+                        set: { on in
+                            if on { fusionPanel.insert(id) } else { fusionPanel.remove(id) }
+                            Task { await saveFusion() }
+                        }
+                    )) { Text(id).font(.callout) }
+                }
+                Picker("Judge", selection: $fusionJudge) {
+                    Text("None").tag(String?.none)
+                    ForEach(fusionCandidates, id: \.self) { Text($0).tag(Optional($0)) }
+                }
+                .onChange(of: fusionJudge) { _, _ in Task { await saveFusion() } }
+            }
+            Text("Then pick the “fusion” model in Chat or Models to run a panel turn. "
+                + "Models load one at a time, so it's slower but cross-checked.")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+
+    private func loadFusion() async {
+        guard let cfg = try? await controller.client.fusion() else { return }
+        fusionEnabled = cfg.enabled
+        fusionPanel = Set(cfg.panel)
+        fusionJudge = cfg.judge
+    }
+
+    private func saveFusion() async {
+        try? await controller.client.setFusion(
+            enabled: fusionEnabled, panel: Array(fusionPanel), judge: fusionJudge ?? ""
+        )
     }
 
     private var gatewaysTab: some View {

@@ -103,9 +103,29 @@ class _FakeImages:
         self.steps = steps
 
 
+class _FakeFusion:
+    def __init__(self):
+        self._enabled = False
+        self._panel: list[str] = []
+        self._judge = None
+
+    @property
+    def config(self):
+        return {"enabled": self._enabled, "panel": list(self._panel), "judge": self._judge}
+
+    def configure(self, *, enabled=None, panel=None, judge=None):
+        if enabled is not None:
+            self._enabled = enabled
+        if panel is not None:
+            self._panel = list(panel)
+        if judge is not None:
+            self._judge = judge or None  # "" clears
+        return self.config
+
+
 def _gateway(
     allowed=None, models=None, default=None, audio=None, video=None, images=None,
-    model_dirs=None
+    fusion=None, model_dirs=None
 ) -> TelegramGateway:
     return TelegramGateway(
         token="x",
@@ -117,6 +137,7 @@ def _gateway(
         audio=audio,
         video=video,
         images=images,
+        fusion=fusion,
         model_dirs=model_dirs,
     )
 
@@ -327,6 +348,29 @@ async def test_apply_imageset_choice_sets_size_and_steps():
     query.data = "isteps:0"  # "Default steps" → clear
     await gw._apply_imageset_choice(query)
     assert images.steps is None
+
+
+async def test_fusion_toggle_panel_and_judge():
+    fusion = _FakeFusion()
+    gw = _gateway(models=[ModelInfo("a", type="llm"), ModelInfo("b", type="llm")], fusion=fusion)
+    q = Mock()
+    q.edit_message_reply_markup = AsyncMock()
+
+    async def tap(data):
+        q.data = data
+        await gw._apply_fusion_choice(q)
+
+    await tap("fus:toggle")
+    assert fusion.config["enabled"] is True
+    await tap("fus:panel:0")
+    await tap("fus:panel:1")
+    assert fusion.config["panel"] == ["a", "b"]
+    await tap("fus:panel:0")  # re-tap toggles membership off
+    assert fusion.config["panel"] == ["b"]
+    await tap("fus:judge:1")
+    assert fusion.config["judge"] == "b"
+    await tap("fus:judge:1")  # re-tap the judge clears it
+    assert fusion.config["judge"] is None
 
 
 async def test_videoset_taps_set_backend_defaults(tmp_path):

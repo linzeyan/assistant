@@ -227,6 +227,7 @@ class TelegramGateway:
         audio=None,
         video=None,
         images=None,
+        fusion=None,
         model_dirs=None,
         default_workspace=None,
         default_store=None,
@@ -252,6 +253,8 @@ class TelegramGateway:
         # Optional image-generation backend (MlxImageBackend). Powers /image (pick the mflux
         # alias) and /imageset (default size & steps), which set the backend's knobs at runtime.
         self._images = images
+        # Optional Fusion engine (panel+judge). Powers /fusion (toggle + pick panel & judge).
+        self._fusion = fusion
         self._app = None
         self._pending: dict[str, asyncio.Future] = {}
         # Per-chat model override, set via the /models inline-keyboard picker. Takes
@@ -286,6 +289,7 @@ class TelegramGateway:
         app.add_handler(CommandHandler("videoset", self._on_videoset))
         app.add_handler(CommandHandler("image", self._on_image))
         app.add_handler(CommandHandler("imageset", self._on_imageset))
+        app.add_handler(CommandHandler("fusion", self._on_fusion))
         app.add_handler(CallbackQueryHandler(self._on_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self._on_voice))
@@ -302,6 +306,7 @@ class TelegramGateway:
                     ("videoset", "Video defaults: resolution & quality"),
                     ("image", "Pick the image-generation model"),
                     ("imageset", "Image defaults: size & steps"),
+                    ("fusion", "Multi-model panel+judge: toggle & pick models"),
                 ]
             )
         except Exception:
@@ -572,6 +577,70 @@ class TelegramGateway:
         except Exception:
             pass  # "not modified" (re-tapping the current choice) is non-fatal
 
+    # --- fusion config (/fusion): toggle on/off, multi-select panel, pick judge ---
+
+    async def _fusion_model_ids(self) -> list[str]:
+        from assistant.agent.fusion import FUSION_MODEL_ID
+
+        models = await self._models.list_models()
+        return [
+            m.id for m in models if m.type in _CHATTABLE_KINDS and m.id != FUSION_MODEL_ID
+        ]
+
+    def _fusion_markup(self, model_ids: list[str]) -> "InlineKeyboardMarkup":
+        cfg = self._fusion.config
+        panel, judge, enabled = cfg["panel"], cfg["judge"], cfg["enabled"]
+        rows = [[InlineKeyboardButton(
+            f"🔀 Fusion: {'ON' if enabled else 'OFF'}", callback_data="fus:toggle")]]
+        # One row per model: left toggles panel membership, right sets it as the judge.
+        for i, mid in enumerate(model_ids):
+            rows.append([
+                InlineKeyboardButton(
+                    f"{'✅' if mid in panel else '⬜'} {mid}", callback_data=f"fus:panel:{i}"),
+                InlineKeyboardButton(
+                    f"{'⭐' if mid == judge else '☆'} judge", callback_data=f"fus:judge:{i}"),
+            ])
+        return InlineKeyboardMarkup(rows)
+
+    async def _on_fusion(self, update: "Update", context) -> None:
+        if not await self._ensure_allowed(update):
+            return
+        if self._fusion is None:
+            await update.message.reply_text("Fusion is unavailable on this backend.")
+            return
+        model_ids = await self._fusion_model_ids()
+        if not model_ids:
+            await update.message.reply_text("No chat models available to build a panel.")
+            return
+        await update.message.reply_text(
+            "Fusion = panel of models + a judge that synthesizes one accurate answer.\n"
+            "✅ adds to the panel · ⭐ is the judge. Then pick the “fusion” model with /models.",
+            reply_markup=self._fusion_markup(model_ids),
+        )
+
+    async def _apply_fusion_choice(self, query) -> None:
+        if self._fusion is None:
+            return
+        _, _, rest = (query.data or "").partition(":")  # strip "fus:"
+        kind, _, idx = rest.partition(":")
+        model_ids = await self._fusion_model_ids()
+        if kind == "toggle":
+            self._fusion.configure(enabled=not self._fusion.config["enabled"])
+        elif kind == "panel" and idx.isdigit() and int(idx) < len(model_ids):
+            mid = model_ids[int(idx)]
+            panel = list(self._fusion.config["panel"])
+            panel.remove(mid) if mid in panel else panel.append(mid)
+            self._fusion.configure(panel=panel)
+        elif kind == "judge" and idx.isdigit() and int(idx) < len(model_ids):
+            mid = model_ids[int(idx)]
+            # Tapping the current judge clears it ("" → None in configure); else set it. (None
+            # would mean "no change", so use "" to actually clear.)
+            self._fusion.configure(judge="" if mid == self._fusion.config["judge"] else mid)
+        try:
+            await query.edit_message_reply_markup(reply_markup=self._fusion_markup(model_ids))
+        except Exception:
+            pass  # "not modified" is non-fatal
+
     async def _on_message(self, update: "Update", context) -> None:
         if not await self._ensure_allowed(update):
             return
@@ -714,6 +783,9 @@ class TelegramGateway:
             return
         if data.startswith("isize:") or data.startswith("isteps:"):  # an /imageset tap
             await self._apply_imageset_choice(query)
+            return
+        if data.startswith("fus:"):  # a /fusion tap (toggle / panel / judge)
+            await self._apply_fusion_choice(query)
             return
         decision, _, token = data.partition(":")
         future = self._pending.get(token)

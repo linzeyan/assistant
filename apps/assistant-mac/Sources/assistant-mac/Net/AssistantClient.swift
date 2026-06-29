@@ -37,6 +37,12 @@ struct AssistantClient {
     func setDefaultModel(_ id: String) async throws {
         try await sendJSONNoDecode("PUT", "/models/default", body: ["model": id])
     }
+    func fusion() async throws -> FusionConfigDTO { try await get("/fusion") }
+    func setFusion(enabled: Bool, panel: [String], judge: String) async throws {
+        try await sendJSONNoDecode(
+            "PUT", "/fusion", body: ["enabled": enabled, "panel": panel, "judge": judge]
+        )
+    }
     func modelSettings(_ id: String) async throws -> ModelSettingsDTO {
         try await get("/models/\(id)/settings")
     }
