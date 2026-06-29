@@ -371,6 +371,39 @@ class TelegramGateway:
 
     # --- handlers ---
 
+    def _help_html(self, model: str, cwd: str) -> str:
+        """The /start status + usage guide. HTML-formatted (Telegram parse_mode=HTML), so any
+        interpolated value (model id, path) is escaped. Built from the live command set so the
+        guide and the actual handlers stay in step."""
+        m, d = _html.escape(model), _html.escape(cwd)
+        return (
+            "👋 <b>Assistant</b> — a local AI you chat with. It can also generate images &amp; "
+            "video, run code, and use tools.\n"
+            f"📍 Now: model <b>{m}</b> · dir <code>{d}</code>\n\n"
+            "<b>💬 Chat</b>\n"
+            "Just send a message. Send a 🎤 voice note to get a spoken reply.\n"
+            "/models — switch the chat model (⚠️ = weak at tool calls; pick a *-Coder for "
+            "coding/agent tasks)\n"
+            "/fusion — panel+judge: several models answer and one synthesizes a more accurate "
+            "reply. Turn it on, tick the panel + a ⭐ judge, then choose <b>fusion</b> in "
+            "/models.\n\n"
+            "<b>🖼 Images</b>\n"
+            "Just ask, e.g. “a watercolor fox”, “畫一隻貓”. The picture is sent back to you.\n"
+            "/image — choose which image model to use\n"
+            "/imageset — default size (512/768/1024) &amp; steps (a request like “768x768” "
+            "overrides)\n\n"
+            "<b>🎬 Video</b>\n"
+            "Just ask, e.g. “a drone shot over a forest” (takes a few minutes).\n"
+            "/video — choose the video checkpoint\n"
+            "/videoset — default resolution &amp; quality\n\n"
+            "<b>📂 Files &amp; coding</b>\n"
+            "/cd — show this chat’s working directory; <code>/cd ~/proj</code> to change it. The "
+            "agent reads, writes and runs commands there and sends back a diff of what changed; "
+            "risky actions ask first with Yes/No buttons.\n\n"
+            "💡 Images, video and file actions are triggered by <i>asking in plain language</i> — "
+            "the commands above only pick which model and settings get used."
+        )
+
     async def _on_start(self, update: "Update", context) -> None:
         uid = update.effective_user.id
         if not self.is_allowed(uid):
@@ -379,9 +412,13 @@ class TelegramGateway:
                 f"telegram_allowed_users to enable access."
             )
             return
+        chat_id = update.effective_chat.id
+        model = await self.pick_model(chat_id) or "(none loaded)"
+        cwd = self._effective_workspace(chat_id) or "(server default)"
         await update.message.reply_text(
-            "Ready. Send me a message. Use /models to switch the chat model, "
-            "/video to pick the video-generation model."
+            self._help_html(model, cwd),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
 
     async def _on_models(self, update: "Update", context) -> None:

@@ -370,6 +370,15 @@ async def test_apply_imageset_choice_sets_size_and_steps():
     assert images.steps is None
 
 
+def test_help_html_lists_commands_and_escapes():
+    out = _gateway()._help_html("mlx/Qwen-7B", "/home/<x>")
+    for cmd in ("/models", "/fusion", "/image", "/imageset", "/video", "/videoset", "/cd"):
+        assert cmd in out
+    assert "mlx/Qwen-7B" in out  # current model is shown
+    # Interpolated values are HTML-escaped (parse_mode=HTML), so a "<" in a path can't break it.
+    assert "&lt;x&gt;" in out and "/home/<x>" not in out
+
+
 async def test_fusion_toggle_panel_and_judge():
     fusion = _FakeFusion()
     gw = _gateway(models=[ModelInfo("a", type="llm"), ModelInfo("b", type="llm")], fusion=fusion)
