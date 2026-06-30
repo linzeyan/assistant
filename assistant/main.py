@@ -274,6 +274,7 @@ async def lifespan(app: FastAPI):
         registry,
         approver,
         ctx,
+        max_iters=settings.max_tool_iters,
         compaction=compaction,
         max_output_tokens=settings.max_output_tokens,
         approval_rules=approval_rules,

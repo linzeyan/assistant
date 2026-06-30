@@ -135,6 +135,12 @@ class Settings(BaseSettings):
     # silently truncated long answers (code, explanations) mid-output; this is the real
     # ceiling and is config-tunable. Generation still stops early on the model's EOS.
     max_output_tokens: int = 4096
+    # Max tool-calling iterations per turn before the loop gives up. Spring4 SB.3 measured a
+    # skill-driven turn (investigate: skill_view + reproduce + read + git log + git show + fix +
+    # regression test) needing well past the old default of 8 — a multi-step task hit the ceiling
+    # mid-investigation. 16 fits a full skill workflow with some retries while still bounding a
+    # runaway loop (worst case ~16 generations/turn). Tunable for tighter/looser budgets.
+    max_tool_iters: int = 16
     # Where over-budget tool output (S4) is spilled in full so the agent can read the rest.
     tool_output_dir: Path = XDG_DATA_DIR / "tool-output"
     # Directory the coding/shell tools operate in. Defaults to the process cwd.

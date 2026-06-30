@@ -428,3 +428,36 @@ async def test_view_image_skipped_for_freshly_generated_image(tmp_path):
     assert view_res["name"] == "view_image" and view_res["ok"]
     assert "already generated" in view_res["content"]
     assert vision.calls == 0  # the vision model was never loaded
+
+
+async def test_max_iters_honored_and_configurable(tmp_path):
+    # WHY: Spring4 SB.3 measured a skill-driven turn (skill_view + reproduce + read + git log +
+    # git show + fix + regression test) running well past the old default of 8 — the loop cut it
+    # off mid-investigation. The per-turn budget must be raisable AND honored exactly, and when it
+    # is reached the loop must stop LOUD (a ceiling error), never silently truncate the work.
+    async def noop(args, ctx):
+        return ToolResult(True, "ok")
+
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            name="noop",
+            description="does nothing",
+            parameters={"type": "object", "properties": {}},
+            handler=noop,
+        )
+    )
+    # Every LLM turn emits another tool call, so the loop only ever stops at the ceiling.
+    tool_turn = [{"type": "tool_calls", "tool_calls": [{"id": "c", "name": "noop", "arguments": {}}]}]
+    llm = FakeLLM([tool_turn] * 50)
+    loop = AgentLoop(
+        llm,
+        reg,
+        PolicyApprover(approval_required=False),
+        ToolContext(cwd=tmp_path),
+        max_iters=12,  # a raised budget, as the app now wires from settings.max_tool_iters
+    )
+    events = await _collect(loop.run(Session(id="s"), "go", "m"))
+    assert sum(e["type"] == "tool_call" for e in events) == 12  # ran the full raised budget
+    err = next(e for e in events if e["type"] == "error")
+    assert "12" in err["detail"]  # and surfaced the ceiling, not a silent stop
