@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import ToolContext, ToolResult
+from .base import ToolContext, ToolResult, service_available
 from .registry import registry
 
 
@@ -23,6 +23,7 @@ from .registry import registry
         },
         "required": ["path"],
     },
+    check_fn=service_available("audio"),
 )
 async def transcribe_audio(args: dict, ctx: ToolContext) -> ToolResult:
     if ctx.audio is None or not ctx.audio.available():
@@ -52,6 +53,7 @@ async def transcribe_audio(args: dict, ctx: ToolContext) -> ToolResult:
         },
         "required": ["text"],
     },
+    check_fn=service_available("audio"),
 )
 async def text_to_speech(args: dict, ctx: ToolContext) -> ToolResult:
     if ctx.audio is None or not ctx.audio.available():

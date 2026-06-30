@@ -6,7 +6,7 @@ Telegram gateway / GUI can special-case it to play the clip back.
 
 from __future__ import annotations
 
-from .base import ToolContext, ToolResult
+from .base import ToolContext, ToolResult, service_available
 from .registry import registry
 
 
@@ -55,6 +55,7 @@ from .registry import registry
         },
         "required": ["prompt"],
     },
+    check_fn=service_available("video"),
 )
 async def generate_video(args: dict, ctx: ToolContext) -> ToolResult:
     if ctx.video is None or not ctx.video.available():

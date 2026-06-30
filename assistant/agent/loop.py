@@ -121,7 +121,7 @@ class AgentLoop:
         session.add_user(user_text)
         await self._hooks.fire_before_start(session, user_text)  # P2 hook seam
         memory_block = await self._prefetch_memory(user_text)
-        tools = self._visible_tool_schemas()
+        tools = self._visible_tool_schemas(ctx)
         # Reference-only blocks injected into the latest user message at send time (never the
         # cacheable system prefix, S3). The date is stamped once per turn so a local model —
         # which has no clock — stops hallucinating "today" from its training cutoff.
@@ -461,17 +461,21 @@ class AgentLoop:
         no restart). None / 0 disables it."""
         self._turn_timeout_s = seconds or None
 
-    def _visible_tool_schemas(self):
-        """Tool schemas offered to the model, with blanket-denied tools (S5) filtered out — no
-        point tempting the model to call something a rule will always refuse. Resource-specific
-        denials stay visible and are enforced at call time by ``_rule_decision``."""
-        schemas = self._registry.schemas()
-        if self._rules:
-            schemas = [
-                s
-                for s in schemas
-                if not any(r.is_blanket_deny(s["function"]["name"]) for r in self._rules)
-            ]
+    def _visible_tool_schemas(self, ctx: ToolContext):
+        """Tool schemas offered to the model, with two schema-time filters:
+
+        - S5: blanket-denied tools are dropped — no point tempting the model to call something a
+          rule will always refuse (resource-specific denials stay visible, enforced at call time).
+        - G/S13: a tool with a ``check_fn`` is dropped when it reports unavailable for this turn's
+          context, so an unloaded/uninstalled vision/audio/video backend never reaches the model —
+          it can't be called and can't fail at runtime (death mode 3)."""
+        schemas = []
+        for tool in self._registry.all():
+            if tool.check_fn is not None and not tool.check_fn(ctx):
+                continue
+            if self._rules and any(r.is_blanket_deny(tool.name) for r in self._rules):
+                continue
+            schemas.append(tool.to_openai())
         return schemas or None
 
     def _rule_decision(self, tool, arguments: dict) -> str:

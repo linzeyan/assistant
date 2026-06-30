@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import ToolContext, ToolResult
+from .base import ToolContext, ToolResult, service_available
 from .registry import registry
 
 
@@ -27,6 +27,7 @@ from .registry import registry
         },
         "required": ["prompt"],
     },
+    check_fn=service_available("images"),
 )
 async def generate_image(args: dict, ctx: ToolContext) -> ToolResult:
     if ctx.images is None or not ctx.images.available():
@@ -75,6 +76,7 @@ async def generate_image(args: dict, ctx: ToolContext) -> ToolResult:
         },
         "required": ["prompt"],
     },
+    check_fn=service_available("images"),
 )
 async def edit_image(args: dict, ctx: ToolContext) -> ToolResult:
     if ctx.images is None or not ctx.images.available():

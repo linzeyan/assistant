@@ -22,11 +22,13 @@ def _loop(rules=None, ask_once: bool = True) -> AgentLoop:
 
 
 class _FakeRegistry:
+    # Mirrors ToolRegistry.all(): _visible_tool_schemas iterates Tools (for check_fn/blanket-deny),
+    # not pre-built schema dicts. These tools have no check_fn, so the schema gate is a no-op here.
     def __init__(self, names):
-        self._names = names
+        self._tools = [_tool(n) for n in names]
 
-    def schemas(self):
-        return [{"type": "function", "function": {"name": n}} for n in self._names]
+    def all(self):
+        return self._tools
 
 
 def _loop_with_tools(names, rules=None) -> AgentLoop:
@@ -34,7 +36,8 @@ def _loop_with_tools(names, rules=None) -> AgentLoop:
 
 
 def _visible_names(loop) -> list[str]:
-    return [s["function"]["name"] for s in (loop._visible_tool_schemas() or [])]
+    # ctx=None is fine: these tools have no check_fn, so the context is never consulted.
+    return [s["function"]["name"] for s in (loop._visible_tool_schemas(None) or [])]
 
 
 # --- Rule parsing / matching ---

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import ToolContext, ToolResult
+from .base import ToolContext, ToolResult, service_available
 from .registry import registry
 
 
@@ -22,6 +22,7 @@ from .registry import registry
         },
         "required": ["path"],
     },
+    check_fn=service_available("vision"),
 )
 async def view_image(args: dict, ctx: ToolContext) -> ToolResult:
     if ctx.vision is None or not ctx.vision.available():

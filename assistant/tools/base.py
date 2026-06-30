@@ -41,6 +41,22 @@ class ToolContext:
     output_spill_dir: Path | None = None
 
 
+def service_available(attr: str) -> "Callable[[ToolContext], bool]":
+    """Build a schema-gate predicate for a tool that needs the ``ctx.<attr>`` media service.
+
+    The tool is offered to the model only when that service exists and reports ``available()`` —
+    a capability check (the dep is importable), so an unloaded/uninstalled vision/audio/video
+    backend never appears in the schema, can't be called, and so can't fail at runtime (death
+    mode 3). It does NOT hide a tool whose model merely isn't loaded yet: ``available()`` is True
+    as long as the backend can load one on demand."""
+
+    def check(ctx: "ToolContext") -> bool:
+        svc = getattr(ctx, attr, None)
+        return svc is not None and svc.available()
+
+    return check
+
+
 @dataclass
 class Tool:
     name: str
@@ -49,6 +65,9 @@ class Tool:
     handler: Callable[[dict, ToolContext], Awaitable[ToolResult]]
     needs_approval: bool = False
     toolset: str = "core"
+    # Optional schema-time availability gate (G/S13): when set and it returns False for the turn's
+    # context, the tool is omitted from the schema sent to the model. None = always offered.
+    check_fn: "Callable[[ToolContext], bool] | None" = None
 
     def to_openai(self) -> dict:
         return {

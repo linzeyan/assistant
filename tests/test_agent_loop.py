@@ -641,3 +641,65 @@ async def test_b2_distinct_calls_never_thrash(tmp_path):
     events = await _collect(loop.run(Session(id="s"), "go", "m"))
     assert seen == ["p0", "p1", "p2", "p3", "p4"]
     assert not any(e["type"] == "error" for e in events)
+
+
+# --- G: modality schema-time gate (omit unavailable tools) -------------------------------
+
+from assistant.tools.base import service_available  # noqa: E402
+
+
+def test_g_service_available_predicate(tmp_path):
+    check = service_available("vision")
+    assert check(ToolContext(cwd=tmp_path)) is False  # no service on the context
+
+    class OK:
+        def available(self):
+            return True
+
+    class NotInstalled:
+        def available(self):
+            return False
+
+    assert check(ToolContext(cwd=tmp_path, vision=OK())) is True
+    assert check(ToolContext(cwd=tmp_path, vision=NotInstalled())) is False
+
+
+async def test_g_schema_gate_omits_unavailable_tool(tmp_path):
+    # A tool whose check_fn reports unavailable is NOT offered to the model — it can't be called and
+    # so can't fail at runtime (death mode 3). An ungated tool is always offered.
+    async def noop(args, ctx):
+        return ToolResult(True, "ok")
+
+    reg = _reg_with(
+        _tool("always", noop),
+        Tool(name="gated", description="", parameters={"type": "object", "properties": {}},
+             handler=noop, check_fn=lambda ctx: False),
+    )
+    loop = AgentLoop(FakeLLM([]), reg, PolicyApprover(approval_required=False),
+                     ToolContext(cwd=tmp_path))
+    names = {s["function"]["name"] for s in loop._visible_tool_schemas(ToolContext(cwd=tmp_path))}
+    assert "always" in names and "gated" not in names
+
+
+def test_g_modality_tools_gated_by_context(tmp_path):
+    # The real modality tools disappear from the schema when their backend isn't on the context,
+    # and reappear when an available service is present. web_search (ungated) is always there.
+    loop = AgentLoop(FakeLLM([]), build_registry(), PolicyApprover(approval_required=False),
+                     ToolContext(cwd=tmp_path))
+    bare = {s["function"]["name"] for s in loop._visible_tool_schemas(ToolContext(cwd=tmp_path))}
+    assert {"view_image", "generate_image", "generate_video", "transcribe_audio",
+            "text_to_speech"}.isdisjoint(bare)
+    assert "web_search" in bare
+
+    class OK:
+        def available(self):
+            return True
+
+    rich = {
+        s["function"]["name"]
+        for s in loop._visible_tool_schemas(
+            ToolContext(cwd=tmp_path, vision=OK(), images=OK(), video=OK(), audio=OK())
+        )
+    }
+    assert {"view_image", "generate_image", "edit_image", "generate_video",
+            "transcribe_audio", "text_to_speech"} <= rich
