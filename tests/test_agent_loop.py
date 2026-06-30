@@ -733,3 +733,50 @@ def test_g_modality_tools_gated_by_context(tmp_path):
     }
     assert {"view_image", "generate_image", "edit_image", "generate_video",
             "transcribe_audio", "text_to_speech"} <= rich
+
+
+# --- H3: approval audit log ----------------------------------------------------------------
+
+async def test_h3_approval_audit_logs_allow_and_deny(tmp_path, caplog):
+    # H3: every security-relevant (approval-gated) decision leaves one structured audit line with
+    # the tool, resource, and allow/deny outcome — independent of which path decided.
+    import logging
+
+    async def w(args, ctx):
+        return ToolResult(True, "wrote")
+
+    reg = _reg_with(_tool("danger", w, needs_approval=True))
+
+    async def _run(approval_required):
+        llm = FakeLLM([_call("c1", "danger", {"path": "x.py"}),
+                       [{"type": "text", "content": "done"}]])
+        loop = AgentLoop(llm, reg, PolicyApprover(approval_required=approval_required),
+                         ToolContext(cwd=tmp_path))
+        with caplog.at_level(logging.INFO, logger="assistant"):
+            await _collect(loop.run(Session(id="s"), "go", "m"))
+
+    caplog.clear()
+    await _run(approval_required=False)  # auto-approved
+    assert any("approval audit" in r.getMessage() and "decision=allow" in r.getMessage()
+               and "danger" in r.getMessage() and "x.py" in r.getMessage()
+               for r in caplog.records)
+
+    caplog.clear()
+    await _run(approval_required=True)  # non-interactive policy → denied
+    assert any("approval audit" in r.getMessage() and "decision=deny" in r.getMessage()
+               for r in caplog.records)
+
+
+async def test_h3_no_audit_for_read_only_tool(tmp_path, caplog):
+    # Read-only tools auto-allow and aren't security-interesting — they must not spam the audit log.
+    import logging
+
+    async def ok(args, ctx):
+        return ToolResult(True, "ok")
+
+    reg = _reg_with(_tool("noop", ok))  # needs_approval=False
+    llm = FakeLLM([_call("c1", "noop", {}), [{"type": "text", "content": "done"}]])
+    loop = AgentLoop(llm, reg, PolicyApprover(approval_required=False), ToolContext(cwd=tmp_path))
+    with caplog.at_level(logging.INFO, logger="assistant"):
+        await _collect(loop.run(Session(id="s"), "go", "m"))
+    assert not any("approval audit" in r.getMessage() for r in caplog.records)

@@ -302,6 +302,17 @@ class AgentLoop:
                             )
                         else:
                             run_it = True
+                    # Approval audit (H3): one structured line per security-relevant (approval-
+                    # gated) decision, so allow/deny outcomes on mutating tools are reviewable after
+                    # the fact regardless of which path (rule / ask-once / interactive / policy)
+                    # decided. Read-only auto-allows and cache replays aren't security-interesting.
+                    if tool is not None and tool.needs_approval:
+                        log.info(
+                            "approval audit: tool=%s resource=%r decision=%s",
+                            tool.name,
+                            resource_of(tc["arguments"]),
+                            "allow" if run_it else "deny",
+                        )
                     # Run the tool (whichever path allowed it) while forwarding any progress
                     # it reports as tool_progress events — long media tools stream a bar
                     # instead of going silent for minutes. Non-reporting tools just resolve.
