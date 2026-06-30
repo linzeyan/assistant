@@ -149,6 +149,10 @@ def test_looks_like_tool_attempt():
     assert looks_like_tool_attempt("blah <tool_call>{}")
     assert looks_like_tool_attempt("<function=foo></function>")
     assert not looks_like_tool_attempt("just a normal answer about 天氣")
+    # A complete answer ending in a stray, empty <tool_call> opener is NOT an attempt — flagging it
+    # mislabels an answered turn as parse_miss (real A1 capture: Qwen3-Coder dangling marker).
+    assert not looks_like_tool_attempt("The record holder is Usain Bolt, 9.58s.\n<tool_call>")
+    assert not looks_like_tool_attempt("done.\n<tool_call>   \n")  # only whitespace after
 
 
 # --- loop integration: records as a pure side channel ---

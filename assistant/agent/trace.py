@@ -44,9 +44,18 @@ def _now() -> float:
 
 
 def looks_like_tool_attempt(text: str) -> bool:
-    """True when ``text`` carries tool-call markup — the signal for a ``parse_miss`` (the
-    model tried to call a tool but it leaked back as text instead of being parsed)."""
-    return any(marker in text for marker in _ATTEMPT_MARKERS)
+    """True when ``text`` carries an UNPARSED tool-call attempt — the signal for a ``parse_miss``
+    (the model tried to call a tool but it leaked back as text instead of being parsed).
+
+    A marker counts only when something follows it: a bare trailing ``<tool_call>`` with nothing
+    after it — a model that finished a complete answer and emitted a stray opener — is NOT an
+    attempt, and flagging it would mislabel a perfectly answered turn as parse_miss (a real
+    false-positive the A1 harness surfaced on a Qwen3-Coder answer ending in a dangling
+    ``<tool_call>``)."""
+    return any(
+        (idx := text.find(marker)) != -1 and text[idx + len(marker):].strip()
+        for marker in _ATTEMPT_MARKERS
+    )
 
 
 def _summary_of(data: dict) -> dict:
