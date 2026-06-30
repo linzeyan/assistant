@@ -53,6 +53,7 @@ class AgentLoop:
         max_iters: int = 8,
         compaction: CompactionManager | None = None,
         max_output_tokens: int = 4096,
+        turn_timeout_s: float | None = None,
         approval_rules: list[Rule] | None = None,
         approval_ask_once: bool = True,
         hooks: HookRegistry | None = None,
@@ -65,6 +66,8 @@ class AgentLoop:
         self._max_iters = max_iters
         self._compaction = compaction
         self._max_output_tokens = max_output_tokens
+        # Per-turn wall-clock budget (B1); None = unlimited. See the deadline check in run().
+        self._turn_timeout_s = turn_timeout_s
         # Per-turn trace (spring2 P0): None = off. Recording is a side-channel — it never
         # changes the events yielded to the caller.
         self._trace = trace_store
@@ -136,9 +139,24 @@ class AgentLoop:
         # heavy vision model to redescribe a picture the user already received. We skip that
         # deterministically below rather than relying on the model not to do it.
         generated_images: set[str] = set()
+        # Turn-level wall-clock budget (B1): None = unlimited. Checked BETWEEN iterations —
+        # bounding a runaway tool-call loop, the realistic "stuck turn" — rather than mid-
+        # generation: MLX has no token-level interrupt (mlx_service awaits the worker thread in
+        # its finally), and a single generation is already bounded by max_output_tokens. So we
+        # stop before starting the next model call, not inside one. Loud error, never a silent stop.
+        _clock = asyncio.get_running_loop().time
+        deadline = _clock() + self._turn_timeout_s if self._turn_timeout_s else None
 
         try:
             for _ in range(self._max_iters):
+                if deadline is not None and _clock() > deadline:
+                    if trace is not None:
+                        self._trace.record(trace.finalize("timeout"))
+                    yield {
+                        "type": "error",
+                        "detail": f"turn exceeded its {self._turn_timeout_s:g}s time limit",
+                    }
+                    return
                 text_parts: list[str] = []
                 tool_calls: list[dict] | None = None
                 step = TraceStep() if trace is not None else None
@@ -378,6 +396,11 @@ class AgentLoop:
         """Live-update the per-turn tool-iteration budget (GUI Settings edit; the next turn's
         loop reads it, so no restart)."""
         self._max_iters = n
+
+    def set_turn_timeout(self, seconds: float | None) -> None:
+        """Live-update the per-turn wall-clock budget (GUI Settings edit; the next turn reads it,
+        no restart). None / 0 disables it."""
+        self._turn_timeout_s = seconds or None
 
     def _visible_tool_schemas(self):
         """Tool schemas offered to the model, with blanket-denied tools (S5) filtered out — no

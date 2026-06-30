@@ -17,6 +17,7 @@ struct SettingsScreen: View {
     @State private var modelBackend: String = "mlx"
     @State private var maxOutputTokens: String = ""
     @State private var maxToolIters: String = ""
+    @State private var turnTimeoutS: String = ""
     @State private var configPath: String = ""
     @State private var savedNote: String?
     @State private var bindNote: String?
@@ -196,6 +197,19 @@ struct SettingsScreen: View {
                 Text("How many tool calls the agent may chain in one turn before stopping. "
                     + "Multi-step tasks (debug → read → fix → test) need more than a few; raise it "
                     + "if complex turns get cut off. Applies to the next turn — no restart.")
+                    .font(.caption2).foregroundStyle(.secondary)
+
+                HStack(spacing: 10) {
+                    Text("Turn timeout (s)").foregroundStyle(.secondary)
+                        .frame(width: labelWidth, alignment: .leading)
+                    TextField("", text: $turnTimeoutS, prompt: Text("off"))
+                        .textFieldStyle(.roundedBorder).frame(width: 100)
+                    Button("Save") { Task { await saveTurnTimeout() } }
+                }
+                Text("Wall-clock budget for one turn, in seconds — a runaway turn is stopped "
+                    + "between tool steps. Empty or 0 = no limit (default; a legitimately slow "
+                    + "large-model turn is never killed). Note: a single in-flight generation isn't "
+                    + "interrupted — that's bounded by max output tokens. No restart.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
@@ -573,6 +587,12 @@ struct SettingsScreen: View {
             modelBackend = cfg.modelBackend
             maxOutputTokens = String(cfg.maxOutputTokens)
             maxToolIters = String(cfg.maxToolIters)
+            // nil/0 = off → blank field; whole seconds shown without a trailing ".0".
+            if let t = cfg.turnTimeoutS, t > 0 {
+                turnTimeoutS = t == t.rounded() ? String(Int(t)) : String(t)
+            } else {
+                turnTimeoutS = ""
+            }
             telegramAllowlist = cfg.telegramAllowedUsers.map(String.init).joined(separator: ", ")
             telegramConfigured = cfg.telegramConfigured
             telegramTokenMasked = cfg.telegramTokenMasked
@@ -654,6 +674,25 @@ struct SettingsScreen: View {
             // Applies live — the next turn's loop reads the new budget, no backend restart.
             try await controller.client.putConfig(maxToolIters: n)
             agentNote = "Saved — the agent may now take up to \(n) tool steps per turn."
+        } catch {
+            agentNote = "Save failed: \(error)"
+        }
+    }
+
+    private func saveTurnTimeout() async {
+        // Empty field = off (send 0, which the backend stores as "no limit").
+        let raw = turnTimeoutS.trimmingCharacters(in: .whitespaces)
+        let seconds = raw.isEmpty ? 0 : (Double(raw) ?? -1)
+        guard (0...86400).contains(seconds) else {
+            agentNote = "Turn timeout must be a number 0–86400 seconds (empty or 0 = off)."
+            return
+        }
+        do {
+            // Applies live — the next turn reads the new budget, no backend restart.
+            try await controller.client.putConfig(turnTimeoutS: seconds)
+            agentNote = seconds == 0
+                ? "Saved — turn timeout is off (turns may run unbounded)."
+                : "Saved — a turn now aborts after \(Int(seconds))s between tool steps."
         } catch {
             agentNote = "Save failed: \(error)"
         }

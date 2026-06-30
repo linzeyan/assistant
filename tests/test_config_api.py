@@ -97,6 +97,31 @@ def test_put_config_rejects_out_of_range_max_tool_iters(tmp_path, monkeypatch):
     assert too_low.status_code == 400 and too_high.status_code == 400
 
 
+def test_put_config_sets_turn_timeout_live(tmp_path, monkeypatch):
+    # B1: the per-turn wall-clock budget applies live (next turn reads it), persists to
+    # config.toml, and updates the running AgentLoop with no restart. 0 disables it (→ None).
+    client, cfg = _client(tmp_path, monkeypatch)
+    with client:
+        assert client.get("/config").json()["turn_timeout_s"] is None  # default: unlimited
+        resp = client.put("/config", json={"turn_timeout_s": 120})
+        live = client.app.state.agent._turn_timeout_s
+        live_settings = client.app.state.settings.turn_timeout_s
+        toml_after_set = tomllib.loads(cfg.read_text())["turn_timeout_s"]
+        client.put("/config", json={"turn_timeout_s": 0})  # disable
+        disabled = client.app.state.agent._turn_timeout_s
+    assert resp.status_code == 200 and resp.json()["restart_required"] is False
+    assert live == 120 and live_settings == 120 and toml_after_set == 120
+    assert disabled is None  # 0 disables the limit on the running loop
+
+
+def test_put_config_rejects_out_of_range_turn_timeout(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+    with client:
+        negative = client.put("/config", json={"turn_timeout_s": -1})
+        too_high = client.put("/config", json={"turn_timeout_s": 99999})
+    assert negative.status_code == 400 and too_high.status_code == 400
+
+
 def test_put_config_writes_extra_model_dirs_and_hf_cache(tmp_path, monkeypatch):
     client, cfg = _client(tmp_path, monkeypatch)
     extra = str(tmp_path / "more-models")

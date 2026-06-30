@@ -141,6 +141,11 @@ class Settings(BaseSettings):
     # mid-investigation. 16 fits a full skill workflow with some retries while still bounding a
     # runaway loop (worst case ~16 generations/turn). Tunable for tighter/looser budgets.
     max_tool_iters: int = 16
+    # Per-turn wall-clock budget in seconds (B1); None = unlimited (default, so a legitimately
+    # slow large-model turn is never killed). When set, the loop aborts a runaway turn BETWEEN
+    # iterations (a stuck tool-call loop) with a loud error. Note it can't preempt a single
+    # in-flight generation (MLX has no token-level interrupt; that's bounded by max_output_tokens).
+    turn_timeout_s: float | None = None
     # Where over-budget tool output (S4) is spilled in full so the agent can read the rest.
     tool_output_dir: Path = XDG_DATA_DIR / "tool-output"
     # Directory the coding/shell tools operate in. Defaults to the process cwd.

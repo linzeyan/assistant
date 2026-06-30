@@ -38,6 +38,7 @@ class ConfigPatch(BaseModel):
     model_backend: str | None = None
     max_output_tokens: int | None = None
     max_tool_iters: int | None = None
+    turn_timeout_s: float | None = None
     # Gateways (S9): a token/allowlist edit (re)starts the gateway live, no backend restart.
     # An empty token clears it (stops the gateway).
     telegram_token: str | None = None
@@ -57,6 +58,7 @@ async def get_config(request: Request):
         "model_backend": s.model_backend,
         "max_output_tokens": s.max_output_tokens,
         "max_tool_iters": s.max_tool_iters,
+        "turn_timeout_s": s.turn_timeout_s,
         "config_path": str(_CONFIG_PATH),
         **gateway_lifecycle.status(request.app),  # telegram_* (token masked)
     }
@@ -100,6 +102,11 @@ async def put_config(patch: ConfigPatch, request: Request):
         )
     if "max_tool_iters" in updates and not (1 <= updates["max_tool_iters"] <= 100):
         raise HTTPException(status_code=400, detail="max_tool_iters must be 1–100")
+    # 0 disables the turn timeout (None can't survive the exclude-None patch dump above).
+    if "turn_timeout_s" in updates and not (0 <= updates["turn_timeout_s"] <= 86400):
+        raise HTTPException(
+            status_code=400, detail="turn_timeout_s must be 0–86400 (0 disables)"
+        )
     if "telegram_token" in updates:
         token = updates["telegram_token"].strip()
         if token and any(c.isspace() for c in token):
@@ -162,6 +169,12 @@ def _apply_live(request: Request, updates: dict) -> bool:
         agent = getattr(request.app.state, "agent", None)
         if agent is not None:
             agent.set_max_iters(updates["max_tool_iters"])
+    if "turn_timeout_s" in updates:
+        # Applies live; 0 disables (stored as None). The next turn reads the new budget.
+        settings.turn_timeout_s = updates["turn_timeout_s"] or None
+        agent = getattr(request.app.state, "agent", None)
+        if agent is not None:
+            agent.set_turn_timeout(updates["turn_timeout_s"])
     # Gateway settings: stage onto live settings so the subsequent reload reads the new values
     # (the reload itself is async, so it runs in put_config, not here).
     if "telegram_token" in updates:

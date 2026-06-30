@@ -506,6 +506,32 @@ async def test_on_whoami_renders_username_when_present():
     assert "@samhandle" in text
 
 
+async def test_on_stop_cancels_the_running_turn():
+    # B1: /stop cancels this chat's in-flight turn task (Telegram has no SSE-disconnect channel
+    # like the desktop Stop button, so we track and cancel the task directly).
+    gw = _gateway(allowed=[7])
+    task = Mock()
+    task.done.return_value = False
+    gw._active_turns[42] = task
+    update = Mock()
+    update.effective_user.id = 7
+    update.effective_chat.id = 42
+    update.message.reply_text = AsyncMock()
+    await gw._on_stop(update, Mock())
+    task.cancel.assert_called_once()
+    assert "Stopping" in update.message.reply_text.await_args.args[0]
+
+
+async def test_on_stop_when_nothing_running():
+    gw = _gateway(allowed=[7])
+    update = Mock()
+    update.effective_user.id = 7
+    update.effective_chat.id = 42  # no entry in _active_turns
+    update.message.reply_text = AsyncMock()
+    await gw._on_stop(update, Mock())
+    assert "Nothing" in update.message.reply_text.await_args.args[0]
+
+
 async def test_on_cd_sets_per_chat_workspace(tmp_path):
     gw = _gateway()
     update = Mock()

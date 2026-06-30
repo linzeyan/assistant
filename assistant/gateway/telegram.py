@@ -12,6 +12,7 @@ everyone, and /start tells a user their id so it can be added.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html as _html
 import logging
 import re
@@ -281,6 +282,9 @@ class TelegramGateway:
         # Per-chat turn lock: with concurrent_updates(True) two quick messages would otherwise
         # run turns on the same session at once and race its history. See _run_turn.
         self._turn_locks: dict[int, asyncio.Lock] = {}
+        # Per-chat in-flight turn task, so /stop can cancel a running turn (B1). The GUI stops
+        # via SSE disconnect; Telegram has no such channel, so we track the task and cancel it.
+        self._active_turns: dict[int, asyncio.Task] = {}
 
     # --- lifecycle ---
 
@@ -296,6 +300,7 @@ class TelegramGateway:
         app = Application.builder().token(self._token).concurrent_updates(True).build()
         app.add_handler(CommandHandler("start", self._on_start))
         app.add_handler(CommandHandler("whoami", self._on_whoami))
+        app.add_handler(CommandHandler("stop", self._on_stop))
         app.add_handler(CommandHandler("models", self._on_models))
         app.add_handler(CommandHandler("cd", self._on_cd))
         app.add_handler(CommandHandler("video", self._on_video))
@@ -317,6 +322,7 @@ class TelegramGateway:
                 [
                     ("start", "Show status and usage"),
                     ("whoami", "Show your Telegram name and id (anyone)"),
+                    ("stop", "Stop the turn that's currently running"),
                     ("models", "Pick the chat model"),
                     ("cd", "Set the working directory for this chat"),
                     ("video", "Pick the video-generation model"),
@@ -439,6 +445,18 @@ class TelegramGateway:
             f"Your ID is <code>{user.id}</code>",  # <code> = tap-to-copy in Telegram
             parse_mode="HTML",
         )
+
+    async def _on_stop(self, update: "Update", context) -> None:
+        # Cancel this chat's in-flight turn (B1). Mirrors the desktop Stop button — useful for a
+        # runaway or just-too-slow turn on a large local model. The partial reply is kept.
+        if not await self._ensure_allowed(update):
+            return
+        task = self._active_turns.get(update.effective_chat.id)
+        if task is None or task.done():
+            await update.message.reply_text("Nothing is running to stop.")
+            return
+        task.cancel()
+        await update.message.reply_text("⏹ Stopping the current turn…")
 
     async def _on_models(self, update: "Update", context) -> None:
         if not await self._ensure_allowed(update):
@@ -826,6 +844,8 @@ class TelegramGateway:
             answer_parts: list[str] = []
             tool_args: dict[str, dict] = {}  # tool_call id -> args, to caption media results
             plan_state: dict = {}  # holds the in-place plan message id for this turn (SA.3)
+            # Expose this turn's task so /stop can cancel it (B1). Cleared in the finally below.
+            self._active_turns[chat_id] = asyncio.current_task()
             try:
                 cwd = self._effective_workspace(chat_id)
                 async for ev in self._agent.run(
@@ -837,10 +857,19 @@ class TelegramGateway:
                         ev, editor, context.bot, chat_id, tool_args, plan_state
                     )
                 await editor.flush(final=True)
+            except asyncio.CancelledError:
+                # Deliberate /stop: leave the partial reply as-is (shows progress) and end
+                # quietly — the /stop handler already acknowledged. Swallow rather than re-raise
+                # because this cancellation is our own signal, not shutdown.
+                with contextlib.suppress(Exception):
+                    await editor.note("⏹ stopped")
+                return
             except Exception as exc:
                 log.exception("Telegram turn failed")
                 await editor.set_error(str(exc))
                 return
+            finally:
+                self._active_turns.pop(chat_id, None)
             if voice_reply:
                 await self._send_voice_reply(
                     context.bot, chat_id, "".join(answer_parts).strip()

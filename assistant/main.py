@@ -279,6 +279,7 @@ async def lifespan(app: FastAPI):
         max_iters=settings.max_tool_iters,
         compaction=compaction,
         max_output_tokens=settings.max_output_tokens,
+        turn_timeout_s=settings.turn_timeout_s,
         approval_rules=approval_rules,
         approval_ask_once=settings.approval_ask_once,
         hooks=hooks,

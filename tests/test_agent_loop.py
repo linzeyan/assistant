@@ -489,3 +489,47 @@ async def test_update_plan_emits_plan_event_with_normalized_steps(tmp_path):
     tool_msgs = [m for m in session.messages if m.get("role") == "tool"]
     assert tool_msgs and "plan updated" in tool_msgs[-1]["content"]
     assert "read the file" not in tool_msgs[-1]["content"]
+
+
+async def test_turn_timeout_aborts_between_iterations(tmp_path):
+    # WHY (B1): a runaway tool-call loop must self-abort on the wall-clock budget — between
+    # iterations, with a loud error — rather than running to the iteration ceiling or unbounded.
+    reg = ToolRegistry()
+
+    async def noop(args, ctx):
+        return ToolResult(True, "ok")
+
+    reg.register(Tool(
+        name="noop", description="", parameters={"type": "object", "properties": {}}, handler=noop
+    ))
+
+    class SlowToolLLM:
+        # Each turn takes real time, then asks for another tool call, so the loop keeps iterating.
+        def stream_chat(self, messages, model, tools=None, **params):
+            async def gen():
+                await asyncio.sleep(0.05)
+                yield {"type": "tool_calls",
+                       "tool_calls": [{"id": "c", "name": "noop", "arguments": {}}]}
+            return gen()
+
+    loop = AgentLoop(
+        SlowToolLLM(), reg, PolicyApprover(approval_required=False), ToolContext(cwd=tmp_path),
+        max_iters=50, turn_timeout_s=0.01,
+    )
+    events = await _collect(loop.run(Session(id="t"), "go", "m"))
+    err = next(e for e in events if e["type"] == "error")
+    assert "time limit" in err["detail"]  # timed out, not the iteration ceiling
+    assert "max tool iterations" not in err["detail"]
+    assert sum(e["type"] == "tool_call" for e in events) < 50  # aborted well before the ceiling
+
+
+async def test_no_turn_timeout_runs_to_completion(tmp_path):
+    # Default (None) must not impose any limit — a normal turn answers as before.
+    llm = FakeLLM([[{"type": "text", "content": "done"}]])
+    loop = AgentLoop(
+        llm, build_registry(), PolicyApprover(approval_required=False), ToolContext(cwd=tmp_path),
+        turn_timeout_s=None,
+    )
+    events = await _collect(loop.run(Session(id="t2"), "hi", "m"))
+    assert any(e["type"] == "done" for e in events)
+    assert not any(e["type"] == "error" for e in events)
