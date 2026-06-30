@@ -27,7 +27,7 @@ class _OkService:
 class _BoomAgent:
     """Mirrors the real loop: the user message is recorded before the turn blows up."""
 
-    async def run(self, session, message, model, approver=None):
+    async def run(self, session, message, model, approver=None, max_iters=None):
         session.add_user(message)
         raise RuntimeError("template render boom")
         yield  # pragma: no cover - unreachable, makes this an async generator

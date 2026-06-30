@@ -21,6 +21,9 @@ class ChatRequest(BaseModel):
     # When set, approval-required tools pause and stream an ``approval_request``
     # event; the client decides via POST /chat/approve. The desktop GUI sets this.
     interactive_approval: bool = False
+    # Optional per-request tool-iteration ceiling (H7); overrides the global default for this turn
+    # only. Clamped server-side (see below). None / non-positive → the configured default.
+    max_iters: int | None = None
 
 
 class ApproveRequest(BaseModel):
@@ -63,8 +66,11 @@ async def chat(req: ChatRequest, request: Request):
         try:
             # The loop yields fully-formed events (assistant_delta / tool_call /
             # approval_request / tool_result / done / error); forward them verbatim.
+            # Clamp the per-request override to a sane band so a caller can't request a runaway
+            # loop (or a zero that would disable the backstop); None passes through as "default".
+            req_max_iters = min(req.max_iters, 100) if req.max_iters else None
             async for event in agent.run(
-                session, req.message, req.model, approver=approver
+                session, req.message, req.model, approver=approver, max_iters=req_max_iters
             ):
                 yield _sse(event)
             completed = True

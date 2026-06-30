@@ -93,10 +93,15 @@ class AgentLoop:
         model: str,
         approver: ApprovalPolicy | None = None,
         cwd: str | Path | None = None,
+        max_iters: int | None = None,
     ) -> AsyncIterator[dict]:
         # Per-run approver lets the Telegram gateway inject an interactive (inline
         # button) approver while the desktop path uses the default policy approver.
         effective_approver = approver or self._approver
+        # Per-request tool-iteration budget (H7): a single hard task can raise the ceiling for one
+        # turn without changing the global default. Falls back to the configured default; a non-
+        # positive value is ignored so callers can't disable the backstop entirely.
+        iters = max_iters if (max_iters and max_iters > 0) else self._max_iters
         # Per-run working directory: workspace is per-conversation, so the Telegram gateway
         # passes the chat's chosen dir here. A copy (not a mutation of the shared ctx) keeps
         # concurrent turns isolated and leaves the desktop/HTTP default untouched.
@@ -165,7 +170,7 @@ class AgentLoop:
         deadline = _clock() + self._turn_timeout_s if self._turn_timeout_s else None
 
         try:
-            for _ in range(self._max_iters):
+            for _ in range(iters):
                 if deadline is not None and _clock() > deadline:
                     if trace is not None:
                         self._trace.record(trace.finalize("timeout"))
@@ -378,7 +383,7 @@ class AgentLoop:
 
             if trace is not None:
                 self._trace.record(trace.finalize("max_iters"))
-            yield {"type": "error", "detail": f"reached max tool iterations ({self._max_iters})"}
+            yield {"type": "error", "detail": f"reached max tool iterations ({iters})"}
         except Exception as exc:
             # A turn can die mid-loop — most often a chat-template render failure when the
             # tool_calls history is fed back to the model. CancelledError / GeneratorExit are

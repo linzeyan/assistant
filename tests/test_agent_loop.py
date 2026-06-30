@@ -468,6 +468,36 @@ async def test_max_iters_honored_and_configurable(tmp_path):
     assert "12" in err["detail"]  # and surfaced the ceiling, not a silent stop
 
 
+async def test_per_request_max_iters_overrides_default(tmp_path):
+    # H7: a single turn can override the loop's configured ceiling without changing the global
+    # default. A non-positive / None override falls back to the default (can't disable the backstop).
+    async def noop(args, ctx):
+        return ToolResult(True, "ok")
+
+    reg = _reg_with(_tool("noop", noop))
+
+    def _llm():  # fresh scripted LLM each run (FakeLLM is single-use, one entry per turn)
+        return FakeLLM([
+            [{"type": "tool_calls",
+              "tool_calls": [{"id": f"c{i}", "name": "noop", "arguments": {"i": i}}]}]
+            for i in range(50)
+        ])
+
+    def _loop_with(llm):
+        return AgentLoop(llm, reg, PolicyApprover(approval_required=False),
+                         ToolContext(cwd=tmp_path), max_iters=12)
+
+    # Override below the default → the turn stops at 3.
+    events = await _collect(_loop_with(_llm()).run(Session(id="s"), "go", "m", max_iters=3))
+    assert sum(e["type"] == "tool_call" for e in events) == 3
+    assert "3" in next(e for e in events if e["type"] == "error")["detail"]
+
+    # None and 0 both fall back to the configured default (12).
+    for override in (None, 0):
+        evs = await _collect(_loop_with(_llm()).run(Session(id="s"), "go", "m", max_iters=override))
+        assert sum(e["type"] == "tool_call" for e in evs) == 12
+
+
 async def test_update_plan_emits_plan_event_with_normalized_steps(tmp_path):
     # WHY (SA.3): the agent's checklist must reach the UI as a structured `plan` event — but the
     # full list must NOT be persisted into history (only the tool's short ack), so a stale
