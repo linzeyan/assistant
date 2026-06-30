@@ -31,6 +31,12 @@ from .trace import TraceStep, TraceStore, TurnTrace
 
 log = logging.getLogger("assistant")
 
+# Thrash guard (B2): abort a turn after this many consecutive *identical* tool calls that made no
+# progress. A1 telemetry shows healthy turns chain several DIFFERENT calls (7+ on a hard web task),
+# so the signal isn't call count — it's the same (name, args) repeating. Three ignored repeats is a
+# stuck loop, not work. A backstop constant, not a user knob: max_iters is the tunable budget.
+_THRASH_REPEAT_CAP = 3
+
 
 class AgentLoop:
     """The think -> tool -> observe cycle.
@@ -139,6 +145,17 @@ class AgentLoop:
         # heavy vision model to redescribe a picture the user already received. We skip that
         # deterministically below rather than relying on the model not to do it.
         generated_images: set[str] = set()
+        # Thrash guard (B2). A repeated *idempotent* call (read-only = no approval) makes no
+        # progress, so we replay its earlier result instead of re-running it, and count consecutive
+        # no-progress calls — too many in a row aborts the turn (the model stuck in a loop, ignoring
+        # the replayed result) rather than burning every iteration. A *mutating* call (needs
+        # approval) is never silently deduped (its side effect may be intended), and any mutation
+        # invalidates the replay cache + the seen set, since a re-read after a write must run for
+        # real (the file changed). idempotent_cache holds successful read results for replay; the
+        # seen set drives the no-progress counter for both tool kinds.
+        seen_calls: set[tuple[str, str]] = set()
+        idempotent_cache: dict[tuple[str, str], str] = {}
+        no_progress = 0
         # Turn-level wall-clock budget (B1): None = unlimited. Checked BETWEEN iterations —
         # bounding a runaway tool-call loop, the realistic "stuck turn" — rather than mid-
         # generation: MLX has no token-level interrupt (mlx_service awaits the worker thread in
@@ -218,6 +235,12 @@ class AgentLoop:
                     tool = self._registry.get(tc["name"])
                     result: ToolResult | None = None
                     run_it = False  # set by whichever branch authorizes execution
+                    # B2: identity of this call for thrash detection — name + canonicalised args.
+                    _key = (
+                        tc["name"],
+                        json.dumps(tc["arguments"], sort_keys=True, ensure_ascii=False, default=str),
+                    )
+                    no_progress = no_progress + 1 if _key in seen_calls else 0
                     # Short-circuit a view_image on an image we just generated this turn (the
                     # user already has it; viewing it only spins up a vision model).
                     _vp = tc["arguments"].get("path") if tc["name"] == "view_image" else None
@@ -229,6 +252,17 @@ class AgentLoop:
                         )
                     elif tool is None:
                         result = ToolResult(False, f"unknown tool: {tc['name']}")
+                    elif tool is not None and not tool.needs_approval and _key in idempotent_cache:
+                        # B2: an identical read-only call already succeeded this turn (and nothing
+                        # has mutated state since — a mutation clears this cache). Replay the earlier
+                        # result instead of re-running, and tell the model it's repeating so it
+                        # changes course or finishes.
+                        result = ToolResult(
+                            True,
+                            idempotent_cache[_key]
+                            + "\n\n(repeated call — returning the earlier result; do something "
+                            "different or finish.)",
+                        )
                     else:
                         # S5: rules + ask-once decide allow/deny before any prompt; only an
                         # unresolved "ask" falls through to the interactive/policy approver.
@@ -280,6 +314,18 @@ class AgentLoop:
                                 }
                             else:
                                 result = sub["result"]
+                    # B2 bookkeeping: remember this call so an identical repeat is detected. A
+                    # successful read is cached for replay; a successful mutation instead invalidates
+                    # the caches (a later re-read must run for real — the state changed) and clears
+                    # the no-progress count, since the mutation WAS progress.
+                    seen_calls.add(_key)
+                    if tool is not None and result is not None and result.ok:
+                        if tool.needs_approval:
+                            idempotent_cache.clear()
+                            seen_calls = {_key}
+                            no_progress = 0
+                        else:
+                            idempotent_cache.setdefault(_key, result.content)
                     # Remember images we produced so a follow-up view_image on them is skipped.
                     if (
                         tc["name"] in ("generate_image", "edit_image")
@@ -316,6 +362,19 @@ class AgentLoop:
                             pass  # malformed args already surfaced as the tool's error result
                 if trace is not None:
                     trace.steps.append(step)
+
+                # B2: the model has repeated an identical call this many times in a row despite
+                # being told it's repeating — it's stuck. Stop loudly instead of burning the rest of
+                # the iteration budget on the same call.
+                if no_progress >= _THRASH_REPEAT_CAP:
+                    if trace is not None:
+                        self._trace.record(trace.finalize("thrash"))
+                    yield {
+                        "type": "error",
+                        "detail": f"stopped: the model repeated an identical tool call "
+                        f"{no_progress} times in a row without making progress",
+                    }
+                    return
 
             if trace is not None:
                 self._trace.record(trace.finalize("max_iters"))

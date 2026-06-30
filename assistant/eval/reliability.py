@@ -33,9 +33,10 @@ TOOL_ERROR = "tool_error"  # death mode 3
 CRASH = "crash"  # turn died mid-loop (e.g. chat-template render TypeError) — a mode-3 upstream variant
 MAX_ITERS = "max_iters"  # loop control: ran out of tool steps
 TIMEOUT = "timeout"  # loop control: exceeded the per-turn wall-clock budget (B1)
+THRASH = "thrash"  # loop control: repeated an identical tool call with no progress (B2)
 
 # Order is the report's display order: success first, then the four death modes, then loop control.
-BUCKETS = (SUCCESS, NO_CALL, PARSE_MISS, TOOL_ERROR, CRASH, MAX_ITERS, TIMEOUT)
+BUCKETS = (SUCCESS, NO_CALL, PARSE_MISS, TOOL_ERROR, CRASH, MAX_ITERS, TIMEOUT, THRASH)
 
 LABELS = {
     SUCCESS: "success (answered, tool ran)",
@@ -45,6 +46,7 @@ LABELS = {
     CRASH: "mode 3* · turn crashed mid-loop",
     MAX_ITERS: "loop · hit the tool-step ceiling",
     TIMEOUT: "loop · hit the turn time limit",
+    THRASH: "loop · stuck repeating a tool call",
 }
 
 
@@ -64,7 +66,7 @@ def classify_turn(trace: dict, *, expects_tool: bool = True) -> str:
     no-call-vs-success split, which mode 4 (ignored result) hides behind — see the module docstring.
     """
     outcome = trace.get("outcome")
-    if outcome in (PARSE_MISS, TOOL_ERROR, MAX_ITERS, TIMEOUT):
+    if outcome in (PARSE_MISS, TOOL_ERROR, MAX_ITERS, TIMEOUT, THRASH):
         return outcome
     if outcome == "error":
         return CRASH

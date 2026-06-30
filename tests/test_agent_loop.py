@@ -447,9 +447,14 @@ async def test_max_iters_honored_and_configurable(tmp_path):
             handler=noop,
         )
     )
-    # Every LLM turn emits another tool call, so the loop only ever stops at the ceiling.
-    tool_turn = [{"type": "tool_calls", "tool_calls": [{"id": "c", "name": "noop", "arguments": {}}]}]
-    llm = FakeLLM([tool_turn] * 50)
+    # Every LLM turn emits another tool call, so the loop only ever stops at the ceiling. The args
+    # differ each turn (distinct {"i": n}) so the B2 thrash guard — which aborts on *identical*
+    # repeats — doesn't pre-empt the max_iters ceiling this test is exercising.
+    llm = FakeLLM([
+        [{"type": "tool_calls",
+          "tool_calls": [{"id": f"c{i}", "name": "noop", "arguments": {"i": i}}]}]
+        for i in range(50)
+    ])
     loop = AgentLoop(
         llm,
         reg,
@@ -532,4 +537,107 @@ async def test_no_turn_timeout_runs_to_completion(tmp_path):
     )
     events = await _collect(loop.run(Session(id="t2"), "hi", "m"))
     assert any(e["type"] == "done" for e in events)
+    assert not any(e["type"] == "error" for e in events)
+
+
+# --- B2: thrash / no-progress guardrails -------------------------------------------------
+
+from assistant.agent.loop import _THRASH_REPEAT_CAP  # noqa: E402
+
+
+def _reg_with(*tools: Tool) -> ToolRegistry:
+    reg = ToolRegistry()
+    for t in tools:
+        reg.register(t)
+    return reg
+
+
+def _tool(name, handler, *, needs_approval=False):
+    return Tool(name=name, description="", parameters={"type": "object", "properties": {}},
+                handler=handler, needs_approval=needs_approval)
+
+
+def _call(cid, name, args):
+    return [{"type": "tool_calls", "tool_calls": [{"id": cid, "name": name, "arguments": args}]}]
+
+
+async def test_b2_idempotent_repeat_is_replayed_not_rerun(tmp_path):
+    # An identical read-only call makes no progress: the handler runs once and the repeat replays
+    # the cached result (annotated), instead of spending another tool round-trip on the same read.
+    ran = []
+
+    async def reader(args, ctx):
+        ran.append(args["path"])
+        return ToolResult(True, "FILE CONTENTS")
+
+    llm = FakeLLM([
+        _call("c1", "reader", {"path": "a"}),
+        _call("c2", "reader", {"path": "a"}),  # identical → replayed
+        [{"type": "text", "content": "done"}],
+    ])
+    loop = AgentLoop(llm, _reg_with(_tool("reader", reader)),
+                     PolicyApprover(approval_required=False), ToolContext(cwd=tmp_path))
+    events = await _collect(loop.run(Session(id="s"), "go", "m"))
+    assert ran == ["a"]  # handler invoked exactly once
+    results = [e for e in events if e["type"] == "tool_result" and e["name"] == "reader"]
+    assert len(results) == 2  # both calls still surfaced a result
+    assert "repeated call" in results[1]["content"] and "FILE CONTENTS" in results[1]["content"]
+    assert not any(e["type"] == "error" for e in events)
+
+
+async def test_b2_aborts_on_repeated_call_thrash(tmp_path):
+    # The model keeps emitting the same call despite the "you're repeating" nudge → stuck. Abort
+    # loudly at the cap instead of burning the whole iteration budget.
+    async def reader(args, ctx):
+        return ToolResult(True, "x")
+
+    turns = [_call(f"c{i}", "reader", {"path": "a"}) for i in range(6)]
+    loop = AgentLoop(FakeLLM(turns), _reg_with(_tool("reader", reader)),
+                     PolicyApprover(approval_required=False), ToolContext(cwd=tmp_path),
+                     max_iters=10)
+    events = await _collect(loop.run(Session(id="s"), "go", "m"))
+    err = next(e for e in events if e["type"] == "error")
+    assert "repeated" in err["detail"] and "max tool iterations" not in err["detail"]
+    # Stopped at the cap, not after all six iterations.
+    assert len([e for e in events if e["type"] == "tool_result"]) <= _THRASH_REPEAT_CAP + 1
+
+
+async def test_b2_mutation_invalidates_replay_cache(tmp_path):
+    # A re-read after a mutation must RUN (state changed), not replay the pre-mutation result.
+    reads = []
+
+    async def reader(args, ctx):
+        reads.append(1)
+        return ToolResult(True, f"v{len(reads)}")
+
+    async def writer(args, ctx):
+        return ToolResult(True, "written")
+
+    reg = _reg_with(_tool("reader", reader), _tool("writer", writer, needs_approval=True))
+    llm = FakeLLM([
+        _call("r1", "reader", {"path": "a"}),
+        _call("w1", "writer", {"path": "a"}),  # mutation → invalidates the read cache
+        _call("r2", "reader", {"path": "a"}),  # must re-run, not replay
+        [{"type": "text", "content": "done"}],
+    ])
+    loop = AgentLoop(llm, reg, PolicyApprover(approval_required=False), ToolContext(cwd=tmp_path))
+    await _collect(loop.run(Session(id="s"), "go", "m"))
+    assert len(reads) == 2  # the second read ran for real
+
+
+async def test_b2_distinct_calls_never_thrash(tmp_path):
+    # Healthy turns chain several DIFFERENT calls — these must all run, none deduped, no abort.
+    seen = []
+
+    async def reader(args, ctx):
+        seen.append(args["path"])
+        return ToolResult(True, "ok")
+
+    turns = [_call(f"c{i}", "reader", {"path": f"p{i}"}) for i in range(5)]
+    turns.append([{"type": "text", "content": "done"}])
+    loop = AgentLoop(FakeLLM(turns), _reg_with(_tool("reader", reader)),
+                     PolicyApprover(approval_required=False), ToolContext(cwd=tmp_path),
+                     max_iters=10)
+    events = await _collect(loop.run(Session(id="s"), "go", "m"))
+    assert seen == ["p0", "p1", "p2", "p3", "p4"]
     assert not any(e["type"] == "error" for e in events)
