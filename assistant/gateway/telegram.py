@@ -305,6 +305,9 @@ class TelegramGateway:
         app.add_handler(CallbackQueryHandler(self._on_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message))
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self._on_voice))
+        # Inbound images: a photo (or image document), with or without a caption. A photo's
+        # caption is NOT filters.TEXT, so this never collides with the text handler above.
+        app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, self._on_photo))
         await app.initialize()
         # Register slash commands so they appear in Telegram's "/" command menu — without
         # this the user can't discover /models. Non-fatal if the API call fails.
@@ -706,7 +709,30 @@ class TelegramGateway:
     async def _on_message(self, update: "Update", context) -> None:
         if not await self._ensure_allowed(update):
             return
-        await self._run_turn(update, context, update.message.text, voice_reply=False)
+        text = update.message.text
+        # If this text is a REPLY to a message that carries an image (a photo the user uploaded,
+        # or one the bot generated), resolve that image so "make this a sketch" / "edit this" works
+        # — a Telegram reply doesn't carry the referenced media into the model's context, so
+        # without this the model sees only the text and asks for a path it can't know.
+        reply = getattr(update.message, "reply_to_message", None)
+        path = await self._download_image(context, reply) if reply is not None else None
+        if path is not None:
+            text = self._with_image_context(text, path)
+        await self._run_turn(update, context, text, voice_reply=False)
+
+    async def _on_photo(self, update: "Update", context) -> None:
+        if not await self._ensure_allowed(update):
+            return
+        path = await self._download_image(context, update.message)
+        if path is None:
+            await update.message.reply_text("Sorry — I couldn't fetch that image.")
+            return
+        # The caption is the instruction ("make this a sketch"); empty caption -> let the model
+        # offer or describe. Either way the image path rides the turn so the model can act on it.
+        caption = (update.message.caption or "").strip() or "I've sent you an image."
+        await self._run_turn(
+            update, context, self._with_image_context(caption, path), voice_reply=False
+        )
 
     async def _on_voice(self, update: "Update", context) -> None:
         if not await self._ensure_allowed(update):
@@ -800,6 +826,53 @@ class TelegramGateway:
                 await self._send_voice_reply(
                     context.bot, chat_id, "".join(answer_parts).strip()
                 )
+
+    @staticmethod
+    def _image_file_ref(msg) -> tuple[str, str, str] | None:
+        """(file_id, unique_id, ext) for an image carried by ``msg``, else None. Telegram sends a
+        photo as several renditions; the last is the largest. An uncompressed image sent as a
+        document (image/* mime) is handled too."""
+        if msg is None:
+            return None
+        photo = getattr(msg, "photo", None)
+        if photo:
+            p = photo[-1]
+            return (p.file_id, p.file_unique_id, "jpg")
+        doc = getattr(msg, "document", None)
+        if doc is not None and (getattr(doc, "mime_type", "") or "").startswith("image/"):
+            name = getattr(doc, "file_name", "") or ""
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else "png"
+            return (doc.file_id, doc.file_unique_id, ext)
+        return None
+
+    async def _download_image(self, context, msg) -> str | None:
+        """Download the image in ``msg`` to a stable absolute path and return it (None if msg has
+        no image). Persisted under the temp dir (not unlinked) so it survives the whole turn AND
+        follow-up references ("now make it bigger"); the absolute path lets the agent's edit_image
+        / view_image read it regardless of the chat's working directory."""
+        ref = self._image_file_ref(msg)
+        if ref is None:
+            return None
+        file_id, uid, ext = ref
+        dest = Path(tempfile.gettempdir()) / f"tg_img_{uid}.{ext}"
+        try:
+            if not dest.exists():
+                tg_file = await context.bot.get_file(file_id)
+                await tg_file.download_to_drive(str(dest))
+            return str(dest)
+        except Exception:
+            log.exception("telegram image download failed")
+            return None
+
+    @staticmethod
+    def _with_image_context(text: str, image_path: str) -> str:
+        """Ride the resolved image path on the user turn so the model acts on it instead of asking
+        for a path it cannot see (Telegram replies/uploads don't reach the model as files)."""
+        return (
+            f"{text}\n\n[The user attached an image, saved locally at: {image_path}\n"
+            "To act on it, call edit_image (to modify it) or view_image (to look at it) with that "
+            "exact path — you already have the file, so do not ask the user where it is.]"
+        )
 
     async def _transcribe_message(self, update: "Update", context) -> str | None:
         media = update.message.voice or update.message.audio

@@ -599,6 +599,69 @@ async def test_approver_denies_on_timeout():
 # --- voice in (STT) / voice out (TTS) ---
 
 
+# --- image in (photo upload / reply-to-image) ---
+
+
+def test_image_file_ref_picks_largest_photo_and_image_document():
+    gw = _gateway()
+    small, large = Mock(file_id="s", file_unique_id="su"), Mock(file_id="l", file_unique_id="lu")
+    assert gw._image_file_ref(Mock(photo=[small, large], document=None)) == ("l", "lu", "jpg")
+    doc = Mock(file_id="d", file_unique_id="du", mime_type="image/png", file_name="x.png")
+    assert gw._image_file_ref(Mock(photo=[], document=doc)) == ("d", "du", "png")
+    assert gw._image_file_ref(Mock(photo=[], document=Mock(mime_type="application/pdf"))) is None
+    assert gw._image_file_ref(None) is None
+
+
+def test_with_image_context_injects_path_and_tool_hint():
+    out = _gateway()._with_image_context("make this a sketch", "/tmp/x.jpg")
+    assert "make this a sketch" in out and "/tmp/x.jpg" in out
+    assert "edit_image" in out and "view_image" in out  # tells the model what to call
+
+
+async def test_reply_to_image_rides_path_into_turn():
+    # The user's exact failure: replying to a (bot or uploaded) image with "make this a sketch"
+    # must hand the model the image path, not leave it asking for one it can't see.
+    gw = _gateway(allowed=[7])
+    captured = {}
+
+    async def fake_run_turn(update, context, text, *, voice_reply):
+        captured["text"] = text
+
+    gw._run_turn = fake_run_turn
+    update = Mock()
+    update.effective_user.id = 7
+    update.message.text = "make this a sketch"
+    update.message.reply_to_message = Mock(
+        photo=[Mock(file_id="fid", file_unique_id="ruq")], document=None
+    )
+    context = Mock()
+    context.bot.get_file = AsyncMock(return_value=Mock(download_to_drive=AsyncMock()))
+
+    await gw._on_message(update, context)
+    assert "make this a sketch" in captured["text"]
+    assert "tg_img_ruq.jpg" in captured["text"] and "edit_image" in captured["text"]
+
+
+async def test_photo_upload_rides_caption_and_path_into_turn():
+    gw = _gateway(allowed=[7])
+    captured = {}
+
+    async def fake_run_turn(update, context, text, *, voice_reply):
+        captured["text"] = text
+
+    gw._run_turn = fake_run_turn
+    update = Mock()
+    update.effective_user.id = 7
+    update.message.caption = "describe this"
+    update.message.photo = [Mock(file_id="fid", file_unique_id="puq")]
+    update.message.document = None
+    context = Mock()
+    context.bot.get_file = AsyncMock(return_value=Mock(download_to_drive=AsyncMock()))
+
+    await gw._on_photo(update, context)
+    assert "describe this" in captured["text"] and "tg_img_puq.jpg" in captured["text"]
+
+
 async def test_transcribe_message_returns_text():
     gw = _gateway(audio=_FakeAudio(transcript="turn on the lights"))
     update = Mock()
