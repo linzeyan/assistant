@@ -153,6 +153,8 @@ class Settings(BaseSettings):
     turn_timeout_s: float | None = None
     # Where over-budget tool output (S4) is spilled in full so the agent can read the rest.
     tool_output_dir: Path = XDG_DATA_DIR / "tool-output"
+    # Retention for spilled tool-output files (S15 GC), swept once at startup. 0 = keep forever.
+    tool_output_retention_days: float = 14
     # Directory the coding/shell tools operate in. Defaults to the process cwd.
     workspace_dir: Path = Field(default_factory=Path.cwd)
     # Fallback model for non-GUI entry points (Telegram) that don't pick one.

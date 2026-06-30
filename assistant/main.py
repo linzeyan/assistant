@@ -60,6 +60,7 @@ from assistant.skills.discovery import SkillStore
 from assistant.tools import build_registry
 from assistant.tools.approval import PolicyApprover, Rule
 from assistant.tools.base import ToolContext
+from assistant.tools.output_bounding import gc_spill_dir
 
 log = logging.getLogger("assistant")
 req_log = logging.getLogger("assistant.request")
@@ -164,6 +165,13 @@ async def lifespan(app: FastAPI):
         # Surface silent overrides (E1 shadow audit) so a project skill masking a user/bundled one
         # of the same name is diagnosable rather than a mystery.
         log.info("skill %r shadows definition(s) in %s", _slug, ", ".join(_overridden))
+    # Prune stale spilled tool-output files (S15/H8) once at startup — the dir grows unbounded
+    # otherwise. Best-effort; a sweep failure must never block bringing the backend up.
+    _gc_removed, _gc_freed = gc_spill_dir(
+        settings.tool_output_dir, max_age_days=settings.tool_output_retention_days
+    )
+    if _gc_removed:
+        log.info("spill GC: removed %d file(s), freed %d bytes", _gc_removed, _gc_freed)
     embedder = (
         MlxEmbeddingBackend(model=settings.embed_model)
         if settings.embed_memory

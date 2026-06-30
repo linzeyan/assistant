@@ -11,6 +11,7 @@ rest on demand instead of losing it.
 from __future__ import annotations
 
 import hashlib
+import time
 from pathlib import Path
 
 # Default budget per tool result (chars). The model's context is the scarce resource, not
@@ -42,6 +43,30 @@ def bound_text(
             spill_note = f"; full {len(text)} chars at {path}"
     marker = f"\n\n...[{omitted} chars omitted{spill_note}]...\n\n"
     return head + marker + tail
+
+
+def gc_spill_dir(spill_dir: Path, *, max_age_days: float) -> tuple[int, int]:
+    """Prune spilled tool-output files older than ``max_age_days`` (S15 spill GC).
+
+    Spill files are content-addressed and otherwise never deleted, so the dir grows without bound.
+    A spill pointer is consumed shortly after it's written (same turn/session), so age-based pruning
+    is safe: a stale pointer in a long-dormant conversation just degrades to "file gone" and the tool
+    can be re-run. ``max_age_days <= 0`` disables GC (keep forever). Best-effort — a stat/unlink error
+    on one file never aborts the sweep. Returns ``(files_removed, bytes_freed)``."""
+    if max_age_days <= 0 or not spill_dir.is_dir():
+        return (0, 0)
+    cutoff = time.time() - max_age_days * 86_400
+    removed = freed = 0
+    for path in spill_dir.glob("*.txt"):
+        try:
+            st = path.stat()
+            if st.st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+                freed += st.st_size
+        except OSError:
+            continue  # racing unlink / permission — skip, keep sweeping
+    return (removed, freed)
 
 
 def _spill(text: str, spill_dir: Path, label: str) -> Path | None:
