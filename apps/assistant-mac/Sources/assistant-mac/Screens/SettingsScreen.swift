@@ -16,6 +16,7 @@ struct SettingsScreen: View {
     @State private var backendPort: String = ""
     @State private var modelBackend: String = "mlx"
     @State private var maxOutputTokens: String = ""
+    @State private var maxToolIters: String = ""
     @State private var configPath: String = ""
     @State private var savedNote: String?
     @State private var bindNote: String?
@@ -183,6 +184,18 @@ struct SettingsScreen: View {
                 Text("The ceiling on tokens generated per reply (the model still stops early "
                     + "at its end-of-text). Raising it prevents long answers being cut off. "
                     + "Applies to the next reply — no restart.")
+                    .font(.caption2).foregroundStyle(.secondary)
+
+                HStack(spacing: 10) {
+                    Text("Max tool steps").foregroundStyle(.secondary)
+                        .frame(width: labelWidth, alignment: .leading)
+                    TextField("", text: $maxToolIters, prompt: Text("16"))
+                        .textFieldStyle(.roundedBorder).frame(width: 100)
+                    Button("Save") { Task { await saveMaxToolIters() } }
+                }
+                Text("How many tool calls the agent may chain in one turn before stopping. "
+                    + "Multi-step tasks (debug → read → fix → test) need more than a few; raise it "
+                    + "if complex turns get cut off. Applies to the next turn — no restart.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
@@ -559,6 +572,7 @@ struct SettingsScreen: View {
             backendPort = String(cfg.backendPort)
             modelBackend = cfg.modelBackend
             maxOutputTokens = String(cfg.maxOutputTokens)
+            maxToolIters = String(cfg.maxToolIters)
             telegramAllowlist = cfg.telegramAllowedUsers.map(String.init).joined(separator: ", ")
             telegramConfigured = cfg.telegramConfigured
             telegramTokenMasked = cfg.telegramTokenMasked
@@ -624,6 +638,22 @@ struct SettingsScreen: View {
             // Applies live — the next reply uses the new ceiling, no backend restart.
             try await controller.client.putConfig(maxOutputTokens: n)
             agentNote = "Saved — replies may now run up to \(n) tokens."
+        } catch {
+            agentNote = "Save failed: \(error)"
+        }
+    }
+
+    private func saveMaxToolIters() async {
+        guard let n = Int(maxToolIters.trimmingCharacters(in: .whitespaces)),
+            (1...100).contains(n)
+        else {
+            agentNote = "Max tool steps must be a number 1–100."
+            return
+        }
+        do {
+            // Applies live — the next turn's loop reads the new budget, no backend restart.
+            try await controller.client.putConfig(maxToolIters: n)
+            agentNote = "Saved — the agent may now take up to \(n) tool steps per turn."
         } catch {
             agentNote = "Save failed: \(error)"
         }

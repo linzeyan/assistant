@@ -360,6 +360,11 @@ class AgentLoop:
         turn, no restart)."""
         self._max_output_tokens = n
 
+    def set_max_iters(self, n: int) -> None:
+        """Live-update the per-turn tool-iteration budget (GUI Settings edit; the next turn's
+        loop reads it, so no restart)."""
+        self._max_iters = n
+
     def _visible_tool_schemas(self):
         """Tool schemas offered to the model, with blanket-denied tools (S5) filtered out — no
         point tempting the model to call something a rule will always refuse. Resource-specific

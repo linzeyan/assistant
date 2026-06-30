@@ -240,6 +240,7 @@ struct ConfigDTO: Decodable {
     let backendPort: Int
     let modelBackend: String
     let maxOutputTokens: Int
+    let maxToolIters: Int
     let configPath: String
     // Gateways (S9): the token is masked by the backend; full secret never crosses the wire.
     let telegramConfigured: Bool
@@ -258,6 +259,7 @@ struct ConfigDTO: Decodable {
         case backendPort = "backend_port"
         case modelBackend = "model_backend"
         case maxOutputTokens = "max_output_tokens"
+        case maxToolIters = "max_tool_iters"
         case telegramConfigured = "telegram_configured"
         case telegramTokenMasked = "telegram_token_masked"
         case telegramAllowedUsers = "telegram_allowed_users"

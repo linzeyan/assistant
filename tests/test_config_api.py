@@ -74,6 +74,29 @@ def test_put_config_rejects_out_of_range_max_output_tokens(tmp_path, monkeypatch
     assert too_low.status_code == 400 and too_high.status_code == 400
 
 
+def test_put_config_sets_max_tool_iters_live(tmp_path, monkeypatch):
+    # The per-turn tool-iteration budget applies live (next turn's loop reads it), so it persists
+    # to config.toml AND updates the running AgentLoop without a restart — same path as the
+    # generation ceiling above.
+    client, cfg = _client(tmp_path, monkeypatch)
+    with client:
+        assert client.get("/config").json()["max_tool_iters"] == 16  # default surfaced to the GUI
+        resp = client.put("/config", json={"max_tool_iters": 24})
+        live = client.app.state.agent._max_iters
+        live_settings = client.app.state.settings.max_tool_iters
+    assert resp.status_code == 200 and resp.json()["restart_required"] is False
+    assert live == 24 and live_settings == 24
+    assert tomllib.loads(cfg.read_text())["max_tool_iters"] == 24
+
+
+def test_put_config_rejects_out_of_range_max_tool_iters(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+    with client:
+        too_low = client.put("/config", json={"max_tool_iters": 0})
+        too_high = client.put("/config", json={"max_tool_iters": 9999})
+    assert too_low.status_code == 400 and too_high.status_code == 400
+
+
 def test_put_config_writes_extra_model_dirs_and_hf_cache(tmp_path, monkeypatch):
     client, cfg = _client(tmp_path, monkeypatch)
     extra = str(tmp_path / "more-models")
