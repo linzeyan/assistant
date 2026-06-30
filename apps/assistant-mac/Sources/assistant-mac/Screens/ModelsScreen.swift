@@ -198,6 +198,10 @@ struct ModelsScreen: View {
             Text("Removes \(model.id) and its files from your model directory. "
                 + "This can't be undone.")
         }
+        // Refresh on open so the loaded state is current however the model got loaded — a
+        // GUI chat turn refreshes via onFinish, but a Telegram turn, the compat API, or a
+        // prior session loads the pool with no GUI event, leaving a stale "Load" until now.
+        .task { await controller.refresh() }
     }
 
     /// Chat works for text LLMs (mlx-lm) and vision-language / omni models (mlx-vlm).
