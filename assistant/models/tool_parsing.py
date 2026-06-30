@@ -168,6 +168,17 @@ def parse_tool_calls(
         after = text.split(_PYTHON_TAG, 1)[1]
         return _coerce_all(_iter_json_values(after), restrict=None)
 
+    # Nested-XML function form with NO wrapping <tool_call> block. Qwen3-Coder emits
+    # ``<function=bash><parameter=command>ls -la</parameter></function>`` directly — sometimes with
+    # only a stray closing ``</tool_call>`` and no opener — so _TOOL_CALL_RE never matches and the
+    # block at the top is skipped, leaking the call back as text (a real parse_miss caught by the
+    # A1 reliability harness). The ``<function=NAME>`` tag is as distinctive as the other markers,
+    # so it's safe to trust here without the wrapper.
+    if _FUNCTION_RE.search(text):
+        calls = _parse_xml_functions(text)
+        if calls:
+            return calls
+
     stripped = text.strip()
     if stripped[:1] in "{[" and known_names:
         return _coerce_all(_iter_json_values(stripped), restrict=known_names)

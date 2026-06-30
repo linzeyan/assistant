@@ -103,14 +103,23 @@ async def _autodetect_model(client: httpx.AsyncClient) -> str | None:
 
 
 def _capture_row(trace: dict) -> dict:
-    """A corpus-shaped row: the raw model text per step plus the loop's verdict, enough to replay
-    against ``parse_tool_calls`` and to see why a turn was bucketed as it was."""
+    """A corpus-shaped row: the raw model text per step, the parsed calls (to replay against
+    ``parse_tool_calls`` for a parse_miss), and the tool results (to see *which* tool failed on a
+    tool_error — mode 3 — without re-running)."""
     return {
         "model": trace.get("model"),
         "user_text": trace.get("user_text"),
         "outcome": trace.get("outcome"),
         "steps": [
-            {"model_text": s.get("model_text", ""), "parsed_calls": s.get("parsed_calls", [])}
+            {
+                "model_text": s.get("model_text", ""),
+                "parsed_calls": s.get("parsed_calls", []),
+                "tool_results": [
+                    {"name": r.get("name"), "ok": r.get("ok"),
+                     "content": (r.get("content") or "")[:200]}
+                    for r in s.get("tool_results") or []
+                ],
+            }
             for s in trace.get("steps") or []
         ],
     }

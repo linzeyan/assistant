@@ -112,11 +112,22 @@ def format_report(summary: dict, *, model: str | None = None, runs: int | None =
 
 
 # Default probe prompts: each is meant to *require* a tool, so an ``answered`` turn that never called
-# one is a real death-mode-1 miss. Split across the two families that share the tool-call root cause
-# (spring2): a live web lookup and a filesystem/code task. Override with --prompts on the CLI.
+# one is a real death-mode-1 miss. These exercise the web tools (web_search / fetch_url), which work
+# API-side without any workspace. Filesystem/coding prompts are intentionally NOT here: an
+# API-driven chat has no workspace (it defaults to the backend's cwd, e.g. ``/``) and ``bash``
+# requires approval, so file prompts measure the environment, not tool-calling — run those via
+# --prompts against a workspace-configured backend (the GUI, or Telegram after /cd). Example coding
+# set for that case:
+#   "List the files in the current working directory."
+#   "Read this project's README and summarise it in two sentences."
+#
+# Caveat on the numbers: ``tool_error`` counts a turn where *any* tool call failed, even one the
+# model then recovered from (e.g. a fetch_url 403 it routed around) — the coarse trace outcome can't
+# tell a fatal failure from a recovered one, so it slightly *under*-counts real success. Honest
+# floor, not the ceiling.
 DEFAULT_PROMPTS = (
     "Search the web for the latest stable version of Python and tell me the version number.",
-    "What is today's date and the current weather in Tokyo? Use a web search.",
-    "List the files in the current working directory.",
-    "Read the README of this project and summarise it in two sentences.",
+    "Use a web search to find who currently holds the men's 100m world record, and the time.",
+    "Search the web for the current USD to JPY exchange rate and state the rate.",
+    "Find, with a web search, what the latest released version of the Rust language is.",
 )

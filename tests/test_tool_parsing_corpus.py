@@ -62,6 +62,14 @@ CASES = [
         [("web_search", {"query": "台北今天天氣"})],
     ),
     (
+        # REAL capture (A1 harness, Qwen3-Coder-30B-A3B): the nested-XML form with NO opening
+        # <tool_call> — only a stray closing tag. Was a parse_miss until the bare-<function=> branch.
+        "qwen_coder_bare_function_stray_close",
+        "<function=bash>\n<parameter=command>\nls -la\n</parameter>\n</function>\n</tool_call>",
+        KNOWN,
+        [("bash", {"command": "ls -la"})],
+    ),
+    (
         "qwen_nested_xml_typed_param",  # XML values that are JSON should recover real types
         "<tool_call><function=read_file><parameter=path>a.txt</parameter>"
         "<parameter=max_lines>50</parameter></function></tool_call>",
