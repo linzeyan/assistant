@@ -16,17 +16,20 @@ def test_scan_and_index(tmp_path):
     assert "alpha" in idx and idx["alpha"].description == "A skill"
 
 
-def test_bundled_investigate_skill_is_discoverable():
-    # Spring4 SB.1: the engine was complete but the shelf was empty. The bundled `investigate`
-    # skill must ship at repo-root/skills (where main.py points _BUNDLED_SKILLS_DIR) with a
-    # frontmatter that parses and a trigger-y description, or pull-and-follow can't be measured.
+def test_bundled_cognitive_skills_are_discoverable():
+    # Spring4 SB.1 / SA.2: the engine was complete but the shelf was empty. The bundled cognitive
+    # skills must ship at repo-root/skills (where main.py points _BUNDLED_SKILLS_DIR), each with a
+    # frontmatter that parses and a non-empty trigger-y description, or pull-and-follow (SB.3 /
+    # Lane C kill-gate) can't even be measured. All passed their kill-gate on the pinned model.
     bundled = Path(__file__).resolve().parent.parent / "skills"
     idx = scan_skills([bundled])
-    assert "investigate" in idx, "bundled investigate skill missing"
-    desc = idx["investigate"].description.lower()
-    assert "root cause" in desc and ("broken" in desc or "error" in desc)
-    body = idx["investigate"].path.read_text()
-    assert "no root cause, no fix" in body.lower()  # the Iron Law survived distillation
+    for name in ("investigate", "spec", "decide", "review"):
+        assert name in idx, f"bundled skill '{name}' missing"
+        assert len(idx[name].description) > 30, f"'{name}' description too thin to trigger on"
+        # Hard ≤60-line cap (lazy-load + small-model context budget); SKILL.md = frontmatter+body.
+        assert idx[name].path.read_text().count("\n") <= 60, f"'{name}' SKILL.md over 60 lines"
+    # The Iron Law must survive investigate's 30-50x distillation from gstack.
+    assert "no root cause, no fix" in idx["investigate"].path.read_text().lower()
 
 
 def test_store_reload_and_read_body(tmp_path):
