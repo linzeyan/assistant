@@ -23,6 +23,7 @@ from assistant.gateway import lifecycle as gateway_lifecycle
 from assistant.agent.session import SessionStore
 from assistant.agent.trace import TraceStore
 from assistant.api import (
+    routes_anthropic,
     routes_audio,
     routes_chat,
     routes_config,
@@ -30,6 +31,7 @@ from assistant.api import (
     routes_images,
     routes_memory,
     routes_models,
+    routes_openai,
     routes_sessions,
     routes_setup,
     routes_skills,
@@ -353,6 +355,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(routes_vision.router)
     app.include_router(routes_audio.router)
     app.include_router(routes_video.router)
+    # OpenAI- / Anthropic-compatible shims: let external agents (Claude Code, OpenAI clients)
+    # drive the local models as a raw chat backend, bypassing our AgentLoop (they bring their own).
+    app.include_router(routes_openai.router)
+    app.include_router(routes_anthropic.router)
     return app
 
 
