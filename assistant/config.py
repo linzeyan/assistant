@@ -82,6 +82,11 @@ class Settings(BaseSettings):
     # --- paths (XDG data dir) ---
     home_dir: Path = XDG_DATA_DIR
     skills_dir: Path = XDG_DATA_DIR / "skills"
+    # Optional third skills source (E1): a project/team skills dir scanned LAST, so its skills win
+    # on a slug collision (shadowing user + bundled). None = only bundled + user dirs. A fixed
+    # configured path, not per-workspace — that would make the skills index (part of the stable
+    # cacheable system prefix, S2/S3) vary per turn.
+    project_skills_dir: Path | None = None
     memory_dir: Path = XDG_DATA_DIR / "memory"
     sessions_dir: Path = XDG_DATA_DIR / "sessions"  # persisted conversations (S1)
     # Per-turn trace (spring2 P0): record each turn (model text + parsed calls + tool

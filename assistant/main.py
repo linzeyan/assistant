@@ -149,10 +149,21 @@ async def lifespan(app: FastAPI):
 
     registry = build_registry()
     approver = PolicyApprover(settings.approval_required)
+    # Bundled, then user, then (optionally) a project/team dir scanned LAST so it wins on a slug
+    # collision (E1). Capabilities for the requires gate are set further down, once the media
+    # backends are built.
+    _project_skill_dirs = (
+        [settings.project_skills_dir] if settings.project_skills_dir else []
+    )
     skills = SkillStore(
-        dirs=[_BUNDLED_SKILLS_DIR, settings.skills_dir], user_dir=settings.skills_dir
+        dirs=[_BUNDLED_SKILLS_DIR, settings.skills_dir, *_project_skill_dirs],
+        user_dir=settings.skills_dir,
     )
     skills.scan()
+    for _slug, _overridden in skills.shadows().items():
+        # Surface silent overrides (E1 shadow audit) so a project skill masking a user/bundled one
+        # of the same name is diagnosable rather than a mystery.
+        log.info("skill %r shadows definition(s) in %s", _slug, ", ".join(_overridden))
     embedder = (
         MlxEmbeddingBackend(model=settings.embed_model)
         if settings.embed_memory
@@ -215,6 +226,21 @@ async def lifespan(app: FastAPI):
         audio=audio,
         video=video,
         output_spill_dir=settings.tool_output_dir,
+    )
+    # Capability set for the skill requires-gate (E2): which optional media backends are installed.
+    # Set now that the services exist; it's process-stable, so the gated skills index stays a
+    # byte-stable cacheable prefix (S2/S3) — a skill requiring an absent backend is dropped here.
+    skills.set_capabilities(
+        {
+            name
+            for name, svc in (
+                ("vision", vision),
+                ("audio", audio),
+                ("video", video),
+                ("images", images),
+            )
+            if svc is not None and svc.available()
+        }
     )
 
     app.state.model_service = model_service
