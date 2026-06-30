@@ -58,6 +58,39 @@ def _release_mlx_memory() -> None:
         )
 
 
+def _active_memory_bytes() -> int | None:
+    """Current MLX unified-memory footprint in bytes, or None when MLX isn't importable
+    (fake-loader tests / non-MLX machines). Lets the pool refine a model's disk-size estimate
+    with its real post-load footprint for the admission ceiling (see ``MlxEnginePool.acquire``)."""
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return None
+    active = getattr(mx, "get_active_memory", None)
+    return int(active()) if callable(active) else None
+
+
+def _estimate_model_bytes(path: Path) -> int:
+    """Estimate a model's resident footprint from its on-disk weight shards.
+
+    The summed ``*.safetensors`` size is the dominant term (the weights) and the only signal
+    available *before* a load. It UNDER-estimates — runtime adds a KV cache and activations that
+    grow with context — so it's used only as the pre-load admission guess and is replaced by the
+    measured active-memory delta once the model is in. Returns 0 when no weight files are found,
+    which disables byte-admission for that model rather than guessing from nothing.
+    """
+    try:
+        return sum(f.stat().st_size for f in path.glob("*.safetensors"))
+    except OSError:
+        return 0
+
+
+class ModelAdmissionError(RuntimeError):
+    """A model can't be admitted under the configured memory ceiling. Raised *before* the load so
+    a too-big model fails with a clear message (surfaced as a chat error / a 502 on /models load)
+    instead of letting MLX OOM-crash the whole backend."""
+
+
 def _messages_for_template(messages: list[dict]) -> list[dict]:
     """Return messages with assistant tool_calls' ``arguments`` parsed from JSON string to a
     dict, for chat-template rendering only.
@@ -275,47 +308,103 @@ class MlxEnginePool:
         max_loaded: int = 1,
         loader: Callable[[Path], object] | None = None,
         pinned: set[str] | None = None,
+        mem_ceiling_bytes: int | None = None,
     ):
         self._max = max(1, max_loaded)
         self._loader = loader or _default_loader
         # Insertion order == LRU order; move_to_end marks most-recently-used.
         self._loaded: OrderedDict[str, object] = OrderedDict()
+        # model_id -> bytes it's holding (measured active-memory delta, or disk estimate as a
+        # fallback). Drives byte-level admission against the ceiling, alongside the count cap.
+        self._footprint: dict[str, int] = {}
         self._pinned: set[str] = set(pinned or set())
+        # None / <=0 disables byte-admission entirely — the pool then behaves exactly as the
+        # count-only LRU it was before, so the guardrail is strictly opt-in via mem_ceiling_gb.
+        self._ceiling = mem_ceiling_bytes if (mem_ceiling_bytes and mem_ceiling_bytes > 0) else None
         self._lock = asyncio.Lock()
 
     async def acquire(self, model_id: str, path: Path) -> object:
-        """Return the loaded engine for ``model_id``, loading (and evicting) as needed."""
+        """Return the loaded engine for ``model_id``, loading (and evicting) as needed.
+
+        Raises ``ModelAdmissionError`` *before* loading if a memory ceiling is set and the model
+        can't be made to fit — fail loud rather than OOM-crash."""
         async with self._lock:
             if model_id in self._loaded:
                 self._loaded.move_to_end(model_id)
                 return self._loaded[model_id]
-            self._evict(exclude=model_id)
+            incoming = _estimate_model_bytes(path)
+            self._make_room(exclude=model_id, incoming=incoming)
             # Load outside would race the lock; loading under the lock serialises
             # model switches, which is what we want (one heavy load at a time).
-            log.info("loading model into pool: %s", model_id)
+            log.info("loading model into pool: %s (~%.1fGB est)", model_id, incoming / 1e9)
+            before = _active_memory_bytes()
             engine = await asyncio.to_thread(self._loader, path)
             self._loaded[model_id] = engine
             self._loaded.move_to_end(model_id)
-            log.info("model loaded: %s (pool now: %s)", model_id, self.loaded_ids())
+            # Refine the disk estimate with the real footprint when MLX exposes it. The lock is
+            # held and the cache was just cleared on eviction, so the active-memory delta is this
+            # model's own contribution; fall back to the estimate (tests / non-MLX / no delta).
+            after = _active_memory_bytes()
+            measured = (after - before) if (before is not None and after is not None and after > before) else 0
+            self._footprint[model_id] = measured or incoming
+            log.info(
+                "model loaded: %s (%.1fGB, pool now: %s = %.1fGB%s)",
+                model_id, self._footprint[model_id] / 1e9, self.loaded_ids(),
+                self._loaded_bytes() / 1e9,
+                f"/{self._ceiling / 1e9:.0f}GB ceiling" if self._ceiling else "",
+            )
             return engine
 
-    def _evict(self, exclude: str) -> None:
-        # Drop LRU non-pinned engines until under budget. Dropping the last reference is
-        # necessary but not sufficient to free MLX's unified memory — _release_mlx_memory
-        # (called once after any eviction) clears the Metal buffer cache too.
+    def _loaded_bytes(self, exclude: str | None = None) -> int:
+        return sum(self._footprint.get(k, 0) for k in self._loaded if k != exclude)
+
+    def _drop(self, model_id: str, reason: str) -> None:
+        self._loaded.pop(model_id, None)
+        self._footprint.pop(model_id, None)
+        log.info("evicted model from pool: %s (%s)", model_id, reason)
+
+    def _make_room(self, exclude: str, incoming: int) -> None:
+        """Evict LRU non-pinned engines until both the count cap (``max_loaded``) and, when a
+        ceiling is set, the memory budget (held + ``incoming`` <= ceiling) are satisfied. Dropping
+        the last reference is necessary but not sufficient to free MLX's unified memory —
+        ``_release_mlx_memory`` (once, after any eviction) clears the Metal buffer cache too.
+
+        Raises ``ModelAdmissionError`` if, after evicting everything evictable, the incoming model
+        still overflows the ceiling (it's larger than the budget, or pinned models leave no room)."""
         evicted = False
+
+        def next_victim() -> str | None:
+            return next((k for k in self._loaded if k != exclude and k not in self._pinned), None)
+
+        # Count cap: make room for one more (ceiling-independent — preserves prior behaviour).
         while len(self._loaded) >= self._max:
-            victim = next(
-                (k for k in self._loaded if k != exclude and k not in self._pinned),
-                None,
-            )
+            victim = next_victim()
             if victim is None:
-                break  # everything left is pinned — exceed budget rather than evict it
-            self._loaded.pop(victim)
-            log.info("evicted LRU model from pool: %s (making room for %s)", victim, exclude)
+                break  # everything left is pinned — exceed the count budget rather than evict it
+            self._drop(victim, f"making room for {exclude}")
             evicted = True
+
+        # Memory ceiling: keep evicting until the incoming estimate fits under the budget.
+        if self._ceiling is not None:
+            while self._loaded_bytes(exclude) + incoming > self._ceiling:
+                victim = next_victim()
+                if victim is None:
+                    break
+                self._drop(victim, f"freeing memory for {exclude}")
+                evicted = True
+
         if evicted:
             _release_mlx_memory()
+
+        if self._ceiling is not None and self._loaded_bytes(exclude) + incoming > self._ceiling:
+            held = self._loaded_bytes(exclude)
+            raise ModelAdmissionError(
+                f"{exclude} needs ~{incoming / 1e9:.1f}GB but only "
+                f"{max(0.0, (self._ceiling - held) / 1e9):.1f}GB is free under the "
+                f"{self._ceiling / 1e9:.0f}GB memory ceiling"
+                + (f" ({held / 1e9:.1f}GB held by pinned models)" if held else "")
+                + ". Raise mem_ceiling_gb or unload other models."
+            )
 
     async def load(self, model_id: str, path: Path) -> None:
         await self.acquire(model_id, path)
@@ -324,6 +413,7 @@ class MlxEnginePool:
         async with self._lock:
             removed = self._loaded.pop(model_id, None) is not None
             if removed:
+                self._footprint.pop(model_id, None)
                 log.info("unloading model from pool: %s (pool now: %s)", model_id, self.loaded_ids())
                 _release_mlx_memory()
             else:

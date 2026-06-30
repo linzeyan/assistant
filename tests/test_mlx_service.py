@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from assistant.models.mlx_engine import MlxEnginePool
+from assistant.models.mlx_engine import MlxEnginePool, ModelAdmissionError
 from assistant.models.mlx_service import MlxModelService
 from assistant.models.status import BackendState
 
@@ -247,3 +247,63 @@ def test_vlm_chat_engine_streams_text(monkeypatch):
     engine = VlmChatEngine(object(), FakeProcessor())
     out = "".join(engine.stream_text([{"role": "user", "content": "hi"}]))
     assert out == "Hello"
+
+
+# --- C: memory-aware admission (byte-level ceiling on top of the count cap) ---------------
+
+def _sized_model(tmp_path: Path, name: str, nbytes: int) -> Path:
+    d = tmp_path / name
+    d.mkdir(parents=True)
+    (d / "model.safetensors").write_bytes(b"\x00" * nbytes)  # _estimate reads this file's size
+    return d
+
+
+async def test_pool_evicts_to_stay_under_memory_ceiling(tmp_path, monkeypatch):
+    # Byte-admission: even when the count cap wouldn't trigger, the ceiling alone evicts the LRU
+    # model so the live set stays within budget. Pin the footprint to the disk estimate (no live
+    # MLX measurement) for a deterministic check.
+    monkeypatch.setattr("assistant.models.mlx_engine._active_memory_bytes", lambda: None)
+    a = _sized_model(tmp_path, "a", 100)
+    b = _sized_model(tmp_path, "b", 100)
+    c = _sized_model(tmp_path, "c", 100)
+    pool = MlxEnginePool(max_loaded=10, mem_ceiling_bytes=250, loader=lambda _p: object())
+    await pool.acquire("a", a)
+    await pool.acquire("b", b)
+    await pool.acquire("c", c)  # a+b+c = 300 > 250 → evict LRU "a"
+    assert pool.loaded_ids() == ["b", "c"]
+
+
+async def test_pool_rejects_model_larger_than_ceiling(tmp_path, monkeypatch):
+    # A single model bigger than the whole budget fails loud BEFORE loading — never OOM-loaded.
+    monkeypatch.setattr("assistant.models.mlx_engine._active_memory_bytes", lambda: None)
+    big = _sized_model(tmp_path, "big", 300)
+    pool = MlxEnginePool(max_loaded=10, mem_ceiling_bytes=250, loader=lambda _p: object())
+    with pytest.raises(ModelAdmissionError):
+        await pool.acquire("big", big)
+    assert pool.loaded_ids() == []  # nothing loaded
+
+
+async def test_pool_rejects_when_pinned_models_leave_no_room(tmp_path, monkeypatch):
+    # A pinned model's footprint counts against the budget and can't be evicted, so an incoming
+    # model that won't fit in the remainder is rejected rather than OOM-loaded over the pin.
+    monkeypatch.setattr("assistant.models.mlx_engine._active_memory_bytes", lambda: None)
+    a = _sized_model(tmp_path, "a", 100)
+    b = _sized_model(tmp_path, "b", 100)
+    pool = MlxEnginePool(max_loaded=10, mem_ceiling_bytes=150, loader=lambda _p: object())
+    await pool.acquire("a", a)
+    pool.pin("a")  # 100 held, only 50 free under the 150 ceiling
+    with pytest.raises(ModelAdmissionError):
+        await pool.acquire("b", b)  # needs 100 > 50, can't evict pinned "a"
+    assert pool.loaded_ids() == ["a"]  # the pinned model survived
+
+
+async def test_pool_without_ceiling_keeps_count_only_behaviour(tmp_path, monkeypatch):
+    # No ceiling → byte-admission disabled: the pool holds up to max_loaded regardless of size,
+    # exactly as before this feature (opt-in guardrail).
+    monkeypatch.setattr("assistant.models.mlx_engine._active_memory_bytes", lambda: None)
+    a = _sized_model(tmp_path, "a", 10_000)
+    b = _sized_model(tmp_path, "b", 10_000)
+    pool = MlxEnginePool(max_loaded=2, mem_ceiling_bytes=None, loader=lambda _p: object())
+    await pool.acquire("a", a)
+    await pool.acquire("b", b)
+    assert pool.loaded_ids() == ["a", "b"]  # both held; no rejection despite large sizes

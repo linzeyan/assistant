@@ -108,6 +108,7 @@ def _build_model_service(settings: Settings, per_model=None, fusion=None):
     service = MlxModelService(
         models_dir=settings.models_dir,
         max_loaded=settings.max_loaded_models,
+        mem_ceiling_gb=settings.mem_ceiling_gb,
         include_hf_cache=settings.hf_cache,
         extra_model_dirs=settings.extra_model_dirs,
         per_model=per_model,

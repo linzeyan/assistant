@@ -71,6 +71,7 @@ class MlxModelService(ModelService):
         *,
         models_dir: Path,
         max_loaded: int = 1,
+        mem_ceiling_gb: float | None = None,
         include_hf_cache: bool = False,
         extra_model_dirs: list[Path] | None = None,
         pool: MlxEnginePool | None = None,
@@ -81,7 +82,9 @@ class MlxModelService(ModelService):
         self._models_dir = Path(models_dir)
         self._extra_dirs = [Path(d) for d in (extra_model_dirs or [])]
         self._include_hf = include_hf_cache
-        self._pool = pool or MlxEnginePool(max_loaded=max_loaded)
+        # Memory ceiling is opt-in: None leaves the pool count-only (prior behaviour). GB→bytes.
+        mem_ceiling_bytes = int(mem_ceiling_gb * 1e9) if mem_ceiling_gb else None
+        self._pool = pool or MlxEnginePool(max_loaded=max_loaded, mem_ceiling_bytes=mem_ceiling_bytes)
         # Optional per-model generation overrides (PerModelStore). Merged into stream params so
         # each model's saved temperature/top_p/top_k/max_tokens apply automatically at chat time.
         self._per_model = per_model
