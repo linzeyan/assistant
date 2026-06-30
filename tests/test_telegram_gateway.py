@@ -476,6 +476,36 @@ async def test_render_plan_sends_once_then_edits_in_place():
     assert "✅" in bot.edit_message_text.await_args.args[0]
 
 
+async def test_on_whoami_is_open_to_everyone_and_reports_id():
+    # /whoami must work for a user who is NOT in the allowlist — that's its whole purpose
+    # (find your id so it can be added). gw has an empty allowlist, so user 999 is not allowed.
+    gw = _gateway(allowed=[7])
+    assert not gw.is_allowed(999)
+    update = Mock()
+    update.effective_user.id = 361923174
+    update.effective_user.full_name = "Ricky"
+    update.effective_user.username = None  # no @handle → shown as "None"
+    update.message.reply_text = AsyncMock()
+    await gw._on_whoami(update, Mock())
+    update.message.reply_text.assert_awaited_once()
+    text = update.message.reply_text.await_args.args[0]
+    assert "Ricky" in text
+    assert "361923174" in text
+    assert "None" in text  # username absent
+
+
+async def test_on_whoami_renders_username_when_present():
+    gw = _gateway()
+    update = Mock()
+    update.effective_user.id = 7
+    update.effective_user.full_name = "Sam"
+    update.effective_user.username = "samhandle"
+    update.message.reply_text = AsyncMock()
+    await gw._on_whoami(update, Mock())
+    text = update.message.reply_text.await_args.args[0]
+    assert "@samhandle" in text
+
+
 async def test_on_cd_sets_per_chat_workspace(tmp_path):
     gw = _gateway()
     update = Mock()

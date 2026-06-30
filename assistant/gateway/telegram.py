@@ -295,6 +295,7 @@ class TelegramGateway:
         # shell — were the first to hit this; media tools don't require approval.)
         app = Application.builder().token(self._token).concurrent_updates(True).build()
         app.add_handler(CommandHandler("start", self._on_start))
+        app.add_handler(CommandHandler("whoami", self._on_whoami))
         app.add_handler(CommandHandler("models", self._on_models))
         app.add_handler(CommandHandler("cd", self._on_cd))
         app.add_handler(CommandHandler("video", self._on_video))
@@ -315,6 +316,7 @@ class TelegramGateway:
             await app.bot.set_my_commands(
                 [
                     ("start", "Show status and usage"),
+                    ("whoami", "Show your Telegram name and id (anyone)"),
                     ("models", "Pick the chat model"),
                     ("cd", "Set the working directory for this chat"),
                     ("video", "Pick the video-generation model"),
@@ -422,6 +424,20 @@ class TelegramGateway:
             self._help_html(model, cwd),
             parse_mode="HTML",
             disable_web_page_preview=True,
+        )
+
+    async def _on_whoami(self, update: "Update", context) -> None:
+        # Deliberately ungated: anyone may call /whoami. The point is to let a not-yet-allowed
+        # user read their own id (and copy it) so it can be added to telegram_allowed_users —
+        # gating this behind the allowlist would defeat its purpose.
+        user = update.effective_user
+        name = user.full_name or user.first_name or "there"
+        username = f"@{user.username}" if user.username else "None"
+        await update.message.reply_text(
+            f"Hello <b>{_html.escape(name)}</b>\n"
+            f"Your username is <b>{_html.escape(username)}</b>\n"
+            f"Your ID is <code>{user.id}</code>",  # <code> = tap-to-copy in Telegram
+            parse_mode="HTML",
         )
 
     async def _on_models(self, update: "Update", context) -> None:
