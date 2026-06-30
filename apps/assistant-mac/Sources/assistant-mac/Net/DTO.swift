@@ -242,6 +242,7 @@ struct ConfigDTO: Decodable {
     let maxOutputTokens: Int
     let maxToolIters: Int
     let turnTimeoutS: Double?  // per-turn wall-clock budget in seconds; nil/None = unlimited
+    let memCeilingGb: Double?  // engine-pool memory-admission ceiling in GB; nil/None = no ceiling
     let configPath: String
     // Gateways (S9): the token is masked by the backend; full secret never crosses the wire.
     let telegramConfigured: Bool
@@ -262,6 +263,7 @@ struct ConfigDTO: Decodable {
         case maxOutputTokens = "max_output_tokens"
         case maxToolIters = "max_tool_iters"
         case turnTimeoutS = "turn_timeout_s"
+        case memCeilingGb = "mem_ceiling_gb"
         case telegramConfigured = "telegram_configured"
         case telegramTokenMasked = "telegram_token_masked"
         case telegramAllowedUsers = "telegram_allowed_users"

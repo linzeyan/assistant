@@ -145,6 +145,11 @@ class MlxModelService(ModelService):
         self._include_hf = include_hf_cache
         self._catalog = {}
 
+    def set_mem_ceiling(self, gb: float | None) -> None:
+        """Live-update the pool's memory-admission ceiling (GUI Settings). GB→bytes; 0/None
+        disables. The next model load enforces it — no restart."""
+        self._pool.set_mem_ceiling_bytes(int(gb * 1e9) if gb else None)
+
     async def _refresh_catalog(self) -> None:
         found = await asyncio.to_thread(
             discover_models,

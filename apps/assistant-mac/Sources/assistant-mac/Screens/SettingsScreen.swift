@@ -18,6 +18,7 @@ struct SettingsScreen: View {
     @State private var maxOutputTokens: String = ""
     @State private var maxToolIters: String = ""
     @State private var turnTimeoutS: String = ""
+    @State private var memCeilingGb: String = ""
     @State private var configPath: String = ""
     @State private var savedNote: String?
     @State private var bindNote: String?
@@ -210,6 +211,20 @@ struct SettingsScreen: View {
                     + "between tool steps. Empty or 0 = no limit (default; a legitimately slow "
                     + "large-model turn is never killed). Note: a single in-flight generation isn't "
                     + "interrupted — that's bounded by max output tokens. No restart.")
+                    .font(.caption2).foregroundStyle(.secondary)
+
+                HStack(spacing: 10) {
+                    Text("Memory ceiling (GB)").foregroundStyle(.secondary)
+                        .frame(width: labelWidth, alignment: .leading)
+                    TextField("", text: $memCeilingGb, prompt: Text("off"))
+                        .textFieldStyle(.roundedBorder).frame(width: 100)
+                    Button("Save") { Task { await saveMemCeiling() } }
+                }
+                Text("Cap on the memory loaded models may hold. Loading a model that won't fit is "
+                    + "refused with a clear error instead of crashing the backend with an "
+                    + "out-of-memory. Empty or 0 = no cap (default). Governs chat/vision models; the "
+                    + "image/video/audio backends load separately. Enforced on the next load — no "
+                    + "restart.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
@@ -593,6 +608,11 @@ struct SettingsScreen: View {
             } else {
                 turnTimeoutS = ""
             }
+            if let g = cfg.memCeilingGb, g > 0 {
+                memCeilingGb = g == g.rounded() ? String(Int(g)) : String(g)
+            } else {
+                memCeilingGb = ""
+            }
             telegramAllowlist = cfg.telegramAllowedUsers.map(String.init).joined(separator: ", ")
             telegramConfigured = cfg.telegramConfigured
             telegramTokenMasked = cfg.telegramTokenMasked
@@ -693,6 +713,25 @@ struct SettingsScreen: View {
             agentNote = seconds == 0
                 ? "Saved — turn timeout is off (turns may run unbounded)."
                 : "Saved — a turn now aborts after \(Int(seconds))s between tool steps."
+        } catch {
+            agentNote = "Save failed: \(error)"
+        }
+    }
+
+    private func saveMemCeiling() async {
+        // Empty field = no cap (send 0, which the backend stores as None).
+        let raw = memCeilingGb.trimmingCharacters(in: .whitespaces)
+        let gb = raw.isEmpty ? 0 : (Double(raw) ?? -1)
+        guard (0...4096).contains(gb) else {
+            agentNote = "Memory ceiling must be a number 0–4096 GB (empty or 0 = no cap)."
+            return
+        }
+        do {
+            // Applies live — the next model load enforces the new ceiling, no backend restart.
+            try await controller.client.putConfig(memCeilingGb: gb)
+            agentNote = gb == 0
+                ? "Saved — memory ceiling is off (no admission cap)."
+                : "Saved — models over \(Int(gb))GB are refused instead of risking an out-of-memory."
         } catch {
             agentNote = "Save failed: \(error)"
         }

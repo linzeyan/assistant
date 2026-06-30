@@ -39,6 +39,7 @@ class ConfigPatch(BaseModel):
     max_output_tokens: int | None = None
     max_tool_iters: int | None = None
     turn_timeout_s: float | None = None
+    mem_ceiling_gb: float | None = None
     # Gateways (S9): a token/allowlist edit (re)starts the gateway live, no backend restart.
     # An empty token clears it (stops the gateway).
     telegram_token: str | None = None
@@ -59,6 +60,7 @@ async def get_config(request: Request):
         "max_output_tokens": s.max_output_tokens,
         "max_tool_iters": s.max_tool_iters,
         "turn_timeout_s": s.turn_timeout_s,
+        "mem_ceiling_gb": s.mem_ceiling_gb,
         "config_path": str(_CONFIG_PATH),
         **gateway_lifecycle.status(request.app),  # telegram_* (token masked)
     }
@@ -106,6 +108,11 @@ async def put_config(patch: ConfigPatch, request: Request):
     if "turn_timeout_s" in updates and not (0 <= updates["turn_timeout_s"] <= 86400):
         raise HTTPException(
             status_code=400, detail="turn_timeout_s must be 0–86400 (0 disables)"
+        )
+    # 0 disables the memory ceiling (same exclude-None sentinel as the turn timeout).
+    if "mem_ceiling_gb" in updates and not (0 <= updates["mem_ceiling_gb"] <= 4096):
+        raise HTTPException(
+            status_code=400, detail="mem_ceiling_gb must be 0–4096 (0 disables)"
         )
     if "telegram_token" in updates:
         token = updates["telegram_token"].strip()
@@ -175,6 +182,12 @@ def _apply_live(request: Request, updates: dict) -> bool:
         agent = getattr(request.app.state, "agent", None)
         if agent is not None:
             agent.set_turn_timeout(updates["turn_timeout_s"])
+    if "mem_ceiling_gb" in updates:
+        # Applies live; 0 disables (stored as None). The next model load enforces the new ceiling.
+        settings.mem_ceiling_gb = updates["mem_ceiling_gb"] or None
+        service = getattr(request.app.state, "model_service", None)
+        if service is not None and hasattr(service, "set_mem_ceiling"):
+            service.set_mem_ceiling(updates["mem_ceiling_gb"])
     # Gateway settings: stage onto live settings so the subsequent reload reads the new values
     # (the reload itself is async, so it runs in put_config, not here).
     if "telegram_token" in updates:

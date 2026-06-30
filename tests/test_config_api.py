@@ -122,6 +122,32 @@ def test_put_config_rejects_out_of_range_turn_timeout(tmp_path, monkeypatch):
     assert negative.status_code == 400 and too_high.status_code == 400
 
 
+def test_put_config_sets_mem_ceiling_live(tmp_path, monkeypatch):
+    # The memory-admission ceiling applies live to the running pool (the next model load enforces
+    # it), persists to config.toml, and needs no restart. 0 disables it (→ None on the pool). This
+    # is why mem_ceiling_gb is in the GUI and not config.toml-only.
+    client, cfg = _client(tmp_path, monkeypatch)
+    with client:
+        assert client.get("/config").json()["mem_ceiling_gb"] is None  # default: no ceiling
+        resp = client.put("/config", json={"mem_ceiling_gb": 100})
+        live = client.app.state.model_service._pool._ceiling
+        live_settings = client.app.state.settings.mem_ceiling_gb
+        toml_after_set = tomllib.loads(cfg.read_text())["mem_ceiling_gb"]
+        client.put("/config", json={"mem_ceiling_gb": 0})  # disable
+        disabled = client.app.state.model_service._pool._ceiling
+    assert resp.status_code == 200 and resp.json()["restart_required"] is False
+    assert live == 100_000_000_000 and live_settings == 100 and toml_after_set == 100
+    assert disabled is None  # 0 disables byte-admission on the running pool
+
+
+def test_put_config_rejects_out_of_range_mem_ceiling(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+    with client:
+        negative = client.put("/config", json={"mem_ceiling_gb": -1})
+        too_high = client.put("/config", json={"mem_ceiling_gb": 99999})
+    assert negative.status_code == 400 and too_high.status_code == 400
+
+
 def test_put_config_writes_extra_model_dirs_and_hf_cache(tmp_path, monkeypatch):
     client, cfg = _client(tmp_path, monkeypatch)
     extra = str(tmp_path / "more-models")

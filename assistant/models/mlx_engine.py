@@ -426,6 +426,12 @@ class MlxEnginePool:
     def loaded_ids(self) -> list[str]:
         return list(self._loaded.keys())
 
+    def set_mem_ceiling_bytes(self, ceiling: int | None) -> None:
+        """Live-update the admission ceiling (GUI Settings edit; the next acquire enforces it, no
+        restart). None / <=0 disables byte-admission. Already-loaded models aren't evicted to fit a
+        newly-lowered ceiling — it bites on the next load, which is when OOM risk actually arrives."""
+        self._ceiling = ceiling if (ceiling and ceiling > 0) else None
+
     def pin(self, model_id: str) -> None:
         self._pinned.add(model_id)
 

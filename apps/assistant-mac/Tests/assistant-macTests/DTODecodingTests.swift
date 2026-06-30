@@ -37,7 +37,8 @@ struct DTODecodingTests {
             """
             {"models_dir":"/m","download_dir":"/d","extra_model_dirs":["/e"],"hf_cache":true,
              "backend_host":"127.0.0.1","backend_port":9981,"model_backend":"mlx",
-             "max_output_tokens":8192,"max_tool_iters":16,"turn_timeout_s":300,"config_path":"/c",
+             "max_output_tokens":8192,"max_tool_iters":16,"turn_timeout_s":300,"mem_ceiling_gb":110,
+             "config_path":"/c",
              "telegram_configured":true,"telegram_token_masked":"1234…wxyz",
              "telegram_allowed_users":[7,8],"telegram_running":true,"telegram_error":null}
             """)
@@ -50,6 +51,7 @@ struct DTODecodingTests {
         #expect(dto.maxOutputTokens == 8192)
         #expect(dto.maxToolIters == 16)
         #expect(dto.turnTimeoutS == 300)
+        #expect(dto.memCeilingGb == 110)
         #expect(dto.telegramConfigured)
         #expect(dto.telegramTokenMasked == "1234…wxyz")
         #expect(dto.telegramAllowedUsers == [7, 8])

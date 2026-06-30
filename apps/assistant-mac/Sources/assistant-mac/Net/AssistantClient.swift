@@ -141,7 +141,7 @@ struct AssistantClient {
         extraModelDirs: [String]? = nil, hfCache: Bool? = nil,
         backendHost: String? = nil, backendPort: Int? = nil,
         modelBackend: String? = nil, maxOutputTokens: Int? = nil,
-        maxToolIters: Int? = nil, turnTimeoutS: Double? = nil,
+        maxToolIters: Int? = nil, turnTimeoutS: Double? = nil, memCeilingGb: Double? = nil,
         telegramToken: String? = nil, telegramAllowedUsers: [Int]? = nil
     ) async throws {
         var body: [String: Any] = [:]
@@ -155,6 +155,7 @@ struct AssistantClient {
         if let maxOutputTokens { body["max_output_tokens"] = maxOutputTokens }
         if let maxToolIters { body["max_tool_iters"] = maxToolIters }
         if let turnTimeoutS { body["turn_timeout_s"] = turnTimeoutS }
+        if let memCeilingGb { body["mem_ceiling_gb"] = memCeilingGb }
         if let telegramToken { body["telegram_token"] = telegramToken }
         if let telegramAllowedUsers { body["telegram_allowed_users"] = telegramAllowedUsers }
         try await sendJSONNoDecode("PUT", "/config", body: body)
