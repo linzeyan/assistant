@@ -13,6 +13,7 @@ def build_registry() -> ToolRegistry:
         coding,
         image_tool,
         memory_tools,
+        plan_tool,
         shell,
         skill_tools,
         video_tool,

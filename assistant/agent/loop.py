@@ -11,6 +11,7 @@ from pathlib import Path
 
 from assistant.tools.approval import ApprovalPolicy, Rule, resource_of
 from assistant.tools.base import ToolContext, ToolResult
+from assistant.tools.plan_tool import normalize_steps
 from assistant.tools.registry import ToolRegistry
 
 from .compaction import CompactionManager
@@ -282,6 +283,19 @@ class AgentLoop:
                         "ok": result.ok,
                         "content": result.content,
                     }
+                    # Plan checklist (SA.3): unlike turn_diff (terminal, one-shot), a plan is
+                    # mutated repeatedly within a turn, so we emit a `plan` event each time the
+                    # agent calls update_plan. The authoritative list lives only here (turn-local)
+                    # and in the event — NOT in session.messages — so a stale checklist isn't
+                    # re-fed every iteration (history bloat / wasted context on small models).
+                    if tc["name"] == "update_plan" and result.ok:
+                        try:
+                            yield {
+                                "type": "plan",
+                                "steps": normalize_steps(tc["arguments"].get("steps")),
+                            }
+                        except ValueError:
+                            pass  # malformed args already surfaced as the tool's error result
                 if trace is not None:
                     trace.steps.append(step)
 

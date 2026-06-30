@@ -87,6 +87,24 @@ struct ChatReducerTests {
         #expect(model.messages[0].diff == "+hi\n")
     }
 
+    @Test func planEventsUpdateOneBubbleInPlace() throws {
+        // SA.3: repeated plan events within a turn must update a single checklist bubble, not
+        // append a new one each time.
+        let model = ChatModel()
+        var current: Int?
+        model.reduce(
+            try event(#"{"type":"plan","steps":[{"title":"read","status":"in_progress"}]}"#),
+            currentAssistant: &current)
+        #expect(model.messages.count == 1)
+        #expect(model.messages[0].role == "plan")
+        #expect(model.messages[0].planSteps?.first?.status == "in_progress")
+        model.reduce(
+            try event(#"{"type":"plan","steps":[{"title":"read","status":"completed"}]}"#),
+            currentAssistant: &current)
+        #expect(model.messages.count == 1)  // same bubble, not a second one
+        #expect(model.messages[0].planSteps?.first?.status == "completed")
+    }
+
     @Test func errorEventAddsToolRowWithDetail() throws {
         let model = ChatModel()
         var current: Int?

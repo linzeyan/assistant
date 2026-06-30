@@ -456,6 +456,26 @@ async def test_send_diff_large_goes_as_document():
     bot.send_message.assert_not_awaited()
 
 
+async def test_render_plan_sends_once_then_edits_in_place():
+    # SA.3: a turn calls update_plan repeatedly; the checklist must edit one message in place
+    # (not spam a new message per update). plan_state carries the message id between calls.
+    bot = Mock()
+    bot.send_message = AsyncMock(return_value=Mock(message_id=777))
+    bot.edit_message_text = AsyncMock()
+    gw = _gateway()
+    plan_state: dict = {}
+    await gw._render_plan(bot, 42, [{"title": "read", "status": "in_progress"}], plan_state)
+    bot.send_message.assert_awaited_once()
+    assert plan_state["message_id"] == 777
+    assert "⬜" not in bot.send_message.await_args.args[1]  # in_progress, not pending icon
+    # Second update edits the same message rather than posting a new one.
+    await gw._render_plan(bot, 42, [{"title": "read", "status": "completed"}], plan_state)
+    bot.send_message.assert_awaited_once()  # still just the one send
+    bot.edit_message_text.assert_awaited_once()
+    assert bot.edit_message_text.await_args.kwargs["message_id"] == 777
+    assert "✅" in bot.edit_message_text.await_args.args[0]
+
+
 async def test_on_cd_sets_per_chat_workspace(tmp_path):
     gw = _gateway()
     update = Mock()
@@ -729,7 +749,7 @@ async def test_handle_event_sends_generated_video(tmp_path):
     bot.send_video = AsyncMock()
     bot.send_photo = AsyncMock()
     await _gateway()._handle_event(
-        _media_result("generate_video", content=str(clip)), Mock(), bot, 42, {}
+        _media_result("generate_video", content=str(clip)), Mock(), bot, 42, {}, {}
     )
     bot.send_video.assert_awaited_once()
     bot.send_photo.assert_not_awaited()  # routed as video, never as an image
@@ -742,7 +762,7 @@ async def test_handle_event_sends_text_to_speech_as_voice(tmp_path):
     bot.send_voice = AsyncMock()
     bot.send_photo = AsyncMock()
     await _gateway()._handle_event(
-        _media_result("text_to_speech", content=str(clip)), Mock(), bot, 42, {}
+        _media_result("text_to_speech", content=str(clip)), Mock(), bot, 42, {}, {}
     )
     bot.send_voice.assert_awaited_once()  # routed as a voice message
     bot.send_photo.assert_not_awaited()
@@ -754,7 +774,7 @@ async def test_handle_event_image_routing_unchanged(tmp_path):
     bot = Mock()
     bot.send_photo = AsyncMock()
     await _gateway()._handle_event(
-        _media_result("generate_image", content=str(img)), Mock(), bot, 42, {}
+        _media_result("generate_image", content=str(img)), Mock(), bot, 42, {}, {}
     )
     bot.send_photo.assert_awaited_once()  # the video addition didn't break images
 
@@ -766,9 +786,11 @@ async def test_handle_event_skips_nonmedia_and_failed_results():
     bot.send_video = AsyncMock()
     bot.send_photo = AsyncMock()
     gw = _gateway()
-    await gw._handle_event(_media_result("web_search", content="snippets"), Mock(), bot, 42, {})
     await gw._handle_event(
-        _media_result("generate_video", ok=False, content="/nope"), Mock(), bot, 42, {}
+        _media_result("web_search", content="snippets"), Mock(), bot, 42, {}, {}
+    )
+    await gw._handle_event(
+        _media_result("generate_video", ok=False, content="/nope"), Mock(), bot, 42, {}, {}
     )
     bot.send_video.assert_not_awaited()
     bot.send_photo.assert_not_awaited()
@@ -786,12 +808,12 @@ async def test_handle_event_captions_video_with_its_prompt(tmp_path):
     await gw._handle_event(
         {"type": "tool_call", "id": "c1", "name": "generate_video",
          "arguments": {"prompt": "a pikachu surfing"}},
-        AsyncMock(), bot, 42, tool_args,
+        AsyncMock(), bot, 42, tool_args, {},
     )
     await gw._handle_event(
         {"type": "tool_result", "id": "c1", "name": "generate_video",
          "ok": True, "content": str(clip)},
-        AsyncMock(), bot, 42, tool_args,
+        AsyncMock(), bot, 42, tool_args, {},
     )
     assert bot.send_video.await_args.kwargs["caption"] == "a pikachu surfing"
 
@@ -801,7 +823,7 @@ async def test_handle_event_heartbeat_renders_generic_working_line():
     editor = AsyncMock()
     await _gateway()._handle_event(
         {"type": "tool_progress", "name": "bash", "fraction": -1.0, "label": "1:05"},
-        editor, Mock(), 42, {},
+        editor, Mock(), 42, {}, {},
     )
     line = editor.progress.await_args.args[0]
     assert "🛠️" in line and "bash" in line and "1:05" in line

@@ -46,6 +46,15 @@ erroring", "it crashed", "this test fails") matches the investigate skill — ca
 skill_view(name) FIRST and follow that workflow step by step, instead of improvising an \
 ad-hoc answer.
 
+Working on multi-step tasks:
+- For a task that needs several steps or tool calls, call update_plan first with a short \
+checklist, then update it as you go (mark a step in_progress before working it, completed when \
+done). Send the whole list each time. Skip the plan for trivial one-step requests.
+- How to work: investigate before you change (find the cause, read the relevant code, don't \
+patch symptoms); finish the whole task rather than stopping half-done; and when a real choice or \
+a destructive/irreversible action comes up, surface it and let the user decide instead of \
+guessing.
+
 Self-improvement:
 - After solving a non-trivial, reusable task, consider saving the procedure as a \
 skill via skill_manage(action="create").

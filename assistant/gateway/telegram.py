@@ -809,6 +809,7 @@ class TelegramGateway:
             )
             answer_parts: list[str] = []
             tool_args: dict[str, dict] = {}  # tool_call id -> args, to caption media results
+            plan_state: dict = {}  # holds the in-place plan message id for this turn (SA.3)
             try:
                 cwd = self._effective_workspace(chat_id)
                 async for ev in self._agent.run(
@@ -816,7 +817,9 @@ class TelegramGateway:
                 ):
                     if ev["type"] == "assistant_delta":
                         answer_parts.append(ev["content"])
-                    await self._handle_event(ev, editor, context.bot, chat_id, tool_args)
+                    await self._handle_event(
+                        ev, editor, context.bot, chat_id, tool_args, plan_state
+                    )
                 await editor.flush(final=True)
             except Exception as exc:
                 log.exception("Telegram turn failed")
@@ -968,7 +971,8 @@ class TelegramGateway:
             pass
 
     async def _handle_event(
-        self, ev: dict, editor: _StreamEditor, bot, chat_id, tool_args: dict
+        self, ev: dict, editor: _StreamEditor, bot, chat_id, tool_args: dict,
+        plan_state: dict,
     ) -> None:
         t = ev["type"]
         if t == "assistant_delta":
@@ -1000,8 +1004,35 @@ class TelegramGateway:
                 await self._send_audio(bot, chat_id, ev["content"])
         elif t == "turn_diff":
             await self._send_diff(bot, chat_id, ev)
+        elif t == "plan":
+            await self._render_plan(bot, chat_id, ev.get("steps") or [], plan_state)
         elif t == "error":
             await editor.set_error(ev["detail"])
+
+    _PLAN_ICON = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}
+
+    async def _render_plan(self, bot, chat_id, steps: list[dict], plan_state: dict) -> None:
+        # Edit one message in place across the turn's repeated update_plan calls, rather than
+        # posting a fresh checklist each time (which would spam the chat). plan_state carries the
+        # message id between events of the same turn.
+        if not steps:
+            return
+        lines = ["📋 Plan"] + [
+            f"{self._PLAN_ICON.get(s.get('status'), '⬜')} {s.get('title', '')}" for s in steps
+        ]
+        text = "\n".join(lines)
+        mid = plan_state.get("message_id")
+        if mid is None:
+            try:
+                msg = await bot.send_message(chat_id, text)
+                plan_state["message_id"] = msg.message_id
+            except Exception:
+                log.exception("failed to send plan")
+        else:
+            try:
+                await bot.edit_message_text(text, chat_id=chat_id, message_id=mid)
+            except Exception:
+                pass  # text unchanged or a transient edit failure — not worth surfacing
 
     async def _send_photo(self, bot, chat_id, path: str, caption: str | None = None) -> None:
         try:

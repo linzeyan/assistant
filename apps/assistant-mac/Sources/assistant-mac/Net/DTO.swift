@@ -281,6 +281,7 @@ struct ChatEvent: Decodable {
     let usage: Usage?   // done: token accounting for the just-finished turn
     let summary: String?  // turn_diff: "N files changed (+x/-y)"
     let diff: String?     // turn_diff: the unified diff of files the turn changed
+    let steps: [PlanStep]?  // plan: the agent's current checklist for this turn (SA.3)
 
     /// Estimated token counts carried by the terminal `done` event (backend tokens.py).
     struct Usage: Decodable {
@@ -294,9 +295,17 @@ struct ChatEvent: Decodable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case type, content, name, ok, detail, token, usage, summary, diff
+        case type, content, name, ok, detail, token, usage, summary, diff, steps
         case sessionId = "session_id"
     }
+}
+
+/// One item in the agent's per-turn plan checklist (`plan` event). `status` is
+/// "pending" | "in_progress" | "completed".
+struct PlanStep: Decodable, Identifiable {
+    let title: String
+    let status: String
+    var id: String { title }
 }
 
 // --- sessions (persisted conversations, S1) ---

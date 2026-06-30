@@ -16,6 +16,9 @@ final class ChatModel: ObservableObject {
     /// Shown in the Chat header so the user can watch the window fill before compaction.
     @Published private(set) var contextTokens: Int?
     private var streamTask: Task<Void, Never>?
+    /// Index of this turn's plan bubble, so repeated `plan` events update it in place rather
+    /// than appending a new checklist each time. Reset at the start of every turn (SA.3).
+    private var planBubbleIndex: Int?
 
     func send(model: String, client: AssistantClient,
               onFinish: @escaping @MainActor () async -> Void = {}) {
@@ -91,6 +94,7 @@ final class ChatModel: ObservableObject {
 
     private func stream(text: String, model: String, client: AssistantClient) async {
         var currentAssistant: Int? = nil
+        planBubbleIndex = nil  // a fresh turn starts a fresh plan bubble
         do {
             for try await event in client.chat(message: text, model: model, sessionId: currentSessionId) {
                 try Task.checkCancellation()
@@ -147,6 +151,17 @@ final class ChatModel: ObservableObject {
                 role: "diff",
                 text: "✏️ \(event.summary ?? "files changed")",
                 diff: event.diff))
+        case "plan":
+            // Update this turn's checklist in place (one bubble, ticked off live) rather than
+            // appending a new one per update_plan call.
+            currentAssistant = nil
+            let steps = event.steps ?? []
+            if let idx = planBubbleIndex, messages.indices.contains(idx) {
+                messages[idx].planSteps = steps
+            } else {
+                messages.append(ChatMessage(role: "plan", text: "", planSteps: steps))
+                planBubbleIndex = messages.count - 1
+            }
         case "error":
             messages.append(ChatMessage(role: "tool", text: "⚠️ \(event.detail ?? "error")"))
         case "done":

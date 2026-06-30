@@ -4,11 +4,12 @@ import SwiftUI
 
 struct ChatMessage: Identifiable {
     let id = UUID()
-    let role: String  // "user" | "assistant" | "tool" | "media" | "diff"
+    let role: String  // "user" | "assistant" | "tool" | "media" | "diff" | "plan"
     var text: String
     var mediaKind: String? = nil  // "image" | "video"
     var mediaPath: String? = nil
     var diff: String? = nil  // role "diff": the unified diff body, shown collapsible
+    var planSteps: [PlanStep]? = nil  // role "plan": the agent's per-turn checklist (SA.3)
 }
 
 /// A tool call paused awaiting the user's Approve/Deny.
@@ -230,6 +231,8 @@ private struct MessageRow: View {
             MediaView(kind: kind, path: path)
         } else if message.role == "diff" {
             DiffBubble(summary: message.text, diff: message.diff ?? "", background: background)
+        } else if message.role == "plan" {
+            PlanBubble(steps: message.planSteps ?? [], background: background)
         } else if message.role == "assistant" {
             AssistantBubble(text: message.text, background: background, isStreaming: isStreaming)
         } else {
@@ -244,9 +247,46 @@ private struct MessageRow: View {
     private var background: Color {
         switch message.role {
         case "user": return Color.accentColor.opacity(0.18)
-        case "tool", "diff": return Color.secondary.opacity(0.12)
+        case "tool", "diff", "plan": return Color.secondary.opacity(0.12)
         default: return Color.gray.opacity(0.12)
         }
+    }
+}
+
+/// The agent's per-turn checklist (the `plan` event), updated in place as the agent ticks steps
+/// off. A completed step is struck through; the one in progress is bold.
+private struct PlanBubble: View {
+    let steps: [PlanStep]
+    let background: Color
+
+    private func icon(_ status: String) -> String {
+        switch status {
+        case "completed": return "checkmark.circle.fill"
+        case "in_progress": return "arrow.triangle.2.circlepath"
+        default: return "circle"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("📋 Plan").font(.callout.weight(.semibold))
+            ForEach(steps) { step in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: icon(step.status))
+                        .foregroundStyle(step.status == "completed" ? .green : .secondary)
+                        .font(.caption)
+                    Text(step.title)
+                        .font(.callout)
+                        .strikethrough(step.status == "completed")
+                        .fontWeight(step.status == "in_progress" ? .semibold : .regular)
+                        .foregroundStyle(step.status == "completed" ? .secondary : .primary)
+                }
+            }
+        }
+        .padding(10)
+        .background(background)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

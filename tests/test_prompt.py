@@ -41,3 +41,12 @@ def test_system_prompt_has_skill_use_policy():
     p = build_system_prompt("(skills index)")
     assert "Using skills" in p
     assert "skill_view" in p
+
+
+def test_system_prompt_has_plan_and_ethos():
+    # SA.3: static guidance to use the update_plan checklist for multi-step tasks plus the ETHOS
+    # principles (investigate-first / finish / let the user decide). Both are static, so they
+    # belong in the cacheable prefix.
+    p = build_system_prompt("(skills index)")
+    assert "update_plan" in p
+    assert "multi-step" in p

@@ -461,3 +461,31 @@ async def test_max_iters_honored_and_configurable(tmp_path):
     assert sum(e["type"] == "tool_call" for e in events) == 12  # ran the full raised budget
     err = next(e for e in events if e["type"] == "error")
     assert "12" in err["detail"]  # and surfaced the ceiling, not a silent stop
+
+
+async def test_update_plan_emits_plan_event_with_normalized_steps(tmp_path):
+    # WHY (SA.3): the agent's checklist must reach the UI as a structured `plan` event — but the
+    # full list must NOT be persisted into history (only the tool's short ack), so a stale
+    # checklist isn't re-fed every iteration (token bloat on small models).
+    llm = FakeLLM([
+        [{"type": "tool_calls", "tool_calls": [{
+            "id": "p1", "name": "update_plan",
+            "arguments": {"steps": [
+                {"title": "read the file", "status": "completed"},
+                {"title": "  ", "status": "pending"},  # empty title is dropped
+                {"title": "fix the bug", "status": "weird"},  # bad status → pending
+            ]},
+        }]}],
+        [{"type": "text", "content": "done"}],
+    ])
+    session = Session(id="plan1")
+    events = await _collect(_loop(llm, tmp_path, approval_required=False).run(session, "go", "m"))
+    plan = next(e for e in events if e["type"] == "plan")
+    assert plan["steps"] == [
+        {"title": "read the file", "status": "completed"},
+        {"title": "fix the bug", "status": "pending"},
+    ]
+    # History carries only the short ack, never the full checklist (no step titles leak in).
+    tool_msgs = [m for m in session.messages if m.get("role") == "tool"]
+    assert tool_msgs and "plan updated" in tool_msgs[-1]["content"]
+    assert "read the file" not in tool_msgs[-1]["content"]
