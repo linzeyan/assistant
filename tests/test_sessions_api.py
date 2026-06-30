@@ -56,3 +56,32 @@ def test_compact_nothing_old_enough_reports_no_change(tmp_path):
         sid = client.post("/sessions", json={"model": "m"}).json()["id"]
         body = client.post(f"/sessions/{sid}/compact").json()
         assert body["compacted"] is False and "context_tokens" in body
+
+
+def test_search_endpoint_finds_session_and_returns_snippet(tmp_path):
+    # F/S14: GET /sessions/search is matched as a literal path (declared before /{session_id}),
+    # not swallowed by the dynamic route, and returns matching sessions with a snippet.
+    with _client(tmp_path) as client:
+        store = client.app.state.sessions
+        s = store.create(model="m")
+        s.add_user("Investigate the flaky telegram heartbeat")
+        store.checkpoint(s)
+
+        r = client.get("/sessions/search", params={"q": "heartbeat"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["query"] == "heartbeat" and body["count"] == 1
+        assert body["results"][0]["id"] == s.id
+        assert "heartbeat" in body["results"][0]["snippet"].lower()
+
+        # A blank query is well-formed and simply returns nothing (not a 422, not everything).
+        empty = client.get("/sessions/search", params={"q": ""})
+        assert empty.status_code == 200 and empty.json()["count"] == 0
+
+
+def test_search_path_not_shadowed_by_dynamic_session_route(tmp_path):
+    # Guards the route-ordering gotcha: /sessions/search must not resolve to get_session("search").
+    with _client(tmp_path) as client:
+        r = client.get("/sessions/search", params={"q": "anything"})
+        assert r.status_code == 200  # would be 404 ("unknown session: search") if shadowed
+        assert "results" in r.json()

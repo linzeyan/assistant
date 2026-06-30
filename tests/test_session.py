@@ -68,3 +68,51 @@ def test_corrupt_session_file_is_skipped(tmp_path):
     store = SessionStore(tmp_path)
     assert store.get("bad") is None  # tolerated, not raised
     assert store.list_sessions() == []
+
+
+def test_search_sessions_substring_and_snippet(tmp_path):
+    # F/S14: cross-session search finds a session by message content and returns a snippet showing
+    # why it matched. Case-insensitive substring (not tokenised), so it works mid-word too.
+    store = SessionStore(tmp_path)
+    a = store.create(model="m")
+    a.add_user("How do I configure the MLX backend timeout?")
+    a.add_assistant("Set turn_timeout_s in config.")
+    store.checkpoint(a)
+    b = store.create(model="m")
+    b.add_user("What's the capital of France?")
+    store.checkpoint(b)
+
+    hits = store.search_sessions("timeout")
+    assert [h["id"] for h in hits] == [a.id]
+    assert "timeout" in hits[0]["snippet"].lower()
+    assert store.search_sessions("france")[0]["id"] == b.id
+    assert store.search_sessions("nonexistent-term") == []
+    assert store.search_sessions("   ") == []  # blank query → no results, not everything
+
+
+def test_search_sessions_matches_cjk_without_word_boundaries(tmp_path):
+    # S7: CJK has no whitespace word boundaries, so matching must be substring, not tokenised.
+    store = SessionStore(tmp_path)
+    s = store.create(model="m")
+    s.add_user("請幫我設定台北的天氣提醒")
+    store.checkpoint(s)
+    hits = store.search_sessions("台北")  # a substring inside a longer unspaced run
+    assert [h["id"] for h in hits] == [s.id]
+    assert "台北" in hits[0]["snippet"]
+
+
+def test_search_sessions_reads_uncheckpointed_in_memory_session(tmp_path):
+    # In-memory state wins over disk (mirrors list_sessions), so a turn not yet persisted is found.
+    store = SessionStore(tmp_path)
+    s = store.create(model="m")  # persisted empty
+    s.add_user("a unique phrase only in memory")  # NOT checkpointed
+    assert [h["id"] for h in store.search_sessions("unique phrase")] == [s.id]
+
+
+def test_search_sessions_title_match(tmp_path):
+    store = SessionStore(tmp_path)
+    s = store.create(model="m")
+    s.title = "Quarterly planning notes"
+    s.add_user("unrelated body")
+    store.checkpoint(s)
+    assert store.search_sessions("quarterly")[0]["snippet"] == "Quarterly planning notes"

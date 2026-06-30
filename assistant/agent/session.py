@@ -16,6 +16,28 @@ def _now() -> float:
     return time.time()
 
 
+def _search_snippet(session: "Session", q: str) -> str | None:
+    """First place ``q`` (already lowercased) occurs in a session: its title, or a ~80-char window
+    around the hit in a user/assistant message. Returns None when nothing matches. Whitespace is
+    collapsed so the snippet renders on one line; ellipses mark a mid-message clip."""
+    title = session.title or session.derived_title()
+    if q in title.lower():
+        return title[:120]
+    for m in session.messages:
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        content = m.get("content")
+        if not isinstance(content, str):
+            continue
+        i = content.lower().find(q)
+        if i != -1:
+            start = max(0, i - 40)
+            end = min(len(content), i + len(q) + 40)
+            body = " ".join(content[start:end].split())
+            return ("…" if start else "") + body + ("…" if end < len(content) else "")
+    return None
+
+
 @dataclass
 class Session:
     """A single conversation: the OpenAI-style message list sent to the model each turn,
@@ -186,6 +208,40 @@ class SessionStore:
         return sorted(
             summaries.values(), key=lambda d: d["last_accessed_at"], reverse=True
         )
+
+    def search_sessions(self, query: str, limit: int = 20) -> list[dict]:
+        """Full-text search across every session (in-memory + on-disk), newest-match first (F/S14).
+
+        Match is lowercase **substring** containment, not tokenised — the same contract as memory
+        keyword search, so it stays correct for CJK, which has no whitespace word boundaries (S7).
+        Each hit carries the session summary plus the first matching snippet, so the GUI can show
+        *why* a conversation matched without loading the whole thing. Mirrors ``list_sessions``'
+        in-memory-wins-over-disk merge so a freshly-edited (uncheckpointed) session searches live."""
+        q = query.strip().lower()
+        if not q:
+            return []
+        results: list[dict] = []
+        seen: set[str] = set()
+
+        def _scan(session: Session) -> None:
+            if session.id in seen:
+                return
+            seen.add(session.id)
+            snippet = _search_snippet(session, q)
+            if snippet is not None:
+                results.append({**session.summary(), "snippet": snippet})
+
+        for s in list(self._sessions.values()):
+            _scan(s)
+        if self._dir is not None:
+            for path in self._dir.glob("*.json"):
+                if path.stem in seen:
+                    continue
+                data = self._read_json(path)
+                if data is not None:
+                    _scan(Session.from_dict(data))
+        results.sort(key=lambda d: d["last_accessed_at"], reverse=True)
+        return results[:limit]
 
     # --- write ---
 

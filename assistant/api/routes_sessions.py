@@ -39,6 +39,14 @@ async def create_session(req: CreateSessionRequest, request: Request):
     return session.summary()
 
 
+@router.get("/sessions/search")
+async def search_sessions(request: Request, q: str = "", limit: int = 20):
+    """Cross-session full-text search (F/S14). Declared BEFORE ``/sessions/{session_id}`` so the
+    literal ``search`` path isn't captured as a session id by the dynamic route."""
+    results = request.app.state.sessions.search_sessions(q, limit=max(1, min(limit, 100)))
+    return {"query": q, "count": len(results), "results": results}
+
+
 @router.get("/sessions/{session_id}")
 async def get_session(session_id: str, request: Request):
     session = request.app.state.sessions.get(session_id)
