@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 from assistant.gateway.approval import TelegramApprover
+from assistant.model_traits import weak_at_tools
 
 try:
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -42,17 +43,9 @@ log = logging.getLogger("assistant.telegram")
 # from auto-selecting a video / embedding model that can't serve a chat turn.
 _CHATTABLE_KINDS = ("llm", "vlm")
 
-# Reasoning/instruct models that, in practice, don't emit agentic tool calls — they describe
-# what they'd do and fabricate success (observed live: DeepSeek-R1-Distill and Qwen3-30B-A3B
-# both ran "git diff" with ZERO tool calls). Flagged in the /models picker so the user doesn't
-# pick one for coding. Substring match is deliberately narrow: "qwen3-30b-a3b" matches the
-# thinking variant but NOT "qwen3-coder-30b-a3b" (the tool-caller to prefer).
-_WEAK_TOOL_MARKERS = ("deepseek-r1", "r1-distill", "qwq", "qwen3-30b-a3b", "thinking")
-
-
-def _weak_at_tools(model_id: str) -> bool:
-    low = model_id.lower()
-    return any(m in low for m in _WEAK_TOOL_MARKERS)
+# The weak-at-tools heuristic lives in model_traits (shared with the /models API + GUI picker),
+# so the ⚠️ flag is identical everywhere. Aliased to the module-private name the picker uses.
+_weak_at_tools = weak_at_tools
 
 
 # --- Telegram HTML rendering (think collapse + a small markdown subset) ---

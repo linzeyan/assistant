@@ -4,6 +4,8 @@ from dataclasses import asdict
 
 from fastapi import APIRouter, HTTPException, Request
 
+from assistant.model_traits import weak_at_tools
+
 router = APIRouter(tags=["models"])
 
 
@@ -15,8 +17,10 @@ def _svc(request: Request):
 async def list_models(request: Request):
     svc = _svc(request)
     models = await svc.list_models()
+    # weak_at_tools is a presentation trait (not part of the service's ModelInfo), computed here so
+    # the GUI picker can render the same ⚠️ as the Telegram /models picker from one source of truth.
     return {
-        "models": [asdict(m) for m in models],
+        "models": [{**asdict(m), "weak_at_tools": weak_at_tools(m.id)} for m in models],
         "reachable": await svc.reachable(),
     }
 

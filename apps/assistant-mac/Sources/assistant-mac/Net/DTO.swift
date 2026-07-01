@@ -31,10 +31,14 @@ struct ModelDTO: Decodable, Identifiable, Hashable {
     let loaded: Bool
     let source: String?
     let sizeBytes: Int?
+    /// Weak at agentic tool calls (reasoning/thinking models) — rendered as ⚠️ in the picker so
+    /// the user doesn't pick one for coding. Optional so an older backend without the field decodes.
+    let weakAtTools: Bool?
 
     enum CodingKeys: String, CodingKey {
         case id, type, loaded, source
         case sizeBytes = "size_bytes"
+        case weakAtTools = "weak_at_tools"
     }
 }
 

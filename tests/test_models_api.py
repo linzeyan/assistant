@@ -47,3 +47,14 @@ def test_delete_unknown_model_is_400_not_500(tmp_path):
     with TestClient(create_app(Settings(models_dir=tmp_path))) as client:
         r = client.delete("/models/nope")
     assert r.status_code == 400, r.text
+
+
+def test_models_list_flags_weak_at_tools(tmp_path):
+    # The GUI picker renders ⚠️ from this per-model flag (one source of truth with Telegram's
+    # /models picker). A thinking model is flagged; its Coder sibling is not.
+    _make_model(tmp_path / "Qwen3-30B-A3B-8bit")
+    _make_model(tmp_path / "Qwen3-Coder-30B-A3B-Instruct-8bit")
+    with TestClient(create_app(Settings(models_dir=tmp_path))) as client:
+        models = {m["id"]: m for m in client.get("/models").json()["models"]}
+    assert models["Qwen3-30B-A3B-8bit"]["weak_at_tools"] is True
+    assert models["Qwen3-Coder-30B-A3B-Instruct-8bit"]["weak_at_tools"] is False

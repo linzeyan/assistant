@@ -48,10 +48,13 @@ struct ChatScreen: View {
                     Text("no models").tag("")
                 }
                 ForEach(controller.models) { model in
-                    Text(model.id).tag(model.id)
+                    // ⚠️ marks models weak at tool calls (parity with the Telegram /models picker),
+                    // so the user doesn't pick a thinking model for coding.
+                    Text(model.weakAtTools == true ? "⚠️ \(model.id)" : model.id).tag(model.id)
                 }
             }
             .frame(maxWidth: 320)
+            .help("⚠️ = weak at tool calls; for coding pick a *-Coder model")
 
             Spacer()
 

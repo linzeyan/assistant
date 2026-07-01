@@ -14,7 +14,8 @@ struct DTODecodingTests {
         let dto = try decode(
             ModelsDTO.self,
             """
-            {"models":[{"id":"org/m","type":"llm","loaded":true,"source":"hf_cache","size_bytes":1024}],
+            {"models":[{"id":"org/m","type":"llm","loaded":true,"source":"hf_cache",
+             "size_bytes":1024,"weak_at_tools":true}],
              "reachable":true}
             """)
         #expect(dto.reachable)
@@ -22,6 +23,7 @@ struct DTODecodingTests {
         #expect(dto.models[0].id == "org/m")
         #expect(dto.models[0].source == "hf_cache")
         #expect(dto.models[0].sizeBytes == 1024)
+        #expect(dto.models[0].weakAtTools == true)  // ⚠️ flag drives the picker marker
     }
 
     @Test func modelDTOToleratesMissingOptionals() throws {
@@ -29,6 +31,7 @@ struct DTODecodingTests {
         #expect(dto.type == nil)
         #expect(dto.sizeBytes == nil)
         #expect(dto.loaded == false)
+        #expect(dto.weakAtTools == nil)  // older backend without the field still decodes
     }
 
     @Test func configDTOMapsAllSnakeCaseKeys() throws {
