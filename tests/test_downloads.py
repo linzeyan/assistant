@@ -202,3 +202,56 @@ async def test_subprocess_runner_passes_max_workers_and_merged_env(tmp_path, mon
     assert captured["args"][3] == "org/m"  # repo_id positional preserved
     assert captured["env"]["HF_HUB_DISABLE_XET"] == "1"  # extra tunable applied
     assert "PATH" in captured["env"]  # merged onto parent env, not a bare replacement
+
+
+async def test_downloads_run_one_at_a_time(tmp_path):
+    # N52: model files are large, so only ONE download transfers at a time; others wait "queued".
+    release = asyncio.Event()
+    started: list[str] = []
+
+    async def runner(repo_id, target, state, cancel):
+        started.append(repo_id)
+        if repo_id == "org/first":
+            await release.wait()  # hold the single slot open
+
+    mgr = _manager(tmp_path, runner=runner)
+    mgr.start("org/first")
+    mgr.start("org/second")
+    t1, t2 = mgr._tasks["org/first"], mgr._tasks["org/second"]
+    await asyncio.sleep(0.05)  # let both tasks reach the gate
+
+    snap = {d["repo_id"]: d["status"] for d in mgr.snapshot()}
+    assert snap["org/first"] == "downloading"
+    assert snap["org/second"] == "queued"  # waiting its turn
+    assert started == ["org/first"]  # the second's runner has NOT started yet
+
+    release.set()  # first finishes → the queued one proceeds
+    await asyncio.gather(t1, t2)
+    assert started == ["org/first", "org/second"]  # ran sequentially
+    assert all(d["status"] == "done" for d in mgr.snapshot())
+
+
+async def test_cancel_a_queued_download_takes_effect_immediately(tmp_path):
+    # A queued download can be cancelled without waiting for the active one to finish.
+    release = asyncio.Event()
+
+    async def runner(repo_id, target, state, cancel):
+        if repo_id == "org/first":
+            await release.wait()
+
+    mgr = _manager(tmp_path, runner=runner)
+    mgr.start("org/first")
+    mgr.start("org/second")
+    t1 = mgr._tasks["org/first"]
+    await asyncio.sleep(0.05)
+    assert {d["repo_id"]: d["status"] for d in mgr.snapshot()}["org/second"] == "queued"
+
+    mgr.cancel("org/second")  # cancel while still queued
+    await asyncio.sleep(0.02)
+    statuses = {d["repo_id"]: d["status"] for d in mgr.snapshot()}
+    assert statuses["org/second"] == "cancelled"  # took effect without waiting its turn
+    assert statuses["org/first"] == "downloading"  # the active download is unaffected
+
+    release.set()
+    await t1
+    assert {d["repo_id"]: d["status"] for d in mgr.snapshot()}["org/first"] == "done"

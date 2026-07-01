@@ -109,6 +109,10 @@ class DownloadManager:
         self._states: dict[str, DownloadState] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._cancels: dict[str, asyncio.Event] = {}
+        # Single-active gate (N52): model files are large, so exactly ONE download transfers at a
+        # time — the rest wait their turn in "queued". Constructed here (no running loop needed on
+        # 3.10+); it binds to the loop on first acquire.
+        self._gate = asyncio.Semaphore(1)
         self._load()
 
     # --- public API ---
@@ -145,7 +149,8 @@ class DownloadManager:
         state = self._states[repo_id]  # KeyError -> 404 at the route
         cancel = self._cancels.get(repo_id)
         if cancel is not None:
-            cancel.set()  # the runner kills the subprocess immediately
+            cancel.set()  # a downloading item: the runner kills its subprocess immediately
+        self._cancel_queued_task(repo_id, state)
         return state.to_public()
 
     def remove(self, repo_id: str) -> None:
@@ -154,11 +159,23 @@ class DownloadManager:
         orphaned task then unwinds against a detached state and won't re-add the entry."""
         if repo_id not in self._states:
             raise KeyError(repo_id)
+        state = self._states[repo_id]
         cancel = self._cancels.get(repo_id)
         if cancel is not None:
             cancel.set()
+        self._cancel_queued_task(repo_id, state)
         self._states.pop(repo_id, None)
         self._persist()
+
+    def _cancel_queued_task(self, repo_id: str, state: DownloadState) -> None:
+        # A still-queued download is blocked on the gate; the cancel event won't wake it (no
+        # subprocess exists yet), so cancel its task — it unwinds to "cancelled" without waiting for
+        # its turn. Safe: status flips to "downloading" synchronously before any subprocess starts,
+        # so a "queued" status guarantees there's nothing to orphan.
+        if state.status == "queued":
+            task = self._tasks.get(repo_id)
+            if task is not None:
+                task.cancel()
 
     async def resume_incomplete(self) -> None:
         """Re-spawn downloads that were mid-flight when the app last closed (the hub continues
@@ -180,24 +197,35 @@ class DownloadManager:
 
     async def _download_one(self, repo_id: str) -> None:
         state = self._states[repo_id]
-        state.status = "downloading"
         state.error = None
+        state.status = "queued"  # normalized so resumed/retried entries also wait at the gate
         cancel = asyncio.Event()
         self._cancels[repo_id] = cancel
         self._persist()
         try:
-            state.total_bytes = await asyncio.to_thread(self._size_fn, repo_id)
-        except Exception as exc:  # sizing is best-effort; bar falls back to bytes-only
-            log.warning("could not size %s: %s", repo_id, exc)
-            state.total_bytes = 0
-        try:
-            await self._runner(repo_id, self._target_dir / repo_id, state, cancel)
-            if cancel.is_set():
-                state.status = "cancelled"
-            else:
-                state.status = "done"
-                if state.total_bytes:
-                    state.downloaded_bytes = state.total_bytes
+            # Wait our turn: only one download holds the gate at a time. A still-queued download is
+            # blocked HERE, so cancel()/remove() cancels its task to unblock it without waiting.
+            async with self._gate:
+                if cancel.is_set():  # cancelled/removed while queued
+                    state.status = "cancelled"
+                    return
+                # From here on a subprocess may exist; flip to "downloading" (and persist) BEFORE
+                # the runner starts so cancel() sees "downloading" and kills the subprocess via the
+                # event rather than cancelling the task and orphaning it.
+                state.status = "downloading"
+                self._persist()
+                try:
+                    state.total_bytes = await asyncio.to_thread(self._size_fn, repo_id)
+                except Exception as exc:  # sizing is best-effort; bar falls back to bytes-only
+                    log.warning("could not size %s: %s", repo_id, exc)
+                    state.total_bytes = 0
+                await self._runner(repo_id, self._target_dir / repo_id, state, cancel)
+                if cancel.is_set():
+                    state.status = "cancelled"
+                else:
+                    state.status = "done"
+                    if state.total_bytes:
+                        state.downloaded_bytes = state.total_bytes
         except asyncio.CancelledError:
             state.status = "cancelled"
             raise
