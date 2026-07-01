@@ -112,6 +112,7 @@ class FusionEngine:
         panel, judge = list(self._panel), self._judge
         n = len(panel)
         candidates: list[tuple[str, str]] = []
+        failures: list[tuple[str, str]] = []
         for i, model in enumerate(panel, 1):
             yield {
                 "type": "tool_progress",
@@ -119,11 +120,27 @@ class FusionEngine:
                 "fraction": (i - 1) / (n + 1),
                 "label": f"panel {i}/{n}: {model}",
             }
-            parts: list[str] = []
-            async for ev in service.stream_chat(messages, model, max_tokens=max_tokens):
-                if ev.get("type") == "text":
-                    parts.append(ev["content"])
-            candidates.append((model, "".join(parts)))
+            # A panel model that won't load (e.g. an arch too new for the installed mlx-lm) must
+            # not sink the whole turn — skip it, keep its slot's progress, and let the judge work
+            # with the survivors. Only a fully empty panel is fatal.
+            try:
+                parts: list[str] = []
+                async for ev in service.stream_chat(messages, model, max_tokens=max_tokens):
+                    if ev.get("type") == "text":
+                        parts.append(ev["content"])
+                candidates.append((model, "".join(parts)))
+            except Exception as e:  # noqa: BLE001 — any per-model failure is isolated here
+                log.warning("fusion panel model %s failed, skipping: %s", model, e)
+                failures.append((model, str(e)))
+                yield {
+                    "type": "tool_progress",
+                    "name": "fusion",
+                    "fraction": i / (n + 1),
+                    "label": f"skipped {model} (failed to load)",
+                }
+        if not candidates:
+            detail = "; ".join(f"{m}: {e}" for m, e in failures) or "no panel models configured"
+            raise RuntimeError(f"Fusion: every panel model failed — {detail}")
         yield {
             "type": "tool_progress",
             "name": "fusion",

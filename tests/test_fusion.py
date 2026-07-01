@@ -35,6 +35,47 @@ async def test_fusion_answer_runs_panel_then_judge(tmp_path):
     assert "answer-from-a" in judge_prompt and "answer-from-b" in judge_prompt
 
 
+class _FlakyService:
+    """Echoes an answer per model, but raises for any model id in ``broken`` — mimics a panel
+    model whose architecture the installed mlx-lm can't load."""
+
+    def __init__(self, broken: set[str]):
+        self.broken = broken
+        self.calls: list[str] = []
+
+    async def stream_chat(self, messages, model, tools=None, **params):
+        self.calls.append(model)
+        if model in self.broken:
+            raise RuntimeError(f"Model type {model} not supported")
+        yield {"type": "text", "content": f"answer-from-{model}"}
+
+
+async def test_fusion_skips_a_failing_panel_model(tmp_path):
+    # A single unloadable panel model must not sink the whole turn — this is the real 500 we hit:
+    # one bad model raising aborted fusion entirely. The judge still runs over the survivors.
+    eng = FusionEngine(tmp_path / "f.json", enabled=True, panel=["a", "bad", "c"], judge="j")
+    svc = _FlakyService(broken={"bad"})
+    events = [ev async for ev in eng.answer(svc, [{"role": "user", "content": "Q"}])]
+
+    # Every model was attempted, then the judge still ran despite "bad" raising.
+    assert svc.calls == ["a", "bad", "c", "j"]
+    text = "".join(e["content"] for e in events if e["type"] == "text")
+    assert text == "answer-from-j"
+    # The skip surfaces as a progress tick so the user isn't left wondering.
+    assert any(
+        "skipped bad" in e.get("label", "") for e in events if e["type"] == "tool_progress"
+    )
+
+
+async def test_fusion_all_panel_failed_is_a_loud_error(tmp_path):
+    import pytest
+
+    eng = FusionEngine(tmp_path / "f.json", enabled=True, panel=["x", "y"], judge="j")
+    svc = _FlakyService(broken={"x", "y"})
+    with pytest.raises(RuntimeError, match="every panel model failed"):
+        [ev async for ev in eng.answer(svc, [{"role": "user", "content": "Q"}])]
+
+
 def test_fusion_enabled_requires_panel_and_judge(tmp_path):
     p = tmp_path / "f.json"
     assert not FusionEngine(p, enabled=True, panel=[], judge=None).enabled
