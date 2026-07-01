@@ -29,6 +29,26 @@ def test_empty_update_clears_overrides(tmp_path):
     assert PerModelStore(p).get("m") == {}  # cleared on disk too
 
 
+def test_type_override_is_stored_and_validated(tmp_path):
+    s = PerModelStore(tmp_path / "p.json")
+    s.set("m", {"type": "llm"})
+    assert s.kind_override("m") == "llm"
+    # An unrecognised / "auto" type clears the override (falls back to auto-detection).
+    s.set("m", {"type": "auto"})
+    assert s.kind_override("m") is None
+    s.set("m", {"type": "bogus"})
+    assert s.kind_override("m") is None
+
+
+def test_type_override_is_kept_out_of_generation_params(tmp_path):
+    # The type override must NOT leak into sampling kwargs — a stray `type` would break generation.
+    s = PerModelStore(tmp_path / "p.json")
+    s.set("m", {"temperature": 0.5, "type": "vlm"})
+    assert s.generation("m") == {"temperature": 0.5}  # type excluded
+    assert s.kind_override("m") == "vlm"
+    assert s.get("m") == {"temperature": 0.5, "type": "vlm"}  # full view keeps both
+
+
 def test_sampler_kwargs_empty_when_no_overrides():
     # No overrides → no sampler kwarg (mlx-lm keeps its own default), and crucially no mlx-lm
     # import is forced, so the helper is safe to call on a machine without mlx installed.

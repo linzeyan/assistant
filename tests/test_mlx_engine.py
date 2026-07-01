@@ -21,7 +21,7 @@ class FakeEngine:
 def _pool(max_loaded: int, pinned=None):
     calls: list[str] = []
 
-    def loader(path: Path) -> FakeEngine:
+    def loader(path: Path, forced_kind: str | None = None) -> FakeEngine:
         calls.append(str(path))
         return FakeEngine(str(path))
 

@@ -28,13 +28,64 @@ def _make_model(tmp_path: Path, name: str, *, arch: str = "LlamaForCausalLM") ->
 
 
 def _service(tmp_path: Path, tokens=("Hel", "lo")):
-    pool = MlxEnginePool(max_loaded=2, loader=lambda path: FakeEngine(tokens))
+    pool = MlxEnginePool(max_loaded=2, loader=lambda path, _k=None: FakeEngine(tokens))
     return MlxModelService(
         models_dir=tmp_path,
         include_hf_cache=False,
         pool=pool,
         available_override=True,
     )
+
+
+async def test_type_override_reroutes_the_loader(tmp_path):
+    # The per-model type override must reach the loader as forced_kind, so a checkpoint we'd
+    # auto-detect one way can be forced to load the other way (the gemma-as-VLM crash fix).
+    from assistant.models.per_model_store import PerModelStore
+
+    _make_model(tmp_path, "qwen")  # auto-detects as an llm
+    seen: list[str | None] = []
+
+    def recording_loader(path, forced_kind=None):
+        seen.append(forced_kind)
+        return FakeEngine(("hi",))
+
+    store = PerModelStore(tmp_path / "pm.json")
+    store.set("qwen", {"type": "vlm"})  # force it the other way
+    svc = MlxModelService(
+        models_dir=tmp_path,
+        include_hf_cache=False,
+        pool=MlxEnginePool(max_loaded=2, loader=recording_loader),
+        per_model=store,
+        available_override=True,
+    )
+    await svc.start()
+    await svc.load("qwen")
+    assert seen == ["vlm"]  # the override, not the auto-detected "llm", reached the loader
+
+
+async def test_type_override_shows_in_list_models(tmp_path):
+    from assistant.models.per_model_store import PerModelStore
+
+    _make_model(tmp_path, "qwen")
+    store = PerModelStore(tmp_path / "pm.json")
+    store.set("qwen", {"type": "vlm"})
+    svc = MlxModelService(
+        models_dir=tmp_path,
+        include_hf_cache=False,
+        pool=MlxEnginePool(max_loaded=2, loader=lambda p, _k=None: FakeEngine(("hi",))),
+        per_model=store,
+        available_override=True,
+    )
+    await svc.start()
+    got = {m.id: m.type for m in await svc.list_models()}
+    assert got["qwen"] == "vlm"  # reported under the overridden kind, not the detected one
+
+
+def test_ram_ceiling_defaults_to_physical_memory(tmp_path):
+    # "Check the resource fits before loading": with no explicit ceiling, the pool still gets one
+    # derived from physical RAM, so an oversized model fails loud instead of OOM-crashing.
+    svc = MlxModelService(models_dir=tmp_path, include_hf_cache=False, available_override=True)
+    assert svc._pool._ceiling is not None and svc._pool._ceiling > 0
 
 
 async def test_unavailable_without_mlx(tmp_path):
@@ -105,7 +156,9 @@ async def test_unload_frees_engine_not_pinned_by_stream_frame(tmp_path):
     _make_model(tmp_path, "qwen")
     engine = FakeEngine(("hi",))
     ref = weakref.ref(engine)
-    pool = MlxEnginePool(max_loaded=1, loader=lambda _path: engine)
+    # The loader closes over `engine` and only runs before the `del engine` below; ruff sees the
+    # later del and flags it as maybe-unbound (false positive for this ordering).
+    pool = MlxEnginePool(max_loaded=1, loader=lambda _path, _k=None: engine)  # noqa: F821
     svc = MlxModelService(
         models_dir=tmp_path, include_hf_cache=False, pool=pool, available_override=True
     )
@@ -266,7 +319,7 @@ async def test_pool_evicts_to_stay_under_memory_ceiling(tmp_path, monkeypatch):
     a = _sized_model(tmp_path, "a", 100)
     b = _sized_model(tmp_path, "b", 100)
     c = _sized_model(tmp_path, "c", 100)
-    pool = MlxEnginePool(max_loaded=10, mem_ceiling_bytes=250, loader=lambda _p: object())
+    pool = MlxEnginePool(max_loaded=10, mem_ceiling_bytes=250, loader=lambda _p, _k=None: object())
     await pool.acquire("a", a)
     await pool.acquire("b", b)
     await pool.acquire("c", c)  # a+b+c = 300 > 250 → evict LRU "a"
@@ -277,7 +330,7 @@ async def test_pool_rejects_model_larger_than_ceiling(tmp_path, monkeypatch):
     # A single model bigger than the whole budget fails loud BEFORE loading — never OOM-loaded.
     monkeypatch.setattr("assistant.models.mlx_engine._active_memory_bytes", lambda: None)
     big = _sized_model(tmp_path, "big", 300)
-    pool = MlxEnginePool(max_loaded=10, mem_ceiling_bytes=250, loader=lambda _p: object())
+    pool = MlxEnginePool(max_loaded=10, mem_ceiling_bytes=250, loader=lambda _p, _k=None: object())
     with pytest.raises(ModelAdmissionError):
         await pool.acquire("big", big)
     assert pool.loaded_ids() == []  # nothing loaded
@@ -289,7 +342,7 @@ async def test_pool_rejects_when_pinned_models_leave_no_room(tmp_path, monkeypat
     monkeypatch.setattr("assistant.models.mlx_engine._active_memory_bytes", lambda: None)
     a = _sized_model(tmp_path, "a", 100)
     b = _sized_model(tmp_path, "b", 100)
-    pool = MlxEnginePool(max_loaded=10, mem_ceiling_bytes=150, loader=lambda _p: object())
+    pool = MlxEnginePool(max_loaded=10, mem_ceiling_bytes=150, loader=lambda _p, _k=None: object())
     await pool.acquire("a", a)
     pool.pin("a")  # 100 held, only 50 free under the 150 ceiling
     with pytest.raises(ModelAdmissionError):
@@ -303,7 +356,7 @@ async def test_pool_without_ceiling_keeps_count_only_behaviour(tmp_path, monkeyp
     monkeypatch.setattr("assistant.models.mlx_engine._active_memory_bytes", lambda: None)
     a = _sized_model(tmp_path, "a", 10_000)
     b = _sized_model(tmp_path, "b", 10_000)
-    pool = MlxEnginePool(max_loaded=2, mem_ceiling_bytes=None, loader=lambda _p: object())
+    pool = MlxEnginePool(max_loaded=2, mem_ceiling_bytes=None, loader=lambda _p, _k=None: object())
     await pool.acquire("a", a)
     await pool.acquire("b", b)
     assert pool.loaded_ids() == ["a", "b"]  # both held; no rejection despite large sizes

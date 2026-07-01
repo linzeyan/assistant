@@ -19,6 +19,7 @@ import asyncio
 import gc
 import json
 import logging
+import os
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -56,6 +57,16 @@ def _release_mlx_memory() -> None:
             "mlx memory after release: active=%.2fGB cache=%.2fGB",
             active() / 1e9, cache() / 1e9,
         )
+
+
+def _total_ram_bytes() -> int | None:
+    """Physical RAM in bytes, or None if it can't be determined. Used to default the pool's
+    admission ceiling to the machine's actual memory so an oversized model fails loud with a clear
+    message instead of OOM-crashing the backend — "check the resource fits before loading"."""
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")  # macOS + Linux
+    except (ValueError, OSError, AttributeError):
+        return None
 
 
 def _active_memory_bytes() -> int | None:
@@ -290,13 +301,15 @@ def _load_vlm(path: Path) -> VlmChatEngine:
     return VlmChatEngine(model, processor)
 
 
-def _default_loader(path: Path) -> object:
-    # Dispatch by model family: a VL/omni checkpoint loads through mlx-vlm, everything
-    # else through mlx-lm. classify_kind re-reads config.json from the path, so the pool
-    # stays generic (loader takes only a path) and test loaders need no changes.
+def _default_loader(path: Path, forced_kind: str | None = None) -> object:
+    # Dispatch by model family: a VL/omni checkpoint loads through mlx-vlm, everything else
+    # through mlx-lm. ``forced_kind`` (a per-model type override) wins over auto-detection — it is
+    # how a checkpoint we'd misclassify as VLM, and then crash the mlx-vlm loader on, is told to
+    # load as a plain LLM and just work. When unset, classify_kind re-reads config.json from path.
     from .mlx_discovery import classify_kind
 
-    return _load_vlm(path) if classify_kind(path) == "vlm" else _load_llm(path)
+    kind = forced_kind or classify_kind(path)
+    return _load_vlm(path) if kind == "vlm" else _load_llm(path)
 
 
 class MlxEnginePool:
@@ -306,7 +319,7 @@ class MlxEnginePool:
         self,
         *,
         max_loaded: int = 1,
-        loader: Callable[[Path], object] | None = None,
+        loader: Callable[..., object] | None = None,
         pinned: set[str] | None = None,
         mem_ceiling_bytes: int | None = None,
     ):
@@ -323,8 +336,11 @@ class MlxEnginePool:
         self._ceiling = mem_ceiling_bytes if (mem_ceiling_bytes and mem_ceiling_bytes > 0) else None
         self._lock = asyncio.Lock()
 
-    async def acquire(self, model_id: str, path: Path) -> object:
+    async def acquire(
+        self, model_id: str, path: Path, forced_kind: str | None = None
+    ) -> object:
         """Return the loaded engine for ``model_id``, loading (and evicting) as needed.
+        ``forced_kind`` overrides the loader's auto-detection (per-model type override).
 
         Raises ``ModelAdmissionError`` *before* loading if a memory ceiling is set and the model
         can't be made to fit — fail loud rather than OOM-crash."""
@@ -338,7 +354,7 @@ class MlxEnginePool:
             # model switches, which is what we want (one heavy load at a time).
             log.info("loading model into pool: %s (~%.1fGB est)", model_id, incoming / 1e9)
             before = _active_memory_bytes()
-            engine = await asyncio.to_thread(self._loader, path)
+            engine = await asyncio.to_thread(self._loader, path, forced_kind)
             self._loaded[model_id] = engine
             self._loaded.move_to_end(model_id)
             # Refine the disk estimate with the real footprint when MLX exposes it. The lock is
@@ -401,13 +417,13 @@ class MlxEnginePool:
             raise ModelAdmissionError(
                 f"{exclude} needs ~{incoming / 1e9:.1f}GB but only "
                 f"{max(0.0, (self._ceiling - held) / 1e9):.1f}GB is free under the "
-                f"{self._ceiling / 1e9:.0f}GB memory ceiling"
+                f"{self._ceiling / 1e9:.0f}GB memory limit"
                 + (f" ({held / 1e9:.1f}GB held by pinned models)" if held else "")
-                + ". Raise mem_ceiling_gb or unload other models."
+                + ". Free memory (unload other models / close apps) or pick a smaller model."
             )
 
-    async def load(self, model_id: str, path: Path) -> None:
-        await self.acquire(model_id, path)
+    async def load(self, model_id: str, path: Path, forced_kind: str | None = None) -> None:
+        await self.acquire(model_id, path, forced_kind)
 
     async def unload(self, model_id: str) -> bool:
         async with self._lock:

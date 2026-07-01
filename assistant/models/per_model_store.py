@@ -1,8 +1,17 @@
-"""Per-model generation overrides (oMLX-style), keyed by model id and persisted to disk.
+"""Per-model overrides (oMLX-style), keyed by model id and persisted to disk.
 
-Each model can carry its own sampler settings (temperature / top_p / top_k) and an optional
-max_tokens cap. They're applied at chat time by the model service, layered over the global
-defaults, so a creative model and a deterministic coder can coexist without a config edit.
+Two independent concerns share one store/file/API:
+
+- **Generation** — sampler settings (temperature / top_p / top_k) and an optional max_tokens cap,
+  applied at chat time layered over the global defaults, so a creative model and a deterministic
+  coder can coexist without a config edit.
+- **Type override** — force a model's kind (llm / vlm / image / video / embed) instead of trusting
+  auto-detection. This is how a checkpoint we misclassify (e.g. gemma-4-31b auto-detected as a VLM,
+  which then crashes the mlx-vlm loader) is told to load as a plain ``llm`` and just work. "auto"
+  clears the override and returns to detection.
+
+The two are kept apart at read time: generation params are merged into sampling kwargs, but the
+type override must NOT be (a stray ``type`` kwarg would break generation), so it has its own getter.
 """
 
 from __future__ import annotations
@@ -13,14 +22,23 @@ from pathlib import Path
 
 log = logging.getLogger("assistant")
 
-# The only keys we persist/apply. Anything else in a PUT body is ignored, so the store can't be
-# used to smuggle arbitrary kwargs into generation.
+# Sampler/generation keys — the only ones merged into generation kwargs.
 ALLOWED_KEYS = ("temperature", "top_p", "top_k", "max_tokens")
+# Kinds a user may force via the type override. "auto" is the UI's way to clear it (→ detection);
+# it is never stored. Kept in sync with mlx_discovery.classify_kind's outputs.
+VALID_TYPES = ("llm", "vlm", "image", "video", "embed")
 
 
 def _clean(settings: dict) -> dict:
-    """Keep only known keys with non-null values (a null clears that override)."""
-    return {k: settings[k] for k in ALLOWED_KEYS if settings.get(k) is not None}
+    """Keep only known keys with usable values (a null/absent value clears that override).
+
+    Generation keys keep non-null values; ``type`` is kept only when it's a recognised kind (an
+    "auto"/unknown value clears it, so the model falls back to auto-detection)."""
+    out = {k: settings[k] for k in ALLOWED_KEYS if settings.get(k) is not None}
+    t = settings.get("type")
+    if isinstance(t, str) and t.strip().lower() in VALID_TYPES:
+        out["type"] = t.strip().lower()
+    return out
 
 
 class PerModelStore:
@@ -36,7 +54,18 @@ class PerModelStore:
                 log.warning("could not read per-model settings at %s", self._path)
 
     def get(self, model_id: str) -> dict:
+        """The full public view (generation params + any type override) — for the settings API."""
         return dict(self._data.get(model_id, {}))
+
+    def generation(self, model_id: str) -> dict:
+        """Only the sampler/generation params — safe to merge into generation kwargs. Excludes the
+        type override, which is metadata about loading, not a generation argument."""
+        return {k: v for k, v in self._data.get(model_id, {}).items() if k in ALLOWED_KEYS}
+
+    def kind_override(self, model_id: str) -> str | None:
+        """The forced kind for this model, or None to auto-detect."""
+        t = self._data.get(model_id, {}).get("type")
+        return t if t in VALID_TYPES else None
 
     def set(self, model_id: str, settings: dict) -> dict:
         cleaned = _clean(settings)

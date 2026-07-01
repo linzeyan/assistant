@@ -19,17 +19,22 @@ import asyncio
 import importlib.util
 import json
 import shutil
+from dataclasses import replace
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 from assistant.agent.fusion import FUSION_MODEL_ID
 
 from .mlx_discovery import DiscoveredModel, discover_models
-from .mlx_engine import MlxEnginePool
+from .mlx_engine import MlxEnginePool, _total_ram_bytes
 from .service import ModelService
 from .status import BackendState, BackendStatus
 from .tool_parsing import TOOL_MARKERS, earliest_marker, parse_tool_calls
 from .types import ModelInfo
+
+# Fraction of physical RAM the pool may commit to model weights before refusing a load. The slack
+# leaves room for the OS, the KV cache and activations (which the on-disk estimate omits).
+_RAM_HEADROOM = 0.9
 
 # Hold back this many trailing chars while streaming so a tool-call marker split
 # across token boundaries is detected before its prefix leaks as text.
@@ -82,8 +87,15 @@ class MlxModelService(ModelService):
         self._models_dir = Path(models_dir)
         self._extra_dirs = [Path(d) for d in (extra_model_dirs or [])]
         self._include_hf = include_hf_cache
-        # Memory ceiling is opt-in: None leaves the pool count-only (prior behaviour). GB→bytes.
-        mem_ceiling_bytes = int(mem_ceiling_gb * 1e9) if mem_ceiling_gb else None
+        # Memory ceiling: an explicit mem_ceiling_gb wins; otherwise default to the machine's
+        # physical RAM minus headroom, so a model too big for this system fails loud with a clear
+        # message BEFORE loading rather than OOM-crashing the backend ("check the resource fits
+        # first"). Estimates come from on-disk weights, so a 96GB model on 128GB RAM still admits.
+        if mem_ceiling_gb:
+            mem_ceiling_bytes: int | None = int(mem_ceiling_gb * 1e9)
+        else:
+            _ram = _total_ram_bytes()
+            mem_ceiling_bytes = int(_ram * _RAM_HEADROOM) if _ram else None
         self._pool = pool or MlxEnginePool(max_loaded=max_loaded, mem_ceiling_bytes=mem_ceiling_bytes)
         # Optional per-model generation overrides (PerModelStore). Merged into stream params so
         # each model's saved temperature/top_p/top_k/max_tokens apply automatically at chat time.
@@ -166,6 +178,13 @@ class MlxModelService(ModelService):
         entry = self._catalog.get(model_id)
         if entry is None:
             raise ValueError(f"unknown model: {model_id}")
+        # Honour a per-model type override: force this model's effective kind (e.g. a checkpoint we
+        # auto-detect as VLM, and crash mlx-vlm on, told to load as a plain LLM). One resolution
+        # point so the chat-gate, the loader dispatch and list_models all agree.
+        if self._per_model is not None:
+            override = self._per_model.kind_override(model_id)
+            if override and override != entry.kind:
+                entry = replace(entry, kind=override)
         return entry
 
     # Kinds usable as a chat model: text LLMs (mlx-lm) and vision-language / omni
@@ -187,9 +206,14 @@ class MlxModelService(ModelService):
             return []
         await self._refresh_catalog()
         loaded = set(self._pool.loaded_ids())
+
+        def _eff_kind(m: DiscoveredModel) -> str:
+            ov = self._per_model.kind_override(m.id) if self._per_model is not None else None
+            return ov or m.kind
+
         models = [
             ModelInfo(
-                id=m.id, type=m.kind, loaded=m.id in loaded,
+                id=m.id, type=_eff_kind(m), loaded=m.id in loaded,
                 source=m.source, size_bytes=m.size_bytes,
             )
             for m in self._catalog.values()
@@ -225,7 +249,7 @@ class MlxModelService(ModelService):
             return  # virtual model: nothing to load (its panel models load on demand)
         entry = await self._entry_for(model_id)
         self._require_chat_model(entry)
-        await self._pool.load(model_id, entry.path)
+        await self._pool.load(model_id, entry.path, forced_kind=entry.kind)
 
     async def unload(self, model_id: str) -> None:
         await self._pool.unload(model_id)
@@ -258,7 +282,7 @@ class MlxModelService(ModelService):
         # The model's saved overrides win over the caller's defaults (e.g. a per-model
         # max_tokens overrides the loop's global cap; temperature/top_p/top_k are added).
         if self._per_model is not None:
-            params = {**params, **self._per_model.get(model)}
+            params = {**params, **self._per_model.generation(model)}
         return self._stream(messages, model, tools, known, **params)
 
     async def _stream(
@@ -271,7 +295,7 @@ class MlxModelService(ModelService):
     ) -> AsyncIterator[dict]:
         entry = await self._entry_for(model)
         self._require_chat_model(entry)
-        engine = await self._pool.acquire(model, entry.path)
+        engine = await self._pool.acquire(model, entry.path, forced_kind=entry.kind)
 
         queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()

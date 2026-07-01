@@ -51,7 +51,7 @@ async def test_full_tool_cycle_through_native_backend(tmp_path):
             ["The file says FILE BODY."],
         ]
     )
-    pool = MlxEnginePool(max_loaded=1, loader=lambda _path: engine)
+    pool = MlxEnginePool(max_loaded=1, loader=lambda _path, _k=None: engine)
     svc = MlxModelService(
         models_dir=tmp_path,
         include_hf_cache=False,
