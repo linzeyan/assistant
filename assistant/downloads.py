@@ -14,6 +14,7 @@ or a real subprocess.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -31,7 +32,7 @@ log = logging.getLogger("assistant")
 # GUI-spawn PATH gap where `huggingface-cli` isn't resolvable.
 _DOWNLOAD_SCRIPT = (
     "import sys; from huggingface_hub import snapshot_download; "
-    "snapshot_download(sys.argv[1], local_dir=sys.argv[2])"
+    "snapshot_download(sys.argv[1], local_dir=sys.argv[2], max_workers=int(sys.argv[3]))"
 )
 
 # Statuses for which a download is still live (idempotent start, resume-on-boot).
@@ -83,11 +84,18 @@ class DownloadManager:
         state_path: Path,
         size_fn: SizeFn | None = None,
         runner: Runner | None = None,
+        env: dict[str, str] | None = None,
+        max_workers: int = 8,
     ):
         self._target_dir = Path(target_dir)
         self._state_path = Path(state_path)
         self._size_fn = size_fn or _hf_total_size
-        self._runner = runner or _subprocess_runner
+        # Bind the tunables (extra env like HF_HUB_DISABLE_XET, and snapshot_download's max_workers)
+        # onto the default subprocess runner, so the call site stays the fixed Runner signature and
+        # an injected test runner is unaffected.
+        self._runner = runner or functools.partial(
+            _subprocess_runner, env=env, max_workers=max_workers
+        )
         self._states: dict[str, DownloadState] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._cancels: dict[str, asyncio.Event] = {}
@@ -235,7 +243,13 @@ def _dir_size(path: Path) -> int:
 
 
 async def _subprocess_runner(
-    repo_id: str, target: Path, state: DownloadState, cancel: asyncio.Event
+    repo_id: str,
+    target: Path,
+    state: DownloadState,
+    cancel: asyncio.Event,
+    *,
+    env: dict[str, str] | None = None,
+    max_workers: int = 8,
 ) -> None:
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -243,9 +257,13 @@ async def _subprocess_runner(
         _DOWNLOAD_SCRIPT,
         repo_id,
         str(target),
+        str(max_workers),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,  # own group -> kill the whole tree on cancel
+        # Merge onto (not replace) the parent env so PATH/HOME survive; extra keys tune the hub
+        # transfer (e.g. HF_HUB_DISABLE_XET, HF_HUB_DOWNLOAD_TIMEOUT).
+        env={**os.environ, **(env or {})},
     )
 
     async def _watch_cancel() -> None:

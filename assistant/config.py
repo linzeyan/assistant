@@ -67,6 +67,16 @@ class Settings(BaseSettings):
     # Where /models/download fetches into. Defaults to models_dir so a downloaded
     # model is immediately discoverable in /models (no separate import step).
     download_dir: Path = XDG_DATA_DIR / "models"
+    # Disable HuggingFace's Xet transfer for downloads (sets HF_HUB_DISABLE_XET=1). On by default:
+    # measured throttling to a few KB/s on some networks, so leaving Xet on can cripple a download.
+    # Set false to use Xet where it performs well.
+    hf_hub_disable_xet: bool = True
+    # Per-file connect/read timeout (seconds) for hub downloads (HF_HUB_DOWNLOAD_TIMEOUT). HF's own
+    # default (~10s) is too tight on a slow link and aborts large shards mid-transfer.
+    hf_hub_download_timeout: int = 120
+    # Concurrent file downloads for snapshot_download(max_workers=...). Fewer workers can be steadier
+    # on a rate-limited/flaky connection; HF defaults to 8.
+    hf_download_max_workers: int = 4
 
     # --- native modality models (mlx-* backends; used when the extra is installed) ---
     embed_memory: bool = True  # embeddings-backed semantic memory search

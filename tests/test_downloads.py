@@ -149,3 +149,56 @@ async def test_eta_reported_while_downloading(tmp_path):
     assert item["status"] == "downloading" and item["eta_seconds"] == 3
     hold.set()
     await task
+
+
+def test_manager_binds_env_and_max_workers_onto_default_runner(tmp_path):
+    # N50: with no injected runner, the manager binds the download tunables onto the real
+    # subprocess runner (so the fixed Runner call site carries them through).
+    import functools
+
+    from assistant.downloads import _subprocess_runner
+
+    mgr = DownloadManager(
+        target_dir=tmp_path / "models",
+        state_path=tmp_path / "downloads.json",
+        env={"HF_HUB_DISABLE_XET": "1"},
+        max_workers=2,
+    )
+    assert isinstance(mgr._runner, functools.partial)
+    assert mgr._runner.func is _subprocess_runner
+    assert mgr._runner.keywords == {"env": {"HF_HUB_DISABLE_XET": "1"}, "max_workers": 2}
+
+
+async def test_subprocess_runner_passes_max_workers_and_merged_env(tmp_path, monkeypatch):
+    # N50: the spawned command carries max_workers as an argv, and the child env merges the extra
+    # hub tunables ONTO the parent env (PATH etc. must survive, not be replaced).
+    import asyncio
+
+    from assistant.downloads import DownloadState, _subprocess_runner
+
+    captured: dict = {}
+
+    class _FakeProc:
+        returncode = 0
+        pid = 999999
+        stderr = None
+
+        async def wait(self):
+            return 0
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs.get("env")
+        return _FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    state = DownloadState(repo_id="org/m")
+    await _subprocess_runner(
+        "org/m", tmp_path / "t", state, asyncio.Event(),
+        env={"HF_HUB_DISABLE_XET": "1"}, max_workers=3,
+    )
+    assert captured["args"][-1] == "3"  # max_workers is the trailing argv
+    assert captured["args"][3] == "org/m"  # repo_id positional preserved
+    assert captured["env"]["HF_HUB_DISABLE_XET"] == "1"  # extra tunable applied
+    assert "PATH" in captured["env"]  # merged onto parent env, not a bare replacement

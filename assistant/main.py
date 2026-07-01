@@ -276,9 +276,18 @@ async def lifespan(app: FastAPI):
     app.state.pending_approvals = {}
     # Model download manager (N17): progress / cancel / resume-after-restart / retry,
     # persisted to downloads.json under the data dir.
+    # Download tunables (N50): extra hub env + concurrency. HF_HUB_DISABLE_XET is the big one —
+    # Xet was measured throttling to a few KB/s on some networks — so it's on by default.
+    _download_env: dict[str, str] = {
+        "HF_HUB_DOWNLOAD_TIMEOUT": str(settings.hf_hub_download_timeout)
+    }
+    if settings.hf_hub_disable_xet:
+        _download_env["HF_HUB_DISABLE_XET"] = "1"
     download_manager = DownloadManager(
         target_dir=settings.download_dir,
         state_path=settings.home_dir / "downloads.json",
+        env=_download_env,
+        max_workers=settings.hf_download_max_workers,
     )
     app.state.download_manager = download_manager
     # Managed-tool installs keyed by feature name.
