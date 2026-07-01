@@ -253,7 +253,7 @@ struct SettingsScreen: View {
                 HStack(spacing: 10) {
                     Text("Max download workers").foregroundStyle(.secondary)
                         .frame(width: labelWidth, alignment: .leading)
-                    TextField("", text: $hfDownloadMaxWorkers, prompt: Text("4"))
+                    TextField("", text: $hfDownloadMaxWorkers, prompt: Text("8"))
                         .textFieldStyle(.roundedBorder).frame(width: 100)
                     Button("Save") { Task { await saveDownloadTuning() } }
                 }

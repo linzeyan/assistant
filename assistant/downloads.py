@@ -14,11 +14,13 @@ or a real subprocess.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 from collections import deque
@@ -198,10 +200,34 @@ class DownloadManager:
     async def resume_incomplete(self) -> None:
         """Re-spawn downloads that were mid-flight when the app last closed (the hub continues
         their partial files). Called once at startup."""
+        self._reap_orphan_downloads()  # kill leftovers from a previous backend before re-spawning
         for repo_id, state in list(self._states.items()):
             if state.status in ACTIVE_STATUSES:
                 log.info("resuming interrupted download: %s", repo_id)
                 self._spawn(repo_id)
+
+    def _reap_orphan_downloads(self) -> None:
+        """Kill download subprocesses left over from a PREVIOUS backend instance. A download runs in
+        a detached session (start_new_session) so it SURVIVES a backend restart — and resume would
+        then spawn a DUPLICATE. Two processes downloading the same repo contend on the hub's per-file
+        .lock and the transfer crawls, then deadlocks at 0 B/s (observed: an orphan with PPID=1 next
+        to the resumed one). At startup we own no downloads yet, so any such process is an orphan.
+        Matched narrowly — our exact `python -c` body AND a path under our target dir — so a user's
+        unrelated `huggingface-cli download` is never touched. Best-effort: pgrep/pkill may be absent."""
+        with contextlib.suppress(Exception):
+            found = subprocess.run(
+                ["pgrep", "-f", "huggingface_hub import snapshot_download"],
+                capture_output=True, text=True,
+            )
+            for pid in found.stdout.split():
+                cmd = subprocess.run(
+                    ["ps", "-p", pid, "-o", "command="], capture_output=True, text=True
+                ).stdout
+                if str(self._target_dir) not in cmd:
+                    continue  # someone else's download, not ours — leave it alone
+                with contextlib.suppress(ProcessLookupError, ValueError, PermissionError):
+                    os.killpg(os.getpgid(int(pid)), signal.SIGKILL)
+                    log.warning("reaped orphaned download subprocess pid=%s", pid)
 
     async def aclose(self) -> None:
         for task in list(self._tasks.values()):

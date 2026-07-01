@@ -153,6 +153,36 @@ async def test_eta_reported_while_downloading(tmp_path):
     await task
 
 
+async def test_resume_reaps_only_our_orphan_download_subprocesses(tmp_path, monkeypatch):
+    # A download detaches (start_new_session) and survives a backend restart; resume must reap that
+    # orphan before re-spawning, or two processes fight over the same files and stall at 0 B/s. The
+    # match is scoped to OUR target dir so a user's unrelated huggingface-cli download is spared.
+    from types import SimpleNamespace
+
+    import assistant.downloads as dl
+
+    target = tmp_path / "models"
+    killed: list[int] = []
+
+    def fake_run(cmd, **kw):
+        if cmd[0] == "pgrep":
+            return SimpleNamespace(stdout="111\n222\n")  # two snapshot_download processes exist
+        if cmd[0] == "ps":
+            pid = cmd[cmd.index("-p") + 1]
+            path = str(target) if pid == "111" else "/some/other/place"  # 222 is not ours
+            return SimpleNamespace(stdout=f"python -c ...snapshot_download... {path}/org/m 1\n")
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(dl.subprocess, "run", fake_run)
+    monkeypatch.setattr(dl.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(dl.os, "killpg", lambda pgid, sig: killed.append(pgid))
+
+    mgr = DownloadManager(target_dir=target, state_path=tmp_path / "downloads.json")
+    await mgr.resume_incomplete()
+
+    assert killed == [111]  # only the orphan under our target dir; the user's 222 is untouched
+
+
 def test_to_public_bounds_eta_so_it_never_overflows():
     # The crash fix: a stalled/near-zero rate makes remaining/rate astronomical — which overflowed
     # the client's Int64 and corrupted the whole downloads decode. Both ends are bounded so ETA is
