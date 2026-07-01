@@ -87,7 +87,9 @@ final class BackendProcess {
         do {
             try proc.run()
             process = proc
+            AppLog.log("backend spawned: \(exe) (pid \(proc.processIdentifier))")
         } catch {
+            AppLog.log("backend spawn FAILED: \(exe): \(error)")
             NSLog("assistant backend spawn failed: \(error)")
         }
     }

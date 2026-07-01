@@ -6,6 +6,13 @@ struct AssistantApp: App {
     @StateObject private var chat = ChatModel()
     @Environment(\.scenePhase) private var scenePhase
 
+    init() {
+        // Earliest Swift entry point. Pairs with BackendController.start()'s "begin" mark so
+        // the gap between them measures pure SwiftUI cold-launch time (process start → first
+        // window .task) — the part of the ~4s app-perceived latency that isn't backend boot.
+        AppLog.log("app launch (SwiftUI init)")
+    }
+
     var body: some Scene {
         WindowGroup("Assistant") {
             RootView()

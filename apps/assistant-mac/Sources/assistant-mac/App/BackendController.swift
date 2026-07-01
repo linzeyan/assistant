@@ -73,8 +73,19 @@ final class BackendController: ObservableObject {
     }
 
     func start() async {
+        // Phase timing for the app-side launch latency: the backend reports its own boot in
+        // ~0.04s, so any remaining "app feels slow to come up" time is spent here (venv check,
+        // connect-or-spawn poll, first /models refresh). app.log makes it measurable per launch.
+        let t0 = Date()
+        func mark(_ phase: String) {
+            AppLog.log(String(format: "start: %@ +%.2fs", phase, Date().timeIntervalSince(t0)))
+        }
+        mark("begin")
         starting = true
-        defer { starting = false }
+        defer {
+            starting = false
+            mark("done")
+        }
         expectingExit = false  // a fresh start cancels any prior deliberate-stop intent
         // Pick up a managed venv that may have appeared since launch (bootstrap).
         if backend.command == nil, let cmd = BackendProcess.defaultCommand() {
@@ -86,8 +97,10 @@ final class BackendController: ObservableObject {
         // relaunch keeps serving the old backend.
         if BackendProcess.usesManagedVenv(), Bootstrap.managedVenvNeedsUpdate() {
             updatingBackend = true
+            mark("venv update begin")
             let updated = await bootstrap.updateManagedVenv()
             updatingBackend = false
+            mark("venv update end")
             if updated {
                 backend.stop()
                 BackendProcess.killOnPort(currentPort)
@@ -99,7 +112,10 @@ final class BackendController: ObservableObject {
         }
         // Connect-or-spawn: only launch a child if nothing is already serving, so a
         // separately-started `make run` backend is reused instead of fighting for the port.
-        if await !probe() {
+        if await probe() {
+            mark("reused running backend")
+        } else {
+            mark("no backend up — spawning")
             backend.spawn()
             installTerminationGuard()
         }
@@ -109,12 +125,15 @@ final class BackendController: ObservableObject {
         // booting, so tight polling costs nothing.
         for i in 0..<52 {  // 15×0.1s + 37×0.5s ≈ 20s budget
             if await probe() {
+                mark("backend reachable (poll \(i))")
                 await refresh()
+                mark("first refresh done")
                 startHealthMonitor()
                 return
             }
             try? await Task.sleep(nanoseconds: i < 15 ? 100_000_000 : 500_000_000)
         }
+        mark("gave up polling — final refresh")
         await refresh()  // final attempt surfaces lastError if still down
         startHealthMonitor()
     }
