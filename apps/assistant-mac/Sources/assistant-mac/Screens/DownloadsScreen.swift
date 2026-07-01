@@ -155,7 +155,7 @@ struct DownloadsScreen: View {
             .font(.caption2).foregroundStyle(.secondary)
     }
 
-    /// "123 MB / 456 MB · 27% · ETA 2m 30s" — omitting parts that aren't known yet.
+    /// "123 MB / 456 MB · 27% · 12.3 MB/s · ETA 2m 30s" — omitting parts that aren't known yet.
     static func progressText(_ item: DownloadDTO) -> String {
         var parts: [String] = []
         if item.totalBytes > 0 {
@@ -164,6 +164,7 @@ struct DownloadsScreen: View {
         } else if item.downloadedBytes > 0 {
             parts.append(bytes(item.downloadedBytes))
         }
+        if let r = item.rateBps, r > 0 { parts.append(speed(r)) }
         if let secs = item.etaSeconds { parts.append("ETA \(eta(secs))") }
         return parts.joined(separator: " · ")
     }
@@ -172,7 +173,12 @@ struct DownloadsScreen: View {
         ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)
     }
 
+    static func speed(_ bytesPerSecond: Double) -> String {
+        "\(bytes(Int(bytesPerSecond.rounded())))/s"
+    }
+
     static func eta(_ seconds: Int) -> String {
+        if seconds >= 48 * 3600 { return "\(seconds / 86400)d \((seconds % 86400) / 3600)h" }
         if seconds >= 3600 { return "\(seconds / 3600)h \((seconds % 3600) / 60)m" }
         if seconds >= 60 { return "\(seconds / 60)m \(seconds % 60)s" }
         return "\(seconds)s"

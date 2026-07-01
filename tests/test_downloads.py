@@ -90,6 +90,7 @@ async def test_state_persists_and_reloads(tmp_path):
         "total_bytes": 1000,
         "downloaded_bytes": 1000,
         "eta_seconds": None,
+        "rate_bps": None,  # only meaningful while downloading
         "error": None,
     }
 
@@ -133,22 +134,46 @@ async def test_remove_unknown_raises(tmp_path):
 
 
 async def test_eta_reported_while_downloading(tmp_path):
-    # A runner that pauses lets us inspect the in-flight public shape (eta from rate).
+    # A runner that pauses lets us inspect the in-flight public shape (eta + speed from the rate).
     hold = asyncio.Event()
 
     async def runner(repo_id, target, state, cancel):
-        state.downloaded_bytes = 400
-        state.rate_bps = 200.0  # 600 bytes left / 200 bps -> 3s
+        state.downloaded_bytes = 400_000
+        state.rate_bps = 200_000.0  # 600_000 left / 200_000 bps -> 3s (rate above the ETA floor)
         await hold.wait()
 
-    mgr = _manager(tmp_path, runner=runner)
+    mgr = _manager(tmp_path, size_fn=lambda _r: 1_000_000, runner=runner)
     mgr.start("org/model")
     task = mgr._tasks["org/model"]
     await asyncio.sleep(0.02)
     item = mgr.snapshot()[0]
     assert item["status"] == "downloading" and item["eta_seconds"] == 3
+    assert item["rate_bps"] == 200_000.0  # speed surfaced for the GUI
     hold.set()
     await task
+
+
+def test_to_public_bounds_eta_so_it_never_overflows():
+    # The crash fix: a stalled/near-zero rate makes remaining/rate astronomical — which overflowed
+    # the client's Int64 and corrupted the whole downloads decode. Both ends are bounded so ETA is
+    # reported "unknown" (None) instead of a giant integer.
+    from assistant.downloads import DownloadState
+
+    stalled = DownloadState(repo_id="org/m", status="downloading", total_bytes=70_000_000_000,
+                            downloaded_bytes=59_000_000_000, rate_bps=24.0)  # ~24 B/s
+    pub = stalled.to_public()
+    assert pub["eta_seconds"] is None  # not a 1e19 integer
+    assert pub["rate_bps"] == 24.0  # speed still reported honestly
+
+    # Above the floor but still absurd (would exceed the 30-day ceiling) → also unknown.
+    slow = DownloadState(repo_id="org/m", status="downloading", total_bytes=100_000_000_000,
+                         downloaded_bytes=0, rate_bps=1100.0)  # ~1052 days
+    assert slow.to_public()["eta_seconds"] is None
+
+    # A healthy rate yields a real, small ETA.
+    healthy = DownloadState(repo_id="org/m", status="downloading", total_bytes=1_000_000,
+                            downloaded_bytes=400_000, rate_bps=200_000.0)
+    assert healthy.to_public()["eta_seconds"] == 3
 
 
 def test_manager_binds_env_and_max_workers_onto_default_runner(tmp_path):
@@ -202,6 +227,9 @@ async def test_subprocess_runner_passes_max_workers_and_merged_env(tmp_path, mon
     assert captured["args"][3] == "org/m"  # repo_id positional preserved
     assert captured["env"]["HF_HUB_DISABLE_XET"] == "1"  # extra tunable applied
     assert "PATH" in captured["env"]  # merged onto parent env, not a bare replacement
+    # Our disk-size bar replaces tqdm; disabling HF progress bars also keeps the (now-drained)
+    # stderr pipe from filling and back-pressuring the child into a stall.
+    assert captured["env"]["HF_HUB_DISABLE_PROGRESS_BARS"] == "1"
 
 
 async def test_downloads_run_one_at_a_time(tmp_path):

@@ -77,16 +77,32 @@ struct DTODecodingTests {
             DownloadDTO.self,
             """
             {"repo_id":"org/m","status":"downloading","total_bytes":1000,
-             "downloaded_bytes":250,"eta_seconds":12,"error":null}
+             "downloaded_bytes":250,"eta_seconds":12,"rate_bps":125.0,"error":null}
             """)
         #expect(dto.repoId == "org/m")
         #expect(dto.status == "downloading")
         #expect(dto.totalBytes == 1000)
         #expect(dto.downloadedBytes == 250)
         #expect(dto.etaSeconds == 12)
+        #expect(dto.rateBps == 125.0)
         #expect(dto.fraction == 0.25)
         #expect(dto.isActive)
         #expect(!dto.isResumable)
+    }
+
+    @Test func downloadDTOToleratesOverflowingETA() throws {
+        // A stalled download's remaining/rate can overflow Int64. The backend now clamps it, but
+        // the decoder must ALSO tolerate it so one bad number never corrupts the whole downloads
+        // list (observed crash: "Number 61148359896027136000 is not representable in Swift").
+        let dto = try decode(
+            DownloadDTO.self,
+            """
+            {"repo_id":"org/m","status":"downloading","total_bytes":70000000000,
+             "downloaded_bytes":59000000000,"eta_seconds":61148359896027136000,"error":null}
+            """)
+        #expect(dto.etaSeconds == nil)  // out-of-range → unknown, not a thrown decode error
+        #expect(dto.downloadedBytes == 59000000000)
+        #expect(dto.rateBps == nil)  // absent field tolerated
     }
 
     @Test func chatEventMapsSessionId() throws {

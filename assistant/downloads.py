@@ -21,11 +21,22 @@ import os
 import signal
 import sys
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 log = logging.getLogger("assistant")
+
+# Rate/ETA are recomputed on this cadence as the AVERAGE over the trailing window (not a jittery
+# per-second EMA), so the displayed speed and ETA are stable.
+_RATE_WINDOW_S = 10.0
+# Below this average rate the transfer is effectively stalled — reporting an ETA then is worse than
+# useless: remaining/rate explodes to an astronomical integer that (a) is meaningless and (b) once
+# overflowed Int64, breaking the GUI's JSON decode of the whole downloads list. So we report ETA
+# "unknown" (None) when the rate is this low OR the ETA would exceed the sane ceiling below.
+_ETA_MIN_RATE_BPS = 1024.0  # 1 KB/s
+_ETA_MAX_S = 30 * 24 * 3600  # 30 days; a longer estimate is noise — report unknown instead
 
 # Subprocess body: download one repo into a local dir. Args arrive via argv (no shell, so a
 # crafted repo_id can't inject); runs in the SAME interpreter as the backend, sidestepping the
@@ -59,16 +70,23 @@ class DownloadState:
     rate_bps: float = 0.0  # runtime-only EMA; never persisted
 
     def to_public(self) -> dict:
+        # ETA is bounded on BOTH ends so it can never blow up: a stalled/near-zero rate or an
+        # absurdly long estimate is reported as unknown (None) rather than a giant integer that
+        # overflows the client's Int64 and corrupts the whole downloads response.
         eta = None
-        if self.status == "downloading" and self.rate_bps > 0 and self.total_bytes:
+        if self.status == "downloading" and self.rate_bps >= _ETA_MIN_RATE_BPS and self.total_bytes:
             remaining = max(0, self.total_bytes - self.downloaded_bytes)
-            eta = int(remaining / self.rate_bps)
+            secs = int(remaining / self.rate_bps)
+            eta = secs if secs <= _ETA_MAX_S else None
         return {
             "repo_id": self.repo_id,
             "status": self.status,
             "total_bytes": self.total_bytes,
             "downloaded_bytes": self.downloaded_bytes,
             "eta_seconds": eta,
+            # Current transfer speed (10s-window average) so the GUI can show "· 12.3 MB/s". Only
+            # meaningful while downloading; None otherwise.
+            "rate_bps": self.rate_bps if self.status == "downloading" else None,
             "error": self.error,
         }
 
@@ -226,6 +244,7 @@ class DownloadManager:
                     state.status = "done"
                     if state.total_bytes:
                         state.downloaded_bytes = state.total_bytes
+                    log.info("download done: %s (%d bytes)", repo_id, state.downloaded_bytes)
         except asyncio.CancelledError:
             state.status = "cancelled"
             raise
@@ -233,6 +252,7 @@ class DownloadManager:
             state.status = "cancelled" if cancel.is_set() else "error"
             if state.status == "error":
                 state.error = str(exc)
+                log.error("download failed: %s: %s", repo_id, exc)
         finally:
             state.rate_bps = 0.0
             self._cancels.pop(repo_id, None)
@@ -298,6 +318,10 @@ async def _subprocess_runner(
     env: dict[str, str] | None = None,
     max_workers: int = 8,
 ) -> None:
+    log.info(
+        "download start: %s -> %s (max_workers=%d, xet_disabled=%s)",
+        repo_id, target, max_workers, str((env or {}).get("HF_HUB_DISABLE_XET") == "1"),
+    )
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",
@@ -309,8 +333,10 @@ async def _subprocess_runner(
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,  # own group -> kill the whole tree on cancel
         # Merge onto (not replace) the parent env so PATH/HOME survive; extra keys tune the hub
-        # transfer (e.g. HF_HUB_DISABLE_XET, HF_HUB_DOWNLOAD_TIMEOUT).
-        env={**os.environ, **(env or {})},
+        # transfer (e.g. HF_HUB_DISABLE_XET, HF_HUB_DOWNLOAD_TIMEOUT). Progress bars are disabled
+        # because we render our own from disk size — and an undrained tqdm stream can fill the
+        # stderr pipe and BACK-PRESSURE (stall) the child. Caller env still wins if it overrides.
+        env={**os.environ, "HF_HUB_DISABLE_PROGRESS_BARS": "1", **(env or {})},
     )
 
     async def _watch_cancel() -> None:
@@ -320,8 +346,31 @@ async def _subprocess_runner(
         except ProcessLookupError:
             pass
 
+    # Drain stderr CONTINUOUSLY into a bounded tail. Before, stderr was read only on exit, so a
+    # chatty child could fill the OS pipe buffer and block mid-download (invisible stall) — and any
+    # retry/timeout diagnostics were lost. Now the pipe never fills, and HF's warnings are logged.
+    stderr_tail: deque[str] = deque(maxlen=40)
+
+    async def _drain_stderr() -> None:
+        if proc.stderr is None:
+            return
+        while True:
+            raw = await proc.stderr.readline()
+            if not raw:
+                break
+            line = raw.decode(errors="replace").rstrip()
+            if not line:
+                continue
+            stderr_tail.append(line)
+            low = line.lower()
+            if any(k in low for k in ("error", "retry", "timeout", "failed", "warning")):
+                log.warning("download %s: %s", repo_id, line)
+
     watcher = asyncio.create_task(_watch_cancel())
-    last_t, last_b = time.monotonic(), state.downloaded_bytes
+    drainer = asyncio.create_task(_drain_stderr())
+    # Rate/ETA are a trailing-window AVERAGE refreshed every _RATE_WINDOW_S; progress bytes still
+    # update every second so the bar stays smooth and cancel stays responsive.
+    rate_anchor_t, rate_anchor_b = time.monotonic(), state.downloaded_bytes
     try:
         while True:
             try:
@@ -330,17 +379,18 @@ async def _subprocess_runner(
             except (asyncio.TimeoutError, TimeoutError):
                 now = time.monotonic()
                 bytes_now = _dir_size(target)
-                dt = now - last_t
-                if dt > 0:
-                    inst = max(0.0, (bytes_now - last_b) / dt)
-                    state.rate_bps = inst if state.rate_bps == 0 else 0.7 * state.rate_bps + 0.3 * inst
                 state.downloaded_bytes = bytes_now
-                last_t, last_b = now, bytes_now
+                window = now - rate_anchor_t
+                if window >= _RATE_WINDOW_S:
+                    state.rate_bps = max(0.0, (bytes_now - rate_anchor_b) / window)
+                    rate_anchor_t, rate_anchor_b = now, bytes_now
         if cancel.is_set():
             return
+        await drainer  # let the last stderr lines land before we inspect the tail
         if proc.returncode != 0:
-            err = await proc.stderr.read() if proc.stderr is not None else b""
-            raise RuntimeError(err.decode(errors="replace")[-500:].strip() or f"exit {proc.returncode}")
+            err = "\n".join(stderr_tail)[-500:].strip() or f"exit {proc.returncode}"
+            raise RuntimeError(err)
         state.downloaded_bytes = _dir_size(target) or state.downloaded_bytes
     finally:
         watcher.cancel()
+        drainer.cancel()

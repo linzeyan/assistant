@@ -134,6 +134,7 @@ struct DownloadDTO: Decodable, Identifiable, Hashable {
     let totalBytes: Int
     let downloadedBytes: Int
     let etaSeconds: Int?
+    let rateBps: Double?  // current transfer speed (10s-window average), bytes/s
     let error: String?
 
     enum CodingKeys: String, CodingKey {
@@ -142,6 +143,21 @@ struct DownloadDTO: Decodable, Identifiable, Hashable {
         case totalBytes = "total_bytes"
         case downloadedBytes = "downloaded_bytes"
         case etaSeconds = "eta_seconds"
+        case rateBps = "rate_bps"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        repoId = try c.decode(String.self, forKey: .repoId)
+        status = try c.decode(String.self, forKey: .status)
+        totalBytes = try c.decodeIfPresent(Int.self, forKey: .totalBytes) ?? 0
+        downloadedBytes = try c.decodeIfPresent(Int.self, forKey: .downloadedBytes) ?? 0
+        // Tolerate an out-of-range ETA: a stalled download's remaining/rate can overflow Int64.
+        // Treat that as "unknown" instead of throwing, which would corrupt the whole downloads
+        // list decode (observed: "Number 6114835989602713600… is not representable in Swift").
+        etaSeconds = (try? c.decodeIfPresent(Int.self, forKey: .etaSeconds)) ?? nil
+        rateBps = try c.decodeIfPresent(Double.self, forKey: .rateBps)
+        error = try c.decodeIfPresent(String.self, forKey: .error)
     }
 
     /// 0…1 when the total size is known; nil → indeterminate bar.
