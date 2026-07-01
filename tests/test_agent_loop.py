@@ -381,6 +381,57 @@ async def test_injects_current_date_into_user_turn(tmp_path):
     )
 
 
+def test_referenced_paths_extracts_only_existing(tmp_path):
+    # N53: extraction is existence-gated — a real named file/dir is surfaced; a path-shaped token
+    # that isn't on disk (and plain prose) is dropped, so the read-me nudge never points at nothing.
+    from assistant.agent.loop import _referenced_paths
+
+    (tmp_path / "Makefile").write_text("all:\n\techo hi\n")
+    sub = tmp_path / "src"
+    sub.mkdir()
+    abs_mk = str(tmp_path / "Makefile")
+
+    # Absolute path pressed against Chinese text (no space) still extracts cleanly.
+    got = _referenced_paths(f"看下{abs_mk} 要怎麼寫", tmp_path)
+    assert got == [abs_mk]
+
+    # Relative filename + relative dir resolve against cwd; a non-existent lookalike is dropped.
+    got2 = _referenced_paths("check Makefile and src/ but not ghost/nope.py", tmp_path)
+    assert abs_mk in got2 and str(sub) in got2
+    assert not any("nope.py" in g for g in got2)
+
+    # Pure prose with a version number / abbreviation → nothing (no bogus nudge).
+    assert _referenced_paths("upgrade to python 3.10, e.g. today", tmp_path) == []
+
+
+async def test_referenced_path_injected_into_user_turn(tmp_path):
+    # N53: when the user names a file that exists, the loop rides a "read these first" block on the
+    # latest user turn (never the cacheable prefix) so a weak model opens it instead of guessing.
+    (tmp_path / "Makefile").write_text("all:\n\techo hi\n")
+    captured: dict = {}
+
+    class CapturingLLM:
+        def stream_chat(self, messages, model, tools=None, **params):
+            captured["messages"] = messages
+
+            async def gen():
+                yield {"type": "text", "content": "ok"}
+
+            return gen()
+
+    loop = AgentLoop(
+        CapturingLLM(),
+        build_registry(),
+        PolicyApprover(approval_required=False),
+        ToolContext(cwd=tmp_path),
+    )
+    await _collect(loop.run(Session(id="rp"), "看下 Makefile 要怎麼寫", "m"))
+    last_user = [m for m in captured["messages"] if m["role"] == "user"][-1]
+    assert "referenced-paths" in last_user["content"]
+    assert str(tmp_path / "Makefile") in last_user["content"]
+    assert "看下 Makefile" in last_user["content"]  # original text preserved
+
+
 async def test_view_image_skipped_for_freshly_generated_image(tmp_path):
     # The agent sometimes calls view_image on an image it just generated; that only loads a
     # vision model to redescribe output the user already has. The loop must short-circuit it.

@@ -20,6 +20,17 @@ You have tools to read/write/edit files, run shell commands, search code, search
 web and fetch pages, manage skills, and store/recall long-term memory. Prefer using \
 tools over guessing.
 
+Ground answers in what's actually there — check, don't guess:
+- When the user names a local file or directory (a path like /Users/…, ~/…, ./x, or "look \
+at / check / 看下 <file>"), READ it with a tool (read_file, or bash cat/ls) BEFORE you answer, \
+edit it, or write anything about it. Never describe or rewrite a file you have not opened.
+- Do not fabricate shell commands, package names, install/run steps, flags, or code APIs. If \
+you are not certain something is real, verify it — read the file, fetch the project's \
+README/docs with fetch_url, or run `--help` — instead of guessing. A confident wrong command \
+wastes the user's time and breaks trust; checking first is what they want.
+- Answer the specific question in its real context (their project, their file). Do not pad the \
+reply with generic alternatives, unrelated tools, or boilerplate the user did not ask for.
+
 Current / external information:
 - The current date is provided with each user message — use it; do not guess the date \
 from your training data.
@@ -87,6 +98,24 @@ def wrap_workspace_context(cwd) -> str:
         f"<workspace reference-only>\nWorking directory: {cwd}\n"
         "Run shell and file commands here; relative paths resolve against it.\n"
         "</workspace>"
+    )
+
+
+def wrap_referenced_paths(paths: list[str]) -> str:
+    """Existing local paths the user named this turn, surfaced as a reference block riding the
+    *current user turn* (never the cacheable prefix, S3). "看下 <path>" is the strongest possible
+    signal to READ before answering, yet a weak-at-tools model often answers from imagination
+    instead — observed: asked to "看下 …/Makefile" it fabricated a whole Makefile without ever
+    opening the real 15.5K one. Naming the real paths in-context, at the exact moment, nudges it
+    to read them first. Existence-gated upstream, so it only ever lists files/dirs that are there."""
+    listed = "\n".join(f"- {p}" for p in paths)
+    return (
+        "<referenced-paths reference-only>\n"
+        "The user's message points at these local paths (they exist on disk):\n"
+        f"{listed}\n"
+        "Open them with read_file (or bash cat/ls) BEFORE answering about, editing, or writing "
+        "instructions for them — do not guess their contents.\n"
+        "</referenced-paths>"
     )
 
 

@@ -11,6 +11,7 @@ from assistant.agent.prompt import (
     build_system_prompt,
     wrap_datetime_context,
     wrap_memory_context,
+    wrap_referenced_paths,
 )
 
 
@@ -50,3 +51,21 @@ def test_system_prompt_has_plan_and_ethos():
     p = build_system_prompt("(skills index)")
     assert "update_plan" in p
     assert "multi-step" in p
+
+
+def test_system_prompt_has_grounding_policy():
+    # N53: a weak-at-tools model answered "看下 <Makefile>" from imagination — never opened the
+    # file, fabricated commands (`brew install mlx`) and a made-up code API. The static grounding
+    # rules (read named files first / don't fabricate / answer the actual question) live in the
+    # cacheable prefix, so they must be present regardless of the skills index.
+    p = build_system_prompt("(skills index)")
+    assert "READ it with a tool" in p  # read a named file before answering
+    assert "Do not fabricate" in p  # no invented commands / APIs
+    assert "fetch_url" in p  # verify from the real source
+
+
+def test_referenced_paths_block_is_reference_only_and_lists_paths():
+    block = wrap_referenced_paths(["/a/Makefile", "/b/README.md"])
+    assert block.startswith("<referenced-paths reference-only>")
+    assert "/a/Makefile" in block and "/b/README.md" in block
+    assert "read_file" in block and "BEFORE" in block

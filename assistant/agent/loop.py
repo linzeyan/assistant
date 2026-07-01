@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import datetime
@@ -23,6 +24,7 @@ from .prompt import (
     build_system_prompt,
     wrap_datetime_context,
     wrap_memory_context,
+    wrap_referenced_paths,
     wrap_workspace_context,
 )
 from .session import Session
@@ -36,6 +38,52 @@ log = logging.getLogger("assistant")
 # so the signal isn't call count — it's the same (name, args) repeating. Three ignored repeats is a
 # stuck loop, not work. A backstop constant, not a user knob: max_iters is the tunable budget.
 _THRASH_REPEAT_CAP = 3
+
+# Path-like substrings in a user turn: something containing a slash (a/b, /abs, ~/x, src/),
+# a bare filename.ext (config.toml, README.md), or a well-known extensionless name (Makefile,
+# Dockerfile). re.ASCII keeps \w to [A-Za-z0-9_] so CJK is NOT a word char — a path pressed
+# against Chinese ("看下/Users/…") still extracts as "/Users/…". The slash branches require a real
+# path char on one side so a lone "/" in prose (e.g. "read / write") never matches. This only
+# *finds candidates*; existence on disk is the real gate in _referenced_paths, so a token that
+# merely looks path-like but isn't there is dropped and false positives never reach the model.
+_KNOWN_BARE = "Makefile|Dockerfile|README|LICENSE|CHANGELOG|Rakefile|Gemfile|Justfile|Procfile"
+_PATH_LIKE = re.compile(
+    rf"[\w.~-]+/[\w./~-]*|/[\w./~-]+|(?<![\w./-])[\w-]+\.[A-Za-z][\w]*"
+    rf"|(?<![\w./-])(?:{_KNOWN_BARE})(?![\w.])",
+    re.ASCII,
+)
+
+
+def _referenced_paths(text: str, cwd: Path, *, limit: int = 5) -> list[str]:
+    """Local paths the user named this turn that actually exist on disk. A weak-at-tools model,
+    told to "看下 <path>", tends to answer from imagination instead of opening the file (observed:
+    it fabricated a whole Makefile without reading the real one). Surfacing the concrete existing
+    paths lets the loop nudge it to read them first — see wrap_referenced_paths. Existence is the
+    gate, so extraction can be liberal without risking bogus nudges."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for tok in _PATH_LIKE.findall(text or ""):
+        tok = tok.strip("'\"`").rstrip(".,;:")  # trim quotes + trailing sentence punctuation
+        if not tok:
+            continue
+        if tok.startswith("~"):
+            p = Path(tok).expanduser()
+        elif tok.startswith("/"):
+            p = Path(tok)
+        else:
+            p = cwd / tok
+        try:
+            if not p.exists():
+                continue
+        except OSError:  # overlong / malformed path — treat as not present
+            continue
+        s = str(p)
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+        if len(out) >= limit:  # cap: name a few, don't flood the turn
+            break
+    return out
 
 
 class AgentLoop:
@@ -130,10 +178,14 @@ class AgentLoop:
         # Reference-only blocks injected into the latest user message at send time (never the
         # cacheable system prefix, S3). The date is stamped once per turn so a local model —
         # which has no clock — stops hallucinating "today" from its training cutoff.
+        referenced = _referenced_paths(user_text, ctx.cwd)
         context_blocks = [
             wrap_datetime_context(datetime.now().astimezone()),
             wrap_workspace_context(ctx.cwd),
             wrap_memory_context(memory_block) if memory_block else "",
+            # An explicit "看下 <path>" is the strongest read-me signal; a weak model still guesses
+            # the file's contents without this in-context nudge (see _referenced_paths).
+            wrap_referenced_paths(referenced) if referenced else "",
         ]
         # P0 trace: assemble a per-turn record as the loop runs; recorded at each exit point.
         trace = TurnTrace.new(session.id, model, user_text) if self._trace else None
