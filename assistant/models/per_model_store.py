@@ -25,8 +25,9 @@ log = logging.getLogger("assistant")
 # Sampler/generation keys — the only ones merged into generation kwargs.
 ALLOWED_KEYS = ("temperature", "top_p", "top_k", "max_tokens")
 # Kinds a user may force via the type override. "auto" is the UI's way to clear it (→ detection);
-# it is never stored. Kept in sync with mlx_discovery.classify_kind's outputs.
-VALID_TYPES = ("llm", "vlm", "image", "video", "embed")
+# it is never stored. These MUST match mlx_discovery.classify_kind's outputs so a forced kind
+# routes the loader and filters into the right Models tab identically to a detected one.
+VALID_TYPES = ("llm", "vlm", "image", "video", "embedding")
 
 
 def _clean(settings: dict) -> dict:

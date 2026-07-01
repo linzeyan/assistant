@@ -151,15 +151,21 @@ class MlxVideoBackend(VideoService):
         self._steps = steps if steps is None or steps > 0 else None
 
     def available(self) -> bool:
-        # Check the REAL generation submodule, not just top-level ``mlx_video``: the unrelated
-        # PyPI "mlx-video" I/O lib also imports as ``mlx_video`` but has no ``models.wan_2``,
-        # so a top-level check falsely reports availability against the wrong package.
+        # We must confirm the REAL generation submodule (the unrelated PyPI "mlx-video" I/O lib
+        # imports under the same name but has no ``models.wan_2``). Do it WITHOUT importing
+        # mlx_video: find_spec on a *submodule* imports the parent packages, and mlx_video's
+        # __init__ drags in a ~1.7s heavy stack — which dominated backend startup. Instead locate
+        # the top-level package cheaply (a bare-name find_spec doesn't execute __init__) and check
+        # the submodule file on disk. The import cost then belongs at generate time, not boot.
         try:
-            return (
-                importlib.util.find_spec("mlx_video.models.wan_2.generate") is not None
-            )
-        except ImportError:
+            spec = importlib.util.find_spec("mlx_video")
+        except (ImportError, ValueError):
             return False
+        for loc in (spec.submodule_search_locations if spec else None) or []:
+            gen = Path(loc) / "models" / "wan_2" / "generate"
+            if gen.with_suffix(".py").is_file() or (gen / "__init__.py").is_file():
+                return True
+        return False
 
     async def generate_video(
         self,

@@ -6,6 +6,8 @@ or spawns the omlx model server. One supervision chain, torn down in reverse on 
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import time
 import uuid
@@ -345,16 +347,34 @@ async def lifespan(app: FastAPI):
     app.state.omlx_status = await model_service.start()
     _t = _phase("model backend start", _t)
 
-    gateway, app.state.telegram_error = await gateway_lifecycle.build_and_start(settings, app)
-    app.state.telegram = gateway
-    _t = _phase("telegram gateway", _t)
+    # Telegram's start() does a ~2s network handshake to api.telegram.org and nothing the GUI needs
+    # waits on it — so start it in the BACKGROUND instead of blocking boot (it was ~half of a ~4s
+    # startup). It publishes app.state.telegram / telegram_error once connected; until then
+    # status() simply reports "not running".
+    app.state.telegram = None
+    app.state.telegram_error = None
+
+    async def _start_telegram() -> None:
+        gw, err = await gateway_lifecycle.build_and_start(settings, app)
+        app.state.telegram = gw
+        app.state.telegram_error = err
+        log.info("startup: telegram gateway connected in background")
+
+    telegram_task = asyncio.create_task(_start_telegram())
     # Resume any download interrupted by the last shutdown (the hub continues partial files).
     await download_manager.resume_incomplete()
     _phase("download resume", _t)
-    log.info("startup: backend ready in %.2fs total", time.monotonic() - _boot)
+    log.info(
+        "startup: backend ready in %.2fs total (telegram connecting in background)",
+        time.monotonic() - _boot,
+    )
     try:
         yield
     finally:
+        # Stop the background start if it's still mid-handshake, then stop a connected gateway.
+        telegram_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await telegram_task
         await download_manager.aclose()
         gw = getattr(app.state, "telegram", None)
         if gw is not None:
