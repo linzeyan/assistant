@@ -18,7 +18,7 @@ from assistant.agent.compaction import CompactionManager
 from assistant.agent.llm_client import AsyncLLM
 from assistant.agent.hooks import HookRegistry
 from assistant.agent.loop import AgentLoop
-from assistant.downloads import DownloadManager
+from assistant.downloads import DownloadManager, hub_env
 from assistant.gateway import lifecycle as gateway_lifecycle
 from assistant.agent.session import SessionStore
 from assistant.agent.trace import TraceStore
@@ -276,17 +276,15 @@ async def lifespan(app: FastAPI):
     app.state.pending_approvals = {}
     # Model download manager (N17): progress / cancel / resume-after-restart / retry,
     # persisted to downloads.json under the data dir.
-    # Download tunables (N50): extra hub env + concurrency. HF_HUB_DISABLE_XET is the big one —
-    # Xet was measured throttling to a few KB/s on some networks — so it's on by default.
-    _download_env: dict[str, str] = {
-        "HF_HUB_DOWNLOAD_TIMEOUT": str(settings.hf_hub_download_timeout)
-    }
-    if settings.hf_hub_disable_xet:
-        _download_env["HF_HUB_DISABLE_XET"] = "1"
+    # Download tunables (N50): extra hub env + concurrency, GUI-editable (config↔Settings). See
+    # hub_env — HF_HUB_DISABLE_XET is the big one (Xet was measured throttling to a few KB/s).
     download_manager = DownloadManager(
         target_dir=settings.download_dir,
         state_path=settings.home_dir / "downloads.json",
-        env=_download_env,
+        env=hub_env(
+            disable_xet=settings.hf_hub_disable_xet,
+            download_timeout=settings.hf_hub_download_timeout,
+        ),
         max_workers=settings.hf_download_max_workers,
     )
     app.state.download_manager = download_manager

@@ -229,3 +229,51 @@ def test_put_config_merges_existing_keys(tmp_path, monkeypatch):
     written = tomllib.loads(cfg.read_text())
     assert written["approval_required"] is False  # preserved
     assert written["download_dir"].endswith("/dl")
+
+
+def test_get_config_reports_download_tunables(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+    with client:
+        body = client.get("/config").json()
+    assert body["hf_hub_disable_xet"] is True  # default: Xet off (measured throttling fix)
+    assert body["hf_hub_download_timeout"] == 120
+    assert body["hf_download_max_workers"] == 4
+
+
+def test_put_config_sets_download_tunables_live(tmp_path, monkeypatch):
+    # The download tunables apply live to the manager (next download uses them), persist to
+    # config.toml, and need no restart — so the GUI, not a hand-edited config, controls them.
+    client, cfg = _client(tmp_path, monkeypatch)
+    with client:
+        resp = client.put("/config", json={
+            "hf_hub_disable_xet": False,
+            "hf_hub_download_timeout": 300,
+            "hf_download_max_workers": 2,
+        })
+        kw = client.app.state.download_manager._runner.keywords  # runner rebuilt from settings
+        s = client.app.state.settings
+        toml_after = tomllib.loads(cfg.read_text())
+    assert resp.status_code == 200 and resp.json()["restart_required"] is False
+    assert kw["max_workers"] == 2
+    assert kw["env"] == {"HF_HUB_DOWNLOAD_TIMEOUT": "300"}  # xet not disabled → no XET key
+    assert s.hf_hub_disable_xet is False and s.hf_hub_download_timeout == 300
+    assert toml_after["hf_download_max_workers"] == 2
+
+
+def test_put_config_partial_download_update_keeps_other_fields(tmp_path, monkeypatch):
+    # Changing only max_workers must not drop the xet/timeout env — it's rebuilt from the merged
+    # settings, not just the patch.
+    client, _ = _client(tmp_path, monkeypatch)
+    with client:
+        client.put("/config", json={"hf_download_max_workers": 8})
+        kw = client.app.state.download_manager._runner.keywords
+    assert kw["max_workers"] == 8
+    assert kw["env"] == {"HF_HUB_DOWNLOAD_TIMEOUT": "120", "HF_HUB_DISABLE_XET": "1"}  # defaults kept
+
+
+def test_put_config_rejects_out_of_range_download_tunables(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+    with client:
+        bad_timeout = client.put("/config", json={"hf_hub_download_timeout": 0})
+        bad_workers = client.put("/config", json={"hf_download_max_workers": 99})
+    assert bad_timeout.status_code == 400 and bad_workers.status_code == 400

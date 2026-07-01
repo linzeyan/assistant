@@ -243,6 +243,11 @@ struct ConfigDTO: Decodable {
     let maxToolIters: Int
     let turnTimeoutS: Double?  // per-turn wall-clock budget in seconds; nil/None = unlimited
     let memCeilingGb: Double?  // engine-pool memory-admission ceiling in GB; nil/None = no ceiling
+    // Model-download tunables. hfHubDisableXet is the big one — Xet was measured throttling to a
+    // few KB/s on some networks.
+    let hfHubDisableXet: Bool
+    let hfHubDownloadTimeout: Int
+    let hfDownloadMaxWorkers: Int
     let configPath: String
     // Gateways (S9): the token is masked by the backend; full secret never crosses the wire.
     let telegramConfigured: Bool
@@ -264,6 +269,9 @@ struct ConfigDTO: Decodable {
         case maxToolIters = "max_tool_iters"
         case turnTimeoutS = "turn_timeout_s"
         case memCeilingGb = "mem_ceiling_gb"
+        case hfHubDisableXet = "hf_hub_disable_xet"
+        case hfHubDownloadTimeout = "hf_hub_download_timeout"
+        case hfDownloadMaxWorkers = "hf_download_max_workers"
         case telegramConfigured = "telegram_configured"
         case telegramTokenMasked = "telegram_token_masked"
         case telegramAllowedUsers = "telegram_allowed_users"

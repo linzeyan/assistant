@@ -19,6 +19,10 @@ struct SettingsScreen: View {
     @State private var maxToolIters: String = ""
     @State private var turnTimeoutS: String = ""
     @State private var memCeilingGb: String = ""
+    @State private var hfDisableXet: Bool = true
+    @State private var hfDownloadTimeout: String = ""
+    @State private var hfDownloadMaxWorkers: String = ""
+    @State private var downloadNote: String?
     @State private var configPath: String = ""
     @State private var savedNote: String?
     @State private var bindNote: String?
@@ -225,6 +229,40 @@ struct SettingsScreen: View {
                     + "out-of-memory. Empty or 0 = no cap (default). Governs chat/vision models; the "
                     + "image/video/audio backends load separately. Enforced on the next load — no "
                     + "restart.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
+            Section("Model downloads") {
+                // Save-on-change binding (like the HF-cache toggle) — seeded by load() without
+                // firing a save.
+                Toggle("Disable HuggingFace Xet transfer", isOn: Binding(
+                    get: { hfDisableXet },
+                    set: { hfDisableXet = $0; Task { await saveDownloadTuning() } }
+                ))
+                Text("Xet was measured throttling downloads to a few KB/s on some networks — leave "
+                    + "it off unless Xet is fast for you. Applies to the next download — no restart.")
+                    .font(.caption2).foregroundStyle(.secondary)
+
+                HStack(spacing: 10) {
+                    Text("Download timeout (s)").foregroundStyle(.secondary)
+                        .frame(width: labelWidth, alignment: .leading)
+                    TextField("", text: $hfDownloadTimeout, prompt: Text("120"))
+                        .textFieldStyle(.roundedBorder).frame(width: 100)
+                    Button("Save") { Task { await saveDownloadTuning() } }
+                }
+                HStack(spacing: 10) {
+                    Text("Max download workers").foregroundStyle(.secondary)
+                        .frame(width: labelWidth, alignment: .leading)
+                    TextField("", text: $hfDownloadMaxWorkers, prompt: Text("4"))
+                        .textFieldStyle(.roundedBorder).frame(width: 100)
+                    Button("Save") { Task { await saveDownloadTuning() } }
+                }
+                if let downloadNote {
+                    Text(downloadNote).font(.caption).foregroundStyle(.secondary)
+                }
+                Text("Per-file connect/read timeout, and how many files download at once. Fewer "
+                    + "workers can be steadier on a rate-limited connection. Applies to the next "
+                    + "download — no restart.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
@@ -613,6 +651,9 @@ struct SettingsScreen: View {
             } else {
                 memCeilingGb = ""
             }
+            hfDisableXet = cfg.hfHubDisableXet
+            hfDownloadTimeout = String(cfg.hfHubDownloadTimeout)
+            hfDownloadMaxWorkers = String(cfg.hfDownloadMaxWorkers)
             telegramAllowlist = cfg.telegramAllowedUsers.map(String.init).joined(separator: ", ")
             telegramConfigured = cfg.telegramConfigured
             telegramTokenMasked = cfg.telegramTokenMasked
@@ -734,6 +775,36 @@ struct SettingsScreen: View {
                 : "Saved — models over \(Int(gb))GB are refused instead of risking an out-of-memory."
         } catch {
             agentNote = "Save failed: \(error)"
+        }
+    }
+
+    private func saveDownloadTuning() async {
+        // Empty field = the default; all three are sent together so the toggle and either Save
+        // button converge on one call.
+        let rawT = hfDownloadTimeout.trimmingCharacters(in: .whitespaces)
+        let timeout = rawT.isEmpty ? 120 : (Int(rawT) ?? -1)
+        guard (1...3600).contains(timeout) else {
+            downloadNote = "Download timeout must be a number 1–3600 seconds."
+            return
+        }
+        let rawW = hfDownloadMaxWorkers.trimmingCharacters(in: .whitespaces)
+        let workers = rawW.isEmpty ? 4 : (Int(rawW) ?? -1)
+        guard (1...32).contains(workers) else {
+            downloadNote = "Max download workers must be a number 1–32."
+            return
+        }
+        do {
+            // Applies live — the next download uses these, no backend restart.
+            try await controller.client.putConfig(
+                hfHubDisableXet: hfDisableXet,
+                hfHubDownloadTimeout: timeout,
+                hfDownloadMaxWorkers: workers
+            )
+            let xet = hfDisableXet ? "Xet off" : "Xet on"
+            downloadNote =
+                "Saved — \(xet), timeout \(timeout)s, \(workers) workers. Applies to the next download."
+        } catch {
+            downloadNote = "Save failed: \(error)"
         }
     }
 

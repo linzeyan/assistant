@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from assistant.config import XDG_CONFIG_DIR
+from assistant.downloads import hub_env
 from assistant.gateway import lifecycle as gateway_lifecycle
 
 router = APIRouter(tags=["config"])
@@ -40,6 +41,11 @@ class ConfigPatch(BaseModel):
     max_tool_iters: int | None = None
     turn_timeout_s: float | None = None
     mem_ceiling_gb: float | None = None
+    # Model-download tunables (N50). hf_hub_disable_xet is the big one — Xet was measured throttling
+    # to a few KB/s on some networks. Applied live to the download manager (next download uses them).
+    hf_hub_disable_xet: bool | None = None
+    hf_hub_download_timeout: int | None = None
+    hf_download_max_workers: int | None = None
     # Gateways (S9): a token/allowlist edit (re)starts the gateway live, no backend restart.
     # An empty token clears it (stops the gateway).
     telegram_token: str | None = None
@@ -61,6 +67,9 @@ async def get_config(request: Request):
         "max_tool_iters": s.max_tool_iters,
         "turn_timeout_s": s.turn_timeout_s,
         "mem_ceiling_gb": s.mem_ceiling_gb,
+        "hf_hub_disable_xet": s.hf_hub_disable_xet,
+        "hf_hub_download_timeout": s.hf_hub_download_timeout,
+        "hf_download_max_workers": s.hf_download_max_workers,
         "config_path": str(_CONFIG_PATH),
         **gateway_lifecycle.status(request.app),  # telegram_* (token masked)
     }
@@ -114,6 +123,14 @@ async def put_config(patch: ConfigPatch, request: Request):
         raise HTTPException(
             status_code=400, detail="mem_ceiling_gb must be 0–4096 (0 disables)"
         )
+    if "hf_hub_download_timeout" in updates and not (1 <= updates["hf_hub_download_timeout"] <= 3600):
+        raise HTTPException(
+            status_code=400, detail="hf_hub_download_timeout must be 1–3600 seconds"
+        )
+    if "hf_download_max_workers" in updates and not (1 <= updates["hf_download_max_workers"] <= 32):
+        raise HTTPException(
+            status_code=400, detail="hf_download_max_workers must be 1–32"
+        )
     if "telegram_token" in updates:
         token = updates["telegram_token"].strip()
         if token and any(c.isspace() for c in token):
@@ -150,6 +167,9 @@ async def put_config(patch: ConfigPatch, request: Request):
 _DISCOVERY_KEYS = frozenset({"models_dir", "download_dir", "extra_model_dirs", "hf_cache"})
 _RESTART_KEYS = frozenset({"backend_host", "backend_port", "model_backend"})
 _GATEWAY_KEYS = frozenset({"telegram_token", "telegram_allowed_users"})
+_DOWNLOAD_KEYS = frozenset(
+    {"hf_hub_disable_xet", "hf_hub_download_timeout", "hf_download_max_workers"}
+)
 
 
 def _apply_live(request: Request, updates: dict) -> bool:
@@ -188,6 +208,25 @@ def _apply_live(request: Request, updates: dict) -> bool:
         service = getattr(request.app.state, "model_service", None)
         if service is not None and hasattr(service, "set_mem_ceiling"):
             service.set_mem_ceiling(updates["mem_ceiling_gb"])
+    if updates.keys() & _DOWNLOAD_KEYS:
+        # Applies live: rebuild the manager's tunables from the (now-updated) settings, so the next
+        # download uses them. Rebuilding from settings — not just the patch — keeps the untouched
+        # fields intact when only one of the three is changed.
+        if "hf_hub_disable_xet" in updates:
+            settings.hf_hub_disable_xet = updates["hf_hub_disable_xet"]
+        if "hf_hub_download_timeout" in updates:
+            settings.hf_hub_download_timeout = updates["hf_hub_download_timeout"]
+        if "hf_download_max_workers" in updates:
+            settings.hf_download_max_workers = updates["hf_download_max_workers"]
+        dm = getattr(request.app.state, "download_manager", None)
+        if dm is not None and hasattr(dm, "set_download_options"):
+            dm.set_download_options(
+                env=hub_env(
+                    disable_xet=settings.hf_hub_disable_xet,
+                    download_timeout=settings.hf_hub_download_timeout,
+                ),
+                max_workers=settings.hf_download_max_workers,
+            )
     # Gateway settings: stage onto live settings so the subsequent reload reads the new values
     # (the reload itself is async, so it runs in put_config, not here).
     if "telegram_token" in updates:

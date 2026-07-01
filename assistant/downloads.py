@@ -39,6 +39,16 @@ _DOWNLOAD_SCRIPT = (
 ACTIVE_STATUSES = frozenset({"queued", "downloading"})
 
 
+def hub_env(*, disable_xet: bool, download_timeout: int) -> dict[str, str]:
+    """The extra hub env for a download subprocess, from the user-tunable settings. Single source
+    so main.py (startup) and the live config PUT build it identically. HF_HUB_DISABLE_XET is the
+    big one — Xet was measured throttling to a few KB/s on some networks."""
+    env = {"HF_HUB_DOWNLOAD_TIMEOUT": str(download_timeout)}
+    if disable_xet:
+        env["HF_HUB_DISABLE_XET"] = "1"
+    return env
+
+
 @dataclass
 class DownloadState:
     repo_id: str
@@ -104,6 +114,15 @@ class DownloadManager:
     # --- public API ---
     def snapshot(self) -> list[dict]:
         return [s.to_public() for s in self._states.values()]
+
+    def set_download_options(self, *, env: dict[str, str] | None, max_workers: int) -> None:
+        """Update the download tunables live (from the config PUT). Rebinds the default subprocess
+        runner; only downloads STARTED AFTER this call see the change — an in-flight subprocess keeps
+        the env/workers it was spawned with. No-op safety isn't needed: routes_config only calls this
+        on the real manager (tests inject their own runner and never call it)."""
+        self._runner = functools.partial(
+            _subprocess_runner, env=env, max_workers=max_workers
+        )
 
     def start(self, repo_id: str) -> dict:
         existing = self._states.get(repo_id)
