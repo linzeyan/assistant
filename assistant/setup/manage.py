@@ -93,18 +93,53 @@ def _pypi_latest(package: str, *, now: float) -> str | None:
     return latest
 
 
+def _queryable_tools(settings: Settings) -> list[tuple[str, str]]:
+    """(package, module) for tools whose PyPI latest is worth checking: installed and not
+    source-overridden. Shared by the networked fetch and the non-networked cache reads so
+    all three agree on exactly which tools participate."""
+    sources = settings.managed_tool_sources or {}
+    return [
+        (meta["package"], meta["module"])
+        for key, meta in FEATURES.items()
+        if key not in sources and _installed(meta["module"])
+    ]
+
+
 def fetch_latest_versions(settings: Settings) -> dict[str, str | None]:
     """PyPI latest for installed, non-source tools (cached). Networked — call off the
     event loop. Source-overridden tools (e.g. a patched mlx-lm git build) are skipped:
     they update by re-pulling the source, so PyPI's version is irrelevant to them."""
-    sources = settings.managed_tool_sources or {}
     now = time.time()
+    return {
+        package: _pypi_latest(package, now=now)
+        for package, _module in _queryable_tools(settings)
+    }
+
+
+def cached_latest_versions(settings: Settings) -> dict[str, str | None]:
+    """Last-known PyPI-latest versions from the in-process cache, WITHOUT touching the
+    network. Mirrors ``fetch_latest_versions``' tool selection but returns ``None`` for any
+    tool not yet fetched. This lets ``/preflight`` answer instantly on a freshly spawned
+    backend (cold cache) instead of blocking on up to 2s/pkg of sequential PyPI lookups —
+    a real refresh warms the cache in the background and later polls pick it up. An absent
+    value means "no update info yet", which the GUI already treats as "no update"."""
     out: dict[str, str | None] = {}
-    for key, meta in FEATURES.items():
-        if key in sources or not _installed(meta["module"]):
-            continue
-        out[meta["package"]] = _pypi_latest(meta["package"], now=now)
+    for package, _module in _queryable_tools(settings):
+        cached = _pypi_cache.get(package)
+        out[package] = cached[0] if cached else None
     return out
+
+
+def latest_versions_fresh(settings: Settings, *, now: float | None = None) -> bool:
+    """True when every queryable tool has a within-TTL cache entry — i.e. a background
+    refresh would be a no-op. Lets the caller avoid scheduling redundant network work on
+    every poll (``/preflight`` is polled every few seconds)."""
+    now = time.time() if now is None else now
+    for package, _module in _queryable_tools(settings):
+        cached = _pypi_cache.get(package)
+        if cached is None or now - cached[1] >= _PYPI_TTL:
+            return False
+    return True
 
 
 def check_tools(

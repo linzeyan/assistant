@@ -93,6 +93,43 @@ def test_check_tools_update_available_needs_newer_pypi():
     assert tools["embeddings"]["update_available"] is expected
 
 
+def test_cached_latest_versions_is_non_networked(monkeypatch):
+    # /preflight serves cached versions without touching PyPI (blocking on it stalled the
+    # GUI's "Runtime" box for seconds every launch). A cold cache must yield a known set of
+    # keys all mapped to None — and any network attempt here is a bug.
+    from assistant.setup import manage
+
+    monkeypatch.setattr(manage, "_pypi_cache", {})
+    monkeypatch.setattr(manage, "_installed", lambda _m: True)  # env-independent tool set
+    monkeypatch.setattr(
+        manage.urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not hit the network")),
+    )
+    settings = Settings()
+    cached = manage.cached_latest_versions(settings)
+    assert cached and all(v is None for v in cached.values())  # known keys, no versions yet
+    assert manage.latest_versions_fresh(settings) is False  # cold → a refresh is warranted
+
+
+def test_latest_versions_fresh_tracks_ttl(monkeypatch):
+    # Freshness must flip with the cache's TTL so the route schedules a background warm only
+    # when needed (not on every poll). Seed the cache as fetch_latest_versions would.
+    from assistant.setup import manage
+
+    monkeypatch.setattr(manage, "_pypi_cache", {})
+    monkeypatch.setattr(manage, "_installed", lambda _m: True)
+    settings = Settings()
+    now = 1_000_000.0
+    for meta in FEATURES.values():
+        manage._pypi_cache[meta["package"]] = ("9.9.9", now)
+    assert manage.cached_latest_versions(settings) == {
+        meta["package"]: "9.9.9" for meta in FEATURES.values()
+    }
+    assert manage.latest_versions_fresh(settings, now=now + 1) is True
+    assert manage.latest_versions_fresh(settings, now=now + manage._PYPI_TTL + 1) is False
+
+
 def test_is_newer_semantics():
     from assistant.setup.manage import _is_newer
 
@@ -114,6 +151,37 @@ def test_find_uv_ignores_nonexistent_override(tmp_path, monkeypatch):
     monkeypatch.setenv("ASSISTANT_UV", str(tmp_path / "missing-uv"))
     monkeypatch.delenv("UV", raising=False)
     assert find_uv() != str(tmp_path / "missing-uv")
+
+
+async def test_preflight_route_never_blocks_on_network(monkeypatch):
+    # The point of the decoupling: a cold-cache /preflight must return immediately WITHOUT a
+    # synchronous PyPI call — otherwise the GUI's "Runtime" box stalls ~3s on every launch
+    # (fresh backend = cold per-process cache). Make any network attempt on the response path
+    # fail loudly; the response must still succeed with cached=None, and a background warm
+    # task must be scheduled to fill the versions in for a later poll.
+    import types
+
+    from assistant.api import routes_setup
+    from assistant.setup import manage
+
+    monkeypatch.setattr(manage, "_pypi_cache", {})
+    monkeypatch.setattr(manage, "_installed", lambda _m: True)
+    monkeypatch.setattr(
+        manage.urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("preflight blocked on PyPI")),
+    )
+
+    state = types.SimpleNamespace(settings=Settings(hf_cache=False), installs={})
+    request = types.SimpleNamespace(app=types.SimpleNamespace(state=state))
+
+    report = await routes_setup.get_preflight(request)
+    assert report["python"] and report["tools"]  # served real local facts, no network
+    assert all(t["latest"] is None for t in report["tools"])  # cold cache → no versions yet
+    # A single-flight background refresh was scheduled; cancel it so the test doesn't leak the
+    # detached task (it would swallow the urlopen error anyway — that path is fault-tolerant).
+    assert state.pypi_refresh_task is not None
+    state.pypi_refresh_task.cancel()
 
 
 async def test_perform_install_marks_done():

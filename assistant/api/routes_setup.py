@@ -18,9 +18,11 @@ from pydantic import BaseModel
 
 from assistant.setup.manage import (
     FEATURES,
+    cached_latest_versions,
     fetch_latest_versions,
     find_uv,
     install_command,
+    latest_versions_fresh,
     perform_install,
     preflight,
 )
@@ -59,12 +61,31 @@ def _run_install(
         raise RuntimeError(tail or f"install exited with {proc.returncode}")
 
 
+def _schedule_latest_refresh(app) -> None:
+    """Single-flight background warm of the PyPI-latest cache. ``/preflight`` must never
+    block on the network — the lookups are sequential (up to 2s/pkg) and the cache is
+    per-process, so awaiting them stalled the FIRST poll (and thus the GUI's "Runtime"
+    box) for seconds on every launch. Kick the refresh off detached; a later poll serves
+    the freshened versions. Guarded so polling every few seconds can't pile up tasks."""
+    task = getattr(app.state, "pypi_refresh_task", None)
+    if task is not None and not task.done():
+        return
+    app.state.pypi_refresh_task = asyncio.create_task(
+        asyncio.to_thread(fetch_latest_versions, app.state.settings)
+    )
+
+
 @router.get("/preflight")
 async def get_preflight(request: Request):
     settings = request.app.state.settings
-    # PyPI "latest" lookups touch the network — run them off the event loop (cached, so
-    # only the rare cache-miss actually does I/O). Drives the version-gated update button.
-    latest = await asyncio.to_thread(fetch_latest_versions, settings)
+    # Serve the cached PyPI-latest versions (empty on a cold process) WITHOUT blocking on the
+    # network, and warm the cache in the background if stale. The "Runtime" box needs only
+    # local facts (python/venv/config/models); the "update available" badges are eventually
+    # consistent — they appear on the next poll, and the client treats a missing flag as "no
+    # update". This is what cut Runtime's first paint from ~3s to instant on every launch.
+    if not latest_versions_fresh(settings):
+        _schedule_latest_refresh(request.app)
+    latest = cached_latest_versions(settings)
     report = preflight(settings, latest=latest)
     # Surface in-flight / finished installs so the GUI can show progress inline.
     report["installs"] = list(request.app.state.installs.values())
