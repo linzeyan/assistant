@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct DownloadsScreen: View {
@@ -5,6 +6,8 @@ struct DownloadsScreen: View {
     @State private var repoId = ""
     @State private var downloads: [DownloadDTO] = []
     @State private var error: String?
+    // Which row's repo id was just copied — flips its icon to a checkmark briefly as feedback.
+    @State private var copiedRepo: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -47,6 +50,15 @@ struct DownloadsScreen: View {
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text(item.repoId).lineLimit(1)
+                            // Copy the repo id so cancel + re-add (e.g. to pick up a fix) is one paste.
+                            Button { copy(item.repoId) } label: {
+                                Image(
+                                    systemName: copiedRepo == item.repoId
+                                        ? "checkmark" : "doc.on.doc"
+                                )
+                            }
+                            .buttonStyle(.borderless).foregroundStyle(.secondary)
+                            .help("Copy repo id")
                             Spacer()
                             statusBadge(item.status)
                             if item.isActive {
@@ -105,6 +117,16 @@ struct DownloadsScreen: View {
             } catch {
                 self.error = String(describing: error)
             }
+        }
+    }
+
+    private func copy(_ repoId: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(repoId, forType: .string)
+        copiedRepo = repoId
+        Task {
+            try? await Task.sleep(for: .seconds(1.2))
+            if copiedRepo == repoId { copiedRepo = nil }  // revert only if not re-copied since
         }
     }
 
