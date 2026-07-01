@@ -125,7 +125,7 @@ class _FakeFusion:
 
 def _gateway(
     allowed=None, models=None, default=None, audio=None, video=None, images=None,
-    fusion=None, model_dirs=None
+    fusion=None, model_dirs=None, download_manager=None
 ) -> TelegramGateway:
     return TelegramGateway(
         token="x",
@@ -139,6 +139,7 @@ def _gateway(
         images=images,
         fusion=fusion,
         model_dirs=model_dirs,
+        download_manager=download_manager,
     )
 
 
@@ -903,3 +904,85 @@ def test_clip_caption_caps_at_telegram_limit():
     long = "x" * 2000
     out = _clip_caption(long)
     assert len(out) <= 1024 and out.endswith("…")
+
+
+# --- /download (submit a model download from Telegram, N51) ---------------------------------
+
+class _FakeDownloads:
+    def __init__(self, snap):
+        self._snap = snap
+        self.started = []
+
+    def start(self, repo_id):
+        self.started.append(repo_id)
+        return {"repo_id": repo_id, "status": "queued"}
+
+    def snapshot(self):
+        return self._snap
+
+
+def _dl_update(uid=7):
+    update = Mock()
+    update.effective_user.id = uid
+    update.message.reply_text = AsyncMock(return_value=Mock(chat_id=42, message_id=99))
+    return update
+
+
+async def test_on_download_starts_and_reports_done():
+    # The happy path: /download <repo> submits to the shared manager and streams to a terminal
+    # state — here already "done", so the watch loop edits the final message on the first tick.
+    dl = _FakeDownloads([{
+        "repo_id": "org/m", "status": "done",
+        "total_bytes": 1_000_000, "downloaded_bytes": 1_000_000,
+        "eta_seconds": None, "error": None,
+    }])
+    gw = _gateway(allowed=[7], download_manager=dl)
+    update = _dl_update()
+    context = Mock()
+    context.args = ["org/m"]
+    context.bot.edit_message_text = AsyncMock()
+
+    await gw._on_download(update, context)
+
+    assert dl.started == ["org/m"]
+    final = context.bot.edit_message_text.await_args.args[0]
+    assert "✅" in final and "/models" in final
+
+
+async def test_on_download_rejects_missing_repo_id():
+    dl = _FakeDownloads([])
+    gw = _gateway(allowed=[7], download_manager=dl)
+    update = _dl_update()
+    context = Mock()
+    context.args = []  # no repo id
+    await gw._on_download(update, context)
+    assert dl.started == []  # nothing submitted
+    assert "Usage" in update.message.reply_text.await_args.args[0]
+
+
+async def test_on_download_unavailable_without_manager():
+    gw = _gateway(allowed=[7], download_manager=None)
+    update = _dl_update()
+    context = Mock()
+    context.args = ["org/m"]
+    await gw._on_download(update, context)
+    assert "unavailable" in update.message.reply_text.await_args.args[0].lower()
+
+
+def test_download_progress_line_has_bar_bytes_and_eta():
+    line = TelegramGateway._download_progress_line("org/m", {
+        "status": "downloading", "total_bytes": 2_000_000_000,
+        "downloaded_bytes": 1_000_000_000, "eta_seconds": 125, "error": None,
+    })
+    assert "org/m" in line and "50%" in line
+    assert "█" in line and "░" in line  # a half-filled bar
+    assert "GB" in line and "ETA 2m05s" in line
+
+
+def test_download_progress_line_without_size_shows_bytes_only():
+    # HfApi sizing can fail; the bar is omitted and we show bytes downloaded so far.
+    line = TelegramGateway._download_progress_line("org/m", {
+        "status": "downloading", "total_bytes": 0,
+        "downloaded_bytes": 5_000_000, "eta_seconds": None, "error": None,
+    })
+    assert "█" not in line and "MB" in line

@@ -41,6 +41,9 @@ async def build_and_start(settings, app) -> tuple[object | None, str | None]:
         default_workspace=settings.workspace_dir,
         # Live backend default model (GUI "Default"), so Telegram's default matches the desktop.
         default_store=getattr(app.state, "default_model_store", None),
+        # Shared with the GUI/HTTP downloads, so /download reuses the same manager (progress,
+        # cancel, resume) rather than a parallel path.
+        download_manager=getattr(app.state, "download_manager", None),
     )
     try:
         await gateway.start()

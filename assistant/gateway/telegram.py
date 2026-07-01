@@ -155,6 +155,28 @@ def _progress_bar(fraction: float, label: str = "", *, name: str = "", slots: in
     return f"{icon} {verb} {bar} {round(fraction * 100)}%{tail}"
 
 
+# --- /download progress rendering (N51) ------------------------------------------------------
+_DOWNLOAD_POLL_INTERVAL = 3.0  # seconds between snapshot polls (well under Telegram's edit limit)
+_DOWNLOAD_WATCH_MAX_TICKS = 2400  # ~2h; a longer download keeps running, just stops being watched
+
+
+def _human_bytes(n: int) -> str:
+    size = float(max(0, n))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _fmt_duration(seconds: int) -> str:
+    m, s = divmod(max(0, int(seconds)), 60)
+    if m >= 60:
+        h, m = divmod(m, 60)
+        return f"{h}h{m:02d}m"
+    return f"{m}m{s:02d}s" if m else f"{s}s"
+
+
 class _StreamEditor:
     """Accumulates streamed text into one Telegram message, throttling edits to
     avoid hitting Telegram's per-chat edit rate limits."""
@@ -243,6 +265,7 @@ class TelegramGateway:
         model_dirs=None,
         default_workspace=None,
         default_store=None,
+        download_manager=None,
     ):
         self._token = token
         self._allowed = set(allowed_users or [])
@@ -268,6 +291,9 @@ class TelegramGateway:
         self._images = images
         # Optional Fusion engine (panel+judge). Powers /fusion (toggle + pick panel & judge).
         self._fusion = fusion
+        # Optional DownloadManager (shared with the GUI/HTTP downloads). Powers /download: submit a
+        # HuggingFace repo and watch its progress. Absent -> /download reports it's unavailable.
+        self._downloads = download_manager
         self._app = None
         self._pending: dict[str, asyncio.Future] = {}
         # Per-chat model override, set via the /models inline-keyboard picker. Takes
@@ -303,6 +329,7 @@ class TelegramGateway:
         app.add_handler(CommandHandler("stop", self._on_stop))
         app.add_handler(CommandHandler("models", self._on_models))
         app.add_handler(CommandHandler("cd", self._on_cd))
+        app.add_handler(CommandHandler("download", self._on_download))
         app.add_handler(CommandHandler("video", self._on_video))
         app.add_handler(CommandHandler("videoset", self._on_videoset))
         app.add_handler(CommandHandler("image", self._on_image))
@@ -325,6 +352,7 @@ class TelegramGateway:
                     ("stop", "Stop the turn that's currently running"),
                     ("models", "Pick the chat model"),
                     ("cd", "Set the working directory for this chat"),
+                    ("download", "Download a model from HuggingFace"),
                     ("video", "Pick the video-generation model"),
                     ("videoset", "Video defaults: resolution & quality"),
                     ("image", "Pick the image-generation model"),
@@ -395,6 +423,8 @@ class TelegramGateway:
             "Just send a message. Send a 🎤 voice note to get a spoken reply.\n"
             "/models — switch the chat model (⚠️ = weak at tool calls; pick a *-Coder for "
             "coding/agent tasks)\n"
+            "/download — fetch a model from HuggingFace, e.g. <code>/download "
+            "mlx-community/Qwen2.5-7B-Instruct-4bit</code>; progress streams here\n"
             "/fusion — panel+judge: several models answer and one synthesizes a more accurate "
             "reply. Turn it on, tick the panel + a ⭐ judge, then choose <b>fusion</b> in "
             "/models.\n\n"
@@ -514,6 +544,85 @@ class TelegramGateway:
         await update.message.reply_text(
             "Pick the video-generation model:", reply_markup=InlineKeyboardMarkup(rows)
         )
+
+    async def _on_download(self, update: "Update", context) -> None:
+        if not await self._ensure_allowed(update):
+            return
+        if self._downloads is None:
+            await update.message.reply_text("Model download is unavailable on this backend.")
+            return
+        repo_id = " ".join(context.args or []).strip()
+        if not repo_id or any(c.isspace() for c in repo_id):
+            # Match the HTTP route's contract: a single 'namespace/name', no spaces/line breaks.
+            await update.message.reply_text(
+                "Usage: <code>/download namespace/name</code>\n"
+                "e.g. <code>/download mlx-community/Qwen2.5-7B-Instruct-4bit</code>",
+                parse_mode="HTML",
+            )
+            return
+        # start() is idempotent and resumes a partial. The download runs as its own backend task,
+        # so the watch loop below only mirrors progress — ending it never stops the download.
+        self._downloads.start(repo_id)
+        msg = await update.message.reply_text(f"⬇️ Queued: {repo_id}")
+        await self._watch_download(context.bot, msg.chat_id, msg.message_id, repo_id)
+
+    async def _watch_download(self, bot, chat_id, message_id, repo_id: str) -> None:
+        shown = ""
+        terminal = {"done", "error", "cancelled"}
+
+        async def _edit(text: str) -> None:
+            nonlocal shown
+            if text == shown:  # skip no-op edits (Telegram rejects "message is not modified")
+                return
+            shown = text
+            with contextlib.suppress(Exception):  # transient rate limit / edit failure is non-fatal
+                await bot.edit_message_text(text[:4000], chat_id=chat_id, message_id=message_id)
+
+        for _ in range(_DOWNLOAD_WATCH_MAX_TICKS):
+            item = next(
+                (d for d in self._downloads.snapshot() if d["repo_id"] == repo_id), None
+            )
+            if item is None:  # removed from the list out from under us
+                await _edit(f"⬇️ {repo_id}: no longer tracked.")
+                return
+            if item["status"] in terminal:
+                await _edit(self._download_final_line(repo_id, item))
+                return
+            await _edit(self._download_progress_line(repo_id, item))
+            await asyncio.sleep(_DOWNLOAD_POLL_INTERVAL)
+        await _edit(
+            f"⬇️ {repo_id}: still downloading in the background — check the app's Downloads."
+        )
+
+    @staticmethod
+    def _download_progress_line(repo_id: str, item: dict) -> str:
+        total = item.get("total_bytes") or 0
+        done = item.get("downloaded_bytes") or 0
+        if total:
+            frac = done / total
+            filled = round(frac * 12)
+            bar = "█" * filled + "░" * (12 - filled)
+            line = (
+                f"⬇️ {repo_id}\n{bar} {round(frac * 100)}% · "
+                f"{_human_bytes(done)} / {_human_bytes(total)}"
+            )
+        else:  # size unknown (HfApi lookup failed) — show bytes only, no bar
+            line = f"⬇️ {repo_id}\n{_human_bytes(done)} downloaded…"
+        eta = item.get("eta_seconds")
+        if eta:
+            line += f" · ETA {_fmt_duration(eta)}"
+        return line
+
+    @staticmethod
+    def _download_final_line(repo_id: str, item: dict) -> str:
+        status = item["status"]
+        if status == "done":
+            total = item.get("total_bytes") or item.get("downloaded_bytes") or 0
+            size = f" ({_human_bytes(total)})" if total else ""
+            return f"✅ Downloaded {repo_id}{size}. Pick it with /models."
+        if status == "cancelled":
+            return f"⏹ Cancelled {repo_id}."
+        return f"⚠️ Download failed: {repo_id}\n{_clip_error(item.get('error') or 'unknown error')}"
 
     # Quality presets for /videoset; None ("Default") lets the checkpoint config decide (≈40).
     _STEP_PRESETS = (("Fast 20", 20), ("Balanced 30", 30), ("Quality 40", 40))
