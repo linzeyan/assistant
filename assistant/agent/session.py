@@ -279,6 +279,22 @@ class SessionStore:
                 existed = True
         return existed
 
+    def clear_all(self) -> int:
+        """Delete every conversation — in-memory cache AND on-disk files. Returns how many distinct
+        conversations existed (Settings → "clear all conversations"), counting an uncheckpointed
+        in-memory session even though it has no file yet. Best-effort per file so one undeletable
+        entry doesn't abort the sweep."""
+        ids = set(self._sessions)
+        if self._dir is not None:
+            for path in self._dir.glob("*.json"):
+                ids.add(path.stem)
+                try:
+                    path.unlink()
+                except OSError:
+                    pass  # locked / vanished — skip, don't abort the clear
+        self._sessions.clear()
+        return len(ids)
+
     # --- internals ---
 
     def _load(self, session_id: str) -> Session | None:

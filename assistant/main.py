@@ -29,6 +29,7 @@ from assistant.api import (
     routes_config,
     routes_downloads,
     routes_images,
+    routes_logs,
     routes_memory,
     routes_models,
     routes_openai,
@@ -394,6 +395,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(routes_traces.router)
     app.include_router(routes_skills.router)
     app.include_router(routes_memory.router)
+    app.include_router(routes_logs.router)
     app.include_router(routes_images.router)
     app.include_router(routes_vision.router)
     app.include_router(routes_audio.router)

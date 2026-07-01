@@ -183,6 +183,29 @@ async def test_resume_reaps_only_our_orphan_download_subprocesses(tmp_path, monk
     assert killed == [111]  # only the orphan under our target dir; the user's 222 is untouched
 
 
+def test_hub_env_enables_hf_transfer_when_installed(monkeypatch):
+    # hf_transfer (Rust chunk-parallel downloader) saturates the link even at max_workers=1 — the
+    # reason the CLI outran the backend at the same worker count. Enable it when importable; skip
+    # when absent (hf_hub errors if the flag is set without the package).
+    import importlib.util as real_util
+
+    import assistant.downloads as dl
+
+    def present(name):
+        return object() if name == "hf_transfer" else real_util.find_spec(name)
+
+    def absent(name):
+        return None if name == "hf_transfer" else real_util.find_spec(name)
+
+    monkeypatch.setattr(dl.importlib.util, "find_spec", present)
+    env = dl.hub_env(disable_xet=True, download_timeout=120)
+    assert env["HF_HUB_ENABLE_HF_TRANSFER"] == "1" and env["HF_HUB_DISABLE_XET"] == "1"
+
+    monkeypatch.setattr(dl.importlib.util, "find_spec", absent)
+    env2 = dl.hub_env(disable_xet=False, download_timeout=60)
+    assert "HF_HUB_ENABLE_HF_TRANSFER" not in env2 and "HF_HUB_DISABLE_XET" not in env2
+
+
 def test_to_public_bounds_eta_so_it_never_overflows():
     # The crash fix: a stalled/near-zero rate makes remaining/rate astronomical — which overflowed
     # the client's Int64 and corrupted the whole downloads decode. Both ends are bounded so ETA is

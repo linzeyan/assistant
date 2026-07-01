@@ -58,6 +58,22 @@ def test_compact_nothing_old_enough_reports_no_change(tmp_path):
         assert body["compacted"] is False and "context_tokens" in body
 
 
+def test_delete_all_sessions_clears_everything(tmp_path):
+    # Settings "clear all conversations": DELETE /sessions wipes every saved chat and reports the
+    # count. Distinct path from /sessions/{id}, so it isn't a delete of a session named "".
+    with _client(tmp_path) as client:
+        store = client.app.state.sessions
+        for _ in range(2):
+            s = store.create(model="m")
+            s.add_user("hi")
+            store.checkpoint(s)
+        assert len(client.get("/sessions").json()["sessions"]) == 2
+
+        r = client.delete("/sessions")
+        assert r.status_code == 200 and r.json()["deleted"] == 2
+        assert client.get("/sessions").json()["sessions"] == []  # gone from memory AND disk
+
+
 def test_search_endpoint_finds_session_and_returns_snippet(tmp_path):
     # F/S14: GET /sessions/search is matched as a literal path (declared before /{session_id}),
     # not swallowed by the dynamic route, and returns matching sessions with a snippet.

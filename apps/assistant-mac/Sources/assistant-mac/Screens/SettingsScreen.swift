@@ -28,6 +28,10 @@ struct SettingsScreen: View {
     @State private var bindNote: String?
     @State private var backendKindNote: String?
     @State private var agentNote: String?
+    // Maintenance (clear logs / clear all conversations) — destructive, so gated behind a confirm.
+    @State private var maintenanceNote: String?
+    @State private var confirmClearLogs = false
+    @State private var confirmClearSessions = false
 
     @State private var fusionEnabled = false
     @State private var fusionPanel: Set<String> = []
@@ -267,9 +271,55 @@ struct SettingsScreen: View {
             }
 
             fusionSection
+            maintenanceSection
         }
         .formStyle(.grouped)
         .task { await loadFusion() }
+    }
+
+    private var maintenanceSection: some View {
+        Section("Maintenance") {
+            HStack(spacing: 10) {
+                Button("Clear logs") { confirmClearLogs = true }
+                Button("Clear all conversations", role: .destructive) { confirmClearSessions = true }
+            }
+            if let maintenanceNote {
+                Text(maintenanceNote).font(.caption).foregroundStyle(.secondary)
+            }
+            Text("Clear logs truncates the backend log files. Clear all conversations permanently "
+                + "deletes every saved chat — this can't be undone.")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .confirmationDialog("Clear the backend logs?", isPresented: $confirmClearLogs) {
+            Button("Clear logs", role: .destructive) { Task { await clearLogs() } }
+            Button("Cancel", role: .cancel) {}
+        }
+        .confirmationDialog(
+            "Delete every saved conversation?", isPresented: $confirmClearSessions
+        ) {
+            Button("Delete all", role: .destructive) { Task { await clearAllConversations() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This permanently removes all chat history and can't be undone.")
+        }
+    }
+
+    private func clearLogs() async {
+        do {
+            try await controller.client.clearLogs()
+            maintenanceNote = "Logs cleared."
+        } catch {
+            maintenanceNote = "Couldn't clear logs: \(error.localizedDescription)"
+        }
+    }
+
+    private func clearAllConversations() async {
+        do {
+            try await controller.client.clearAllSessions()
+            maintenanceNote = "All conversations deleted."
+        } catch {
+            maintenanceNote = "Couldn't clear conversations: \(error.localizedDescription)"
+        }
     }
 
     /// Chat models eligible for a Fusion panel/judge — excludes embedding/image/video kinds and

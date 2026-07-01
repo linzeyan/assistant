@@ -129,6 +129,12 @@ struct AssistantClient {
     func deleteSession(_ id: String) async throws {
         try await sendJSONNoDecode("DELETE", "/sessions/\(id)", body: [:])
     }
+    func clearAllSessions() async throws {
+        try await sendJSONNoDecode("DELETE", "/sessions", body: [:])
+    }
+    func clearLogs() async throws {
+        try await postJSONNoDecode("/logs/clear", body: [:])
+    }
 
     func installTool(feature: String, upgrade: Bool = false) async throws {
         try await postJSONNoDecode("/setup/install", body: ["feature": feature, "upgrade": upgrade])

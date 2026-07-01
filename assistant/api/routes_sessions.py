@@ -60,6 +60,16 @@ async def get_session(session_id: str, request: Request):
     }
 
 
+@router.delete("/sessions")
+async def clear_all_sessions(request: Request):
+    """Delete ALL conversations at once (Settings → clear all). A distinct path from
+    ``/sessions/{session_id}`` so it can't be mistaken for deleting a session literally named
+    the empty string."""
+    removed = request.app.state.sessions.clear_all()
+    log.info("cleared all sessions: %d removed", removed)
+    return {"deleted": removed}
+
+
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, request: Request):
     ok = request.app.state.sessions.delete_session(session_id)

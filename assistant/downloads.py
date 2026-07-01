@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import importlib.util
 import json
 import logging
 import os
@@ -59,6 +60,13 @@ def hub_env(*, disable_xet: bool, download_timeout: int) -> dict[str, str]:
     env = {"HF_HUB_DOWNLOAD_TIMEOUT": str(download_timeout)}
     if disable_xet:
         env["HF_HUB_DISABLE_XET"] = "1"
+    # hf_transfer is the Rust chunk-parallel downloader: it opens several connections PER FILE, so it
+    # saturates the link even at max_workers=1. A single plain-HTTPS stream to the HF CDN was measured
+    # capping ~1.9 MB/s (and stalling), while the huggingface-cli — which uses hf_transfer — hit
+    # 5-8 MB/s at the same worker count. Enable it whenever the package is importable; hf_hub raises
+    # if the flag is set without it, so gate on the import. (With Xet on, Xet wins and this is inert.)
+    if importlib.util.find_spec("hf_transfer") is not None:
+        env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     return env
 
 

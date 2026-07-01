@@ -255,7 +255,9 @@ def test_put_config_sets_download_tunables_live(tmp_path, monkeypatch):
         toml_after = tomllib.loads(cfg.read_text())
     assert resp.status_code == 200 and resp.json()["restart_required"] is False
     assert kw["max_workers"] == 2
-    assert kw["env"] == {"HF_HUB_DOWNLOAD_TIMEOUT": "300"}  # xet not disabled → no XET key
+    # xet not disabled → no XET key. (HF_HUB_ENABLE_HF_TRANSFER is env-dependent — see its own test.)
+    assert kw["env"]["HF_HUB_DOWNLOAD_TIMEOUT"] == "300"
+    assert "HF_HUB_DISABLE_XET" not in kw["env"]
     assert s.hf_hub_disable_xet is False and s.hf_hub_download_timeout == 300
     assert toml_after["hf_download_max_workers"] == 2
 
@@ -268,7 +270,9 @@ def test_put_config_partial_download_update_keeps_other_fields(tmp_path, monkeyp
         client.put("/config", json={"hf_download_max_workers": 8})
         kw = client.app.state.download_manager._runner.keywords
     assert kw["max_workers"] == 8
-    assert kw["env"] == {"HF_HUB_DOWNLOAD_TIMEOUT": "120", "HF_HUB_DISABLE_XET": "1"}  # defaults kept
+    # defaults kept (timeout + xet); the env-dependent hf_transfer key is asserted in its own test.
+    assert kw["env"]["HF_HUB_DOWNLOAD_TIMEOUT"] == "120"
+    assert kw["env"]["HF_HUB_DISABLE_XET"] == "1"
 
 
 def test_put_config_rejects_out_of_range_download_tunables(tmp_path, monkeypatch):
