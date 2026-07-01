@@ -239,12 +239,25 @@ struct ModelSettingsView: View {
     @State private var topP = ""
     @State private var topK = ""
     @State private var maxTokens = ""
+    @State private var type = "auto"
     @State private var saving = false
     @State private var error: String?
+
+    // "auto" = trust detection; the rest force the loader (fixes a misdetected checkpoint, e.g. a
+    // model wrongly seen as VLM that crashes the mlx-vlm loader — force it to load as a plain LLM).
+    private static let typeChoices = ["auto", "llm", "vlm", "image", "video", "embedding"]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Type").font(.caption2).foregroundStyle(.secondary)
+                    Picker("", selection: $type) {
+                        ForEach(Self.typeChoices, id: \.self) { Text($0).tag($0) }
+                    }
+                    .labelsHidden().frame(width: 96)
+                    .help("Force how this model loads instead of auto-detecting its kind")
+                }
                 field("Temperature", $temperature)
                 field("Top-p", $topP)
                 field("Top-k", $topK)
@@ -253,6 +266,8 @@ struct ModelSettingsView: View {
             HStack(spacing: 8) {
                 Button("Save") { Task { await save() } }.disabled(saving)
                 Button("Clear") {
+                    // Clears the sampler overrides; the type override is left as-is (set it to
+                    // "auto" in the picker to drop it).
                     temperature = ""; topP = ""; topK = ""; maxTokens = ""
                     Task { await save() }
                 }.disabled(saving)
@@ -277,6 +292,7 @@ struct ModelSettingsView: View {
         topP = s.topP.map { String($0) } ?? ""
         topK = s.topK.map { String($0) } ?? ""
         maxTokens = s.maxTokens.map { String($0) } ?? ""
+        type = s.type ?? "auto"
     }
 
     private func save() async {
@@ -287,6 +303,7 @@ struct ModelSettingsView: View {
         if let v = Double(topP) { body["top_p"] = v }
         if let v = Int(topK) { body["top_k"] = v }
         if let v = Int(maxTokens) { body["max_tokens"] = v }
+        if type != "auto" { body["type"] = type }  // "auto" omits it → clears the override
         do {
             try await controller.client.setModelSettings(modelID, body)
             error = nil

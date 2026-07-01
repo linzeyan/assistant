@@ -157,6 +157,23 @@ struct DTODecodingTests {
         #expect(dto.messages[2].content == nil)  // non-string content tolerated → nil
     }
 
+    @Test func modelSettingsDecodesTypeOverride() throws {
+        // The per-model settings carry an optional forced-kind override alongside sampler params.
+        let dto = try decode(
+            ModelSettingsDTO.self,
+            #"{"model":"m","settings":{"temperature":0.5,"top_k":40,"type":"llm"}}"#)
+        #expect(dto.settings.type == "llm")
+        #expect(dto.settings.temperature == 0.5)
+        #expect(dto.settings.topK == 40)
+    }
+
+    @Test func modelSettingsTypeOverrideDefaultsNilWhenAbsent() throws {
+        // No override saved → type is nil → the picker shows "auto" (detection).
+        let dto = try decode(
+            ModelSettingsDTO.self, #"{"model":"m","settings":{"temperature":0.2}}"#)
+        #expect(dto.settings.type == nil)
+    }
+
     @Test func sessionSummaryMapsCountAndTimestamp() throws {
         let dto = try decode(
             SessionSummaryDTO.self,

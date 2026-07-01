@@ -69,11 +69,13 @@ struct ModelSettingsDTO: Decodable {
         let topP: Double?
         let topK: Int?
         let maxTokens: Int?
+        let type: String?  // forced kind override (llm/vlm/image/video/embedding); nil = auto
         enum CodingKeys: String, CodingKey {
             case temperature
             case topP = "top_p"
             case topK = "top_k"
             case maxTokens = "max_tokens"
+            case type
         }
     }
 }
