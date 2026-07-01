@@ -126,6 +126,16 @@ def _build_model_service(settings: Settings, per_model=None, fusion=None):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings: Settings = app.state.settings
+    # Startup timing (task: "backend start/restart is slow"). Static profiling showed the Python
+    # side is fast (import ~0.2s, discovery ~0.01s, mlx-lm is lazy), so the cost — if any — is in
+    # the async steps below (model backend start / Telegram gateway network handshake / download
+    # resume). Log each phase's wall time so a real restart names the culprit instead of guessing.
+    _boot = time.monotonic()
+
+    def _phase(label: str, since: float) -> float:
+        now = time.monotonic()
+        log.info("startup: %s took %.2fs", label, now - since)
+        return now
 
     # Ensure the user-facing model dirs exist so a fresh default install doesn't present
     # a "missing" path (and downloads have somewhere to land). Best-effort, never fatal.
@@ -329,14 +339,19 @@ async def lifespan(app: FastAPI):
         trace_store=trace_store,
     )
 
+    _t = _phase("build services + discovery", _boot)
     # Start the model backend. Non-fatal: a missing backend (no omlx / no mlx-lm)
     # still serves so the GUI can render and tell the user how to enable it.
     app.state.omlx_status = await model_service.start()
+    _t = _phase("model backend start", _t)
 
     gateway, app.state.telegram_error = await gateway_lifecycle.build_and_start(settings, app)
     app.state.telegram = gateway
+    _t = _phase("telegram gateway", _t)
     # Resume any download interrupted by the last shutdown (the hub continues partial files).
     await download_manager.resume_incomplete()
+    _phase("download resume", _t)
+    log.info("startup: backend ready in %.2fs total", time.monotonic() - _boot)
     try:
         yield
     finally:
