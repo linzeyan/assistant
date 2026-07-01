@@ -556,7 +556,7 @@ class TelegramGateway:
         # start() is idempotent and resumes a partial. The download runs as its own backend task,
         # so the watch loop below only mirrors progress — ending it never stops the download.
         self._downloads.start(repo_id)
-        msg = await update.message.reply_text(f"⬇️ Queued: {repo_id}")
+        msg = await update.message.reply_text(self._download_queued_line(repo_id))
         await self._watch_download(context.bot, msg.chat_id, msg.message_id, repo_id)
 
     async def _watch_download(self, bot, chat_id, message_id, repo_id: str) -> None:
@@ -581,11 +581,22 @@ class TelegramGateway:
             if item["status"] in terminal:
                 await _edit(self._download_final_line(repo_id, item))
                 return
-            await _edit(self._download_progress_line(repo_id, item))
+            # A queued download hasn't started — show "queued", not a "0 B downloaded…" progress
+            # line (which looked like it was already transferring). Progress appears once it begins.
+            if item["status"] == "queued":
+                await _edit(self._download_queued_line(repo_id))
+            else:
+                await _edit(self._download_progress_line(repo_id, item))
             await asyncio.sleep(_DOWNLOAD_POLL_INTERVAL)
         await _edit(
             f"⬇️ {repo_id}: still downloading in the background — check the app's Downloads."
         )
+
+    @staticmethod
+    def _download_queued_line(repo_id: str) -> str:
+        # Same text for the initial reply and the queued watch ticks, so _edit dedups (no flicker)
+        # until the download actually starts and the progress line takes over.
+        return f"⏳ Queued: {repo_id} — waiting for the current download to finish…"
 
     @staticmethod
     def _download_progress_line(repo_id: str, item: dict) -> str:

@@ -74,9 +74,11 @@ class Settings(BaseSettings):
     # Per-file connect/read timeout (seconds) for hub downloads (HF_HUB_DOWNLOAD_TIMEOUT). HF's own
     # default (~10s) is too tight on a slow link and aborts large shards mid-transfer.
     hf_hub_download_timeout: int = 120
-    # Concurrent file downloads for snapshot_download(max_workers=...). Fewer workers can be steadier
-    # on a rate-limited/flaky connection; HF defaults to 8.
-    hf_download_max_workers: int = 4
+    # Concurrent file downloads for snapshot_download(max_workers=...). Each file is a single HTTP
+    # connection (Xet off), so ONE worker caps at that connection's throughput (~2 MB/s observed);
+    # parallel files are what reach a link's full bandwidth. Default 8 to match the `huggingface-cli`
+    # default (the speed users compare against); lower it only for a rate-limited/flaky connection.
+    hf_download_max_workers: int = 8
 
     # --- native modality models (mlx-* backends; used when the extra is installed) ---
     embed_memory: bool = True  # embeddings-backed semantic memory search

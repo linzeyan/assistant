@@ -237,7 +237,7 @@ def test_get_config_reports_download_tunables(tmp_path, monkeypatch):
         body = client.get("/config").json()
     assert body["hf_hub_disable_xet"] is True  # default: Xet off (measured throttling fix)
     assert body["hf_hub_download_timeout"] == 120
-    assert body["hf_download_max_workers"] == 4
+    assert body["hf_download_max_workers"] == 8  # matches the huggingface-cli default
 
 
 def test_put_config_sets_download_tunables_live(tmp_path, monkeypatch):

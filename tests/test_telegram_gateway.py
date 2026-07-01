@@ -969,6 +969,50 @@ async def test_on_download_unavailable_without_manager():
     assert "unavailable" in update.message.reply_text.await_args.args[0].lower()
 
 
+def test_download_queued_line_says_waiting_not_downloaded():
+    line = TelegramGateway._download_queued_line("org/m")
+    assert "Queued" in line and "org/m" in line
+    assert "downloaded" not in line.lower()  # a queued item isn't transferring yet
+
+
+async def test_watch_download_shows_queued_before_progress(monkeypatch):
+    # N56: a queued download must show "Queued …", not a "0 B downloaded…" progress line that looks
+    # like it's already transferring. Progress appears only once it flips to downloading.
+    import assistant.gateway.telegram as tg
+
+    monkeypatch.setattr(tg.asyncio, "sleep", AsyncMock())  # don't actually wait between ticks
+    snaps = [
+        [{"repo_id": "org/m", "status": "queued", "total_bytes": 0, "downloaded_bytes": 0,
+          "eta_seconds": None, "error": None}],
+        [{"repo_id": "org/m", "status": "downloading", "total_bytes": 1000, "downloaded_bytes": 500,
+          "eta_seconds": None, "error": None}],
+        [{"repo_id": "org/m", "status": "done", "total_bytes": 1000, "downloaded_bytes": 1000,
+          "eta_seconds": None, "error": None}],
+    ]
+
+    class _Seq:
+        def __init__(self):
+            self.i = 0
+
+        def snapshot(self):
+            s = snaps[min(self.i, len(snaps) - 1)]
+            self.i += 1
+            return s
+
+    gw = _gateway(allowed=[7], download_manager=_Seq())
+    bot = Mock()
+    bot.edit_message_text = AsyncMock()
+    await gw._watch_download(bot, 42, 99, "org/m")
+
+    edits = [c.args[0] for c in bot.edit_message_text.await_args_list]
+    assert any("Queued" in e for e in edits)  # queued tick
+    assert any("50%" in e for e in edits)  # progress only after it starts downloading
+    assert any("✅" in e for e in edits)  # terminal
+    # The queued tick never claimed transfer had begun.
+    queued_edits = [e for e in edits if "Queued" in e]
+    assert all("downloaded" not in e.lower() for e in queued_edits)
+
+
 def test_download_progress_line_has_bar_bytes_and_eta():
     line = TelegramGateway._download_progress_line("org/m", {
         "status": "downloading", "total_bytes": 2_000_000_000,

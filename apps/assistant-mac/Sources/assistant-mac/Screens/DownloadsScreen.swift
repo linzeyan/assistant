@@ -66,7 +66,7 @@ struct DownloadsScreen: View {
                             }
                         }
                         if item.isActive {
-                            ProgressView(value: item.fraction)  // nil -> indeterminate
+                            ProgressView(value: item.barValue)  // queued -> static 0; else fraction
                             progressLine(item)
                         }
                         if let detail = item.error {
