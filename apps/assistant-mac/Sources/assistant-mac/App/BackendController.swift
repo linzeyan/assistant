@@ -103,14 +103,17 @@ final class BackendController: ObservableObject {
             backend.spawn()
             installTerminationGuard()
         }
-        // The child takes a moment to bind the port; poll instead of failing on the race.
-        for _ in 0..<40 {  // ~20s
+        // The child binds the port in ~0.25s now (fast startup), so poll tightly at first to
+        // render as soon as it's up, then back off for the long tail (cold venv / slow machine).
+        // probe() is a /status GET that fails instantly (connection refused) while it's still
+        // booting, so tight polling costs nothing.
+        for i in 0..<52 {  // 15×0.1s + 37×0.5s ≈ 20s budget
             if await probe() {
                 await refresh()
                 startHealthMonitor()
                 return
             }
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            try? await Task.sleep(nanoseconds: i < 15 ? 100_000_000 : 500_000_000)
         }
         await refresh()  // final attempt surfaces lastError if still down
         startHealthMonitor()
