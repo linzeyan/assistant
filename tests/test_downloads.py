@@ -156,20 +156,26 @@ async def test_eta_reported_while_downloading(tmp_path):
 async def test_resume_reaps_only_our_orphan_download_subprocesses(tmp_path, monkeypatch):
     # A download detaches (start_new_session) and survives a backend restart; resume must reap that
     # orphan before re-spawning, or two processes fight over the same files and stall at 0 B/s. The
-    # match is scoped to OUR target dir so a user's unrelated huggingface-cli download is spared.
+    # match is scoped to OUR target dir (a user's unrelated huggingface-cli download is spared) AND
+    # to true orphans (PPID=1): a subprocess with a live parent belongs to another RUNNING backend —
+    # a manual restart racing the app's supervisor made two backends reap each other's downloads.
     from types import SimpleNamespace
 
     import assistant.downloads as dl
 
     target = tmp_path / "models"
     killed: list[int] = []
+    # 111: our true orphan (ppid 1). 222: not our dir. 333: ours but parent still alive.
+    ppids = {"111": "1", "222": "1", "333": "555"}
 
     def fake_run(cmd, **kw):
         if cmd[0] == "pgrep":
-            return SimpleNamespace(stdout="111\n222\n")  # two snapshot_download processes exist
+            return SimpleNamespace(stdout="111\n222\n333\n")
         if cmd[0] == "ps":
             pid = cmd[cmd.index("-p") + 1]
-            path = str(target) if pid == "111" else "/some/other/place"  # 222 is not ours
+            if "ppid=" in cmd:
+                return SimpleNamespace(stdout=f"{ppids[pid]}\n")
+            path = "/some/other/place" if pid == "222" else str(target)
             return SimpleNamespace(stdout=f"python -c ...snapshot_download... {path}/org/m 1\n")
         return SimpleNamespace(stdout="")
 
@@ -180,7 +186,7 @@ async def test_resume_reaps_only_our_orphan_download_subprocesses(tmp_path, monk
     mgr = DownloadManager(target_dir=target, state_path=tmp_path / "downloads.json")
     await mgr.resume_incomplete()
 
-    assert killed == [111]  # only the orphan under our target dir; the user's 222 is untouched
+    assert killed == [111]  # not 222 (someone else's) and not 333 (a live backend's)
 
 
 def test_hub_env_enables_hf_transfer_when_installed(monkeypatch):
@@ -227,6 +233,24 @@ def test_to_public_bounds_eta_so_it_never_overflows():
     healthy = DownloadState(repo_id="org/m", status="downloading", total_bytes=1_000_000,
                             downloaded_bytes=400_000, rate_bps=200_000.0)
     assert healthy.to_public()["eta_seconds"] == 3
+
+
+def test_to_public_clamps_downloaded_to_total():
+    # Progress polls the directory size, which also counts the hub's .cache bookkeeping; stale
+    # *.incomplete files from a cancelled attempt pushed the GUI to "54.24 GB / 53.81 GB · 100%
+    # · ETA 0s" while still transferring. Downloaded is clamped to the known total, and a
+    # zero-remaining ETA is reported unknown rather than the meaningless "0s".
+    from assistant.downloads import DownloadState
+
+    over = DownloadState(repo_id="org/m", status="downloading", total_bytes=1_000,
+                         downloaded_bytes=1_100, rate_bps=200_000.0)
+    pub = over.to_public()
+    assert pub["downloaded_bytes"] == 1_000
+    assert pub["eta_seconds"] is None
+
+    # Unknown total: raw bytes pass through (the GUI falls back to a bytes-only line).
+    unsized = DownloadState(repo_id="org/m", status="downloading", downloaded_bytes=123)
+    assert unsized.to_public()["downloaded_bytes"] == 123
 
 
 def test_manager_binds_env_and_max_workers_onto_default_runner(tmp_path):

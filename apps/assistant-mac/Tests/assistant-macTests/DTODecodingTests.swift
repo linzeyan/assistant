@@ -90,18 +90,18 @@ struct DTODecodingTests {
         #expect(!dto.isResumable)
     }
 
-    @Test func downloadBarValueIsStaticZeroWhenQueued() throws {
-        // A queued download shows a static 0% bar, not the indeterminate animation (which reads as
-        // "endlessly trying"). Once downloading with a known size, the bar tracks the fraction.
-        let queued = try decode(
-            DownloadDTO.self,
-            #"{"repo_id":"org/m","status":"queued","total_bytes":0,"downloaded_bytes":0}"#)
-        #expect(queued.barValue == 0)  // not nil → determinate, not animated
-
+    @Test func downloadFractionTracksKnownTotalAndCapsAtOne() throws {
+        // The screen shows a bar only while "downloading" (a queued item has no progress to show);
+        // the bar tracks fraction, which must cap at 1 even if the backend ever over-reports.
         let active = try decode(
             DownloadDTO.self,
             #"{"repo_id":"org/m","status":"downloading","total_bytes":1000,"downloaded_bytes":250}"#)
-        #expect(active.barValue == 0.25)
+        #expect(active.fraction == 0.25)
+
+        let over = try decode(
+            DownloadDTO.self,
+            #"{"repo_id":"org/m","status":"downloading","total_bytes":1000,"downloaded_bytes":1100}"#)
+        #expect(over.fraction == 1)
     }
 
     @Test func downloadDTOToleratesOverflowingETA() throws {

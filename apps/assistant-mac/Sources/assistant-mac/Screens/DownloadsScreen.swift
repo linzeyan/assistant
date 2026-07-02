@@ -77,8 +77,10 @@ struct DownloadsScreen: View {
                                 .help("Remove from list")
                             }
                         }
-                        if item.isActive {
-                            ProgressView(value: item.barValue)  // queued -> static 0; else fraction
+                        // Only a transferring item gets a bar; a queued one hasn't started, so a
+                        // bar (even at 0%) reads as stalled progress. The badge already says "queued".
+                        if item.status == "downloading" {
+                            ProgressView(value: item.fraction)  // nil total -> indeterminate
                             progressLine(item)
                         }
                         if let detail = item.error {

@@ -176,9 +176,6 @@ struct DownloadDTO: Decodable, Identifiable, Hashable {
     var fraction: Double? {
         totalBytes > 0 ? min(1, Double(downloadedBytes) / Double(totalBytes)) : nil
     }
-    /// Progress-bar value. Queued downloads haven't started, so they show a static 0% bar rather
-    /// than the indeterminate animation, which reads as "endlessly trying to download".
-    var barValue: Double? { status == "queued" ? 0 : fraction }
     var isActive: Bool { status == "queued" || status == "downloading" }
     var isResumable: Bool { status == "error" || status == "cancelled" }
 }

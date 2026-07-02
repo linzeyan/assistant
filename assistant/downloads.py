@@ -80,19 +80,29 @@ class DownloadState:
     rate_bps: float = 0.0  # runtime-only EMA; never persisted
 
     def to_public(self) -> dict:
+        # Downloaded is clamped to the repo total: progress polls the directory size, which also
+        # counts the hub's .cache/huggingface bookkeeping — stale *.incomplete files from an
+        # earlier cancelled attempt made the GUI show "54.24 GB / 53.81 GB · 100%" while still
+        # transferring. The clamp keeps the pair honest; the real bytes land at "done".
+        downloaded = (
+            min(self.downloaded_bytes, self.total_bytes)
+            if self.total_bytes
+            else self.downloaded_bytes
+        )
         # ETA is bounded on BOTH ends so it can never blow up: a stalled/near-zero rate or an
         # absurdly long estimate is reported as unknown (None) rather than a giant integer that
-        # overflows the client's Int64 and corrupts the whole downloads response.
+        # overflows the client's Int64 and corrupts the whole downloads response. Zero remaining
+        # (clamped progress, tail still verifying/moving) is unknown too — "ETA 0s" is a lie.
         eta = None
         if self.status == "downloading" and self.rate_bps >= _ETA_MIN_RATE_BPS and self.total_bytes:
-            remaining = max(0, self.total_bytes - self.downloaded_bytes)
+            remaining = max(0, self.total_bytes - downloaded)
             secs = int(remaining / self.rate_bps)
-            eta = secs if secs <= _ETA_MAX_S else None
+            eta = secs if 0 < secs <= _ETA_MAX_S else None
         return {
             "repo_id": self.repo_id,
             "status": self.status,
             "total_bytes": self.total_bytes,
-            "downloaded_bytes": self.downloaded_bytes,
+            "downloaded_bytes": downloaded,
             "eta_seconds": eta,
             # Current transfer speed (10s-window average) so the GUI can show "· 12.3 MB/s". Only
             # meaningful while downloading; None otherwise.
@@ -219,8 +229,10 @@ class DownloadManager:
         a detached session (start_new_session) so it SURVIVES a backend restart — and resume would
         then spawn a DUPLICATE. Two processes downloading the same repo contend on the hub's per-file
         .lock and the transfer crawls, then deadlocks at 0 B/s (observed: an orphan with PPID=1 next
-        to the resumed one). At startup we own no downloads yet, so any such process is an orphan.
-        Matched narrowly — our exact `python -c` body AND a path under our target dir — so a user's
+        to the resumed one). A true orphan is reparented to launchd (PPID=1) — a subprocess whose
+        parent is still alive belongs to ANOTHER RUNNING backend (observed: a manual restart racing
+        the app's supervisor made the two backends reap each other's in-flight downloads). Matched
+        narrowly — our exact `python -c` body AND a path under our target dir — so a user's
         unrelated `huggingface-cli download` is never touched. Best-effort: pgrep/pkill may be absent."""
         with contextlib.suppress(Exception):
             found = subprocess.run(
@@ -233,6 +245,11 @@ class DownloadManager:
                 ).stdout
                 if str(self._target_dir) not in cmd:
                     continue  # someone else's download, not ours — leave it alone
+                ppid = subprocess.run(
+                    ["ps", "-p", pid, "-o", "ppid="], capture_output=True, text=True
+                ).stdout.strip()
+                if ppid != "1":
+                    continue  # parent still alive -> another backend owns it — leave it alone
                 with contextlib.suppress(ProcessLookupError, ValueError, PermissionError):
                     os.killpg(os.getpgid(int(pid)), signal.SIGKILL)
                     log.warning("reaped orphaned download subprocess pid=%s", pid)
@@ -422,8 +439,10 @@ async def _subprocess_runner(
             return
         await drainer  # let the last stderr lines land before we inspect the tail
         if proc.returncode != 0:
-            err = "\n".join(stderr_tail)[-500:].strip() or f"exit {proc.returncode}"
-            raise RuntimeError(err)
+            # Lead with the exit code: the stderr tail alone can be pure noise (a harmless
+            # FutureWarning masked a SIGKILL — the surfaced "error" said deprecation, not death).
+            tail = "\n".join(stderr_tail)[-500:].strip()
+            raise RuntimeError(f"exit {proc.returncode}" + (f": {tail}" if tail else ""))
         state.downloaded_bytes = _dir_size(target) or state.downloaded_bytes
     finally:
         watcher.cancel()
