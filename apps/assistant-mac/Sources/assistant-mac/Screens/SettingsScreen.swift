@@ -286,11 +286,11 @@ struct SettingsScreen: View {
             if let maintenanceNote {
                 Text(maintenanceNote).font(.caption).foregroundStyle(.secondary)
             }
-            Text("Clear logs truncates the backend log files. Clear all conversations permanently "
-                + "deletes every saved chat — this can't be undone.")
+            Text("Clear logs truncates the backend and app log files. Clear all conversations "
+                + "permanently deletes every saved chat — this can't be undone.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
-        .confirmationDialog("Clear the backend logs?", isPresented: $confirmClearLogs) {
+        .confirmationDialog("Clear the backend and app logs?", isPresented: $confirmClearLogs) {
             Button("Clear logs", role: .destructive) { Task { await clearLogs() } }
             Button("Cancel", role: .cancel) {}
         }
