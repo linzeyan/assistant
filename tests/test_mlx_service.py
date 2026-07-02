@@ -333,6 +333,62 @@ async def test_stream_chat_emits_prose_before_suppressing_tool_markup(tmp_path):
     assert any(e["type"] == "tool_calls" for e in events)
 
 
+async def test_stream_chat_drops_truncated_tool_marker_instead_of_leaking_it(tmp_path):
+    # The user's screenshot bug: a turn ended with a bare "<tool_call>" (the model opened a tool
+    # call then hit EOS/max_tokens with nothing inside). parse returns no call, and the raw marker
+    # must NOT leak back as visible text — once a marker opens, the tail is a failed tool attempt.
+    _make_model(tmp_path, "qwen")
+    tokens = ("All done. ", "<tool_call>")  # opened, never filled
+    svc = _service(tmp_path, tokens=tokens)
+    await svc.start()
+
+    events = [
+        e
+        async for e in svc.stream_chat(
+            [{"role": "user", "content": "x"}], "qwen", tools=_READ_FILE_TOOL
+        )
+    ]
+    text = "".join(e["content"] for e in events if e["type"] == "text")
+    assert text == "All done. "  # prose kept, bare marker dropped
+    assert "<tool_call>" not in text
+    assert not any(e["type"] == "tool_calls" for e in events)
+
+
+_EDIT_TOOL = [
+    {
+        "type": "function",
+        "function": {
+            "name": "Edit",
+            "parameters": {"properties": {"replace_all": {"type": "boolean"}}},
+        },
+    }
+]
+
+
+async def test_stream_chat_normalizes_overquoted_scalar_against_schema(tmp_path):
+    # Qwen3-Coder emitted `"replace_all": "False"` (string); the middleware must coerce it to the
+    # boolean the schema declares before the event leaves the service, or the downstream validator
+    # rejects the whole call (the observed InputValidationError).
+    _make_model(tmp_path, "qwen")
+    tokens = (
+        "<tool_call>",
+        '{"name": "Edit", "arguments": {"replace_all": "False", "file_path": "a.md"}}',
+        "</tool_call>",
+    )
+    svc = _service(tmp_path, tokens=tokens)
+    await svc.start()
+
+    events = [
+        e
+        async for e in svc.stream_chat(
+            [{"role": "user", "content": "x"}], "qwen", tools=_EDIT_TOOL
+        )
+    ]
+    (tc,) = [e for e in events if e["type"] == "tool_calls"][0]["tool_calls"]
+    assert tc["arguments"]["replace_all"] is False  # coerced string -> bool
+    assert tc["arguments"]["file_path"] == "a.md"  # untouched
+
+
 async def test_stream_chat_plain_text_has_no_tool_calls(tmp_path):
     _make_model(tmp_path, "qwen")
     svc = _service(tmp_path, tokens=("The answer ", "is 42."))

@@ -34,6 +34,16 @@ _HERMES_OPEN = "<tool_call>"
 _FUNCTION_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
 _PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
 
+# Harmony (OpenAI gpt-oss): a tool call rides the "commentary" channel as
+#   ...to=functions.NAME <|constrain|>json<|message|>{...json args...}<|call|>
+# The recipient carries the tool name; the JSON payload follows <|message|> up to <|call|>.
+# UNVERIFIED against real gpt-oss output — the model isn't downloaded yet, and how mlx-lm's
+# tokenizer renders the harmony control tokens (<|message|>/<|call|>) after decode must be
+# confirmed against a live capture before this is trusted (see _HARMONY note in parse_tool_calls).
+_HARMONY_CALL_RE = re.compile(
+    r"to=functions\.([\w.-]+).*?<\|message\|>\s*(\{.*?\})\s*<\|call\|>", re.DOTALL
+)
+
 # Markers a streaming consumer watches for to stop emitting text and start
 # buffering a tool call. Bare JSON has no marker (handled by a leading-brace check).
 # ``<function=`` covers Qwen3-Coder's wrapper-less XML form: without it the raw XML
@@ -189,10 +199,31 @@ def parse_tool_calls(
         if calls:
             return calls
 
+    # Harmony (gpt-oss): `to=functions.NAME … <|message|>{json}<|call|>`. Distinctive enough to
+    # trust without a wrapper. NOTE: pattern is written to the documented harmony spec but not yet
+    # verified against a live gpt-oss capture — confirm and adjust once the model is downloaded.
+    if "to=functions." in text and "<|call|>" in text:
+        harmony = [
+            _coerce_call({"name": name, "arguments": args})
+            for name, args in (
+                (m.group(1), _first_json(m.group(2)))
+                for m in _HARMONY_CALL_RE.finditer(text)
+            )
+        ]
+        harmony = [c for c in harmony if c is not None]
+        if harmony:
+            return _assign_ids(harmony)
+
     stripped = text.strip()
     if stripped[:1] in "{[" and known_names:
         return _coerce_all(_iter_json_values(stripped), restrict=known_names)
     return []
+
+
+def _first_json(s: str):
+    """Best-effort: the first JSON value in ``s`` (harmony's <|message|> payload), or {} ."""
+    vals = _iter_json_values(s)
+    return vals[0] if vals else {}
 
 
 def earliest_marker(buffer: str, start: int = 0) -> int | None:
@@ -203,3 +234,50 @@ def earliest_marker(buffer: str, start: int = 0) -> int | None:
         if idx != -1 and (best is None or idx < best):
             best = idx
     return best
+
+
+def _coerce_scalar(value: str, types: list[str]):
+    """Coerce a stringified argument to the scalar type its schema declares. Local models over-quote
+    non-strings — Qwen3-Coder emitted ``"replace_all": "False"`` (a string) for a boolean param, and
+    Claude Code's schema validator then rejected the whole call. Conservative: only touch a value
+    that maps CLEANLY, and never when ``string`` is an accepted type (the model may have meant the
+    literal text)."""
+    if "string" in types:
+        return value  # ambiguous — a union with string; leave the literal alone
+    low = value.strip().lower()
+    if "boolean" in types and low in ("true", "false"):
+        return low == "true"
+    if "integer" in types:
+        try:
+            return int(value.strip())
+        except ValueError:
+            pass
+    if "number" in types:
+        try:
+            return float(value.strip())
+        except ValueError:
+            pass
+    if "null" in types and low in ("null", "none"):
+        return None
+    return value
+
+
+def normalize_arguments(arguments: dict, properties: dict) -> dict:
+    """Schema-aware coercion of a parsed call's arguments — the normalization middleware shared by
+    every consumer (the Anthropic /v1/messages compat route AND the assistant's own agent loop both
+    reach it through mlx_service). ``properties`` is the tool's JSON-Schema ``properties`` map; each
+    string argument whose param declares a scalar (boolean/integer/number/null) type is coerced to
+    it. Unknown params and non-string values pass through untouched, so a well-formed call is never
+    altered."""
+    if not isinstance(arguments, dict) or not properties:
+        return arguments
+    out = {}
+    for key, val in arguments.items():
+        prop = properties.get(key) if isinstance(properties, dict) else None
+        if isinstance(val, str) and isinstance(prop, dict):
+            declared = prop.get("type")
+            types = [declared] if isinstance(declared, str) else list(declared or [])
+            out[key] = _coerce_scalar(val, types)
+        else:
+            out[key] = val
+    return out

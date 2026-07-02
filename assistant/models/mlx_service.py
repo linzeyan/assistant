@@ -29,7 +29,12 @@ from .mlx_discovery import DiscoveredModel, discover_models
 from .mlx_engine import MlxEnginePool, _estimate_model_bytes, _total_ram_bytes
 from .service import ModelService
 from .status import BackendState, BackendStatus
-from .tool_parsing import TOOL_MARKERS, earliest_marker, parse_tool_calls
+from .tool_parsing import (
+    TOOL_MARKERS,
+    earliest_marker,
+    normalize_arguments,
+    parse_tool_calls,
+)
 from .types import ModelInfo
 
 # Fraction of physical RAM the pool may commit to model weights before refusing a load. The slack
@@ -359,6 +364,12 @@ class MlxModelService(ModelService):
         first_char_seen = False
         json_mode = False
         saw_marker = False
+        # name → JSON-Schema properties, for the argument-normalization middleware below.
+        schemas = {
+            fn.get("name"): (fn.get("parameters") or {}).get("properties") or {}
+            for t in (tools or [])
+            if (fn := (t.get("function") or {})).get("name")
+        }
         try:
             while True:
                 kind, payload = await queue.get()
@@ -391,16 +402,29 @@ class MlxModelService(ModelService):
 
             calls = parse_tool_calls(buffer, known_names=known_names)
             if calls:
+                # Normalize each call's arguments against its tool schema (the shared middleware):
+                # local models over-quote scalars (e.g. Qwen3-Coder's `"replace_all": "False"`),
+                # which the downstream schema validator would reject. schemas maps name→properties.
                 yield {
                     "type": "tool_calls",
                     "tool_calls": [
-                        {"id": c.id, "name": c.name, "arguments": c.arguments}
+                        {
+                            "id": c.id,
+                            "name": c.name,
+                            "arguments": normalize_arguments(
+                                c.arguments, schemas.get(c.name, {})
+                            ),
+                        }
                         for c in calls
                     ],
                 }
-            else:
+            elif not saw_marker:
+                # No call parsed AND no marker was seen: this is genuine prose — flush it.
                 remainder = buffer[emitted:]
                 if remainder:
                     yield {"type": "text", "content": remainder}
+            # else: a tool marker opened but yielded no valid call (truncated at max_tokens/EOS, or
+            # malformed) — drop the raw markup instead of leaking a bare "<tool_call>" to the user
+            # (the symptom the user saw). Tool syntax must never surface as text (cf. N3/N67).
         finally:
             await fut

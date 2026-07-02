@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from assistant.models.tool_parsing import earliest_marker, parse_tool_calls
+from assistant.models.tool_parsing import (
+    earliest_marker,
+    normalize_arguments,
+    parse_tool_calls,
+)
 
 
 def test_hermes_single_block():
@@ -131,3 +135,54 @@ def test_json_block_still_wins_over_xml_fallback():
     calls = parse_tool_calls(text)
     assert calls[0].name == "read_file"
     assert calls[0].arguments == {"path": "a.py"}
+
+
+def test_harmony_gpt_oss_tool_call_is_parsed():
+    # gpt-oss rides the harmony "commentary" channel: `to=functions.NAME … <|message|>{json}<|call|>`.
+    # (Best-effort until verified against a live gpt-oss capture.)
+    text = (
+        "analysis I'll write it.<|end|>"
+        "commentary to=functions.Write <|constrain|>json"
+        '<|message|>{"file_path": "a.md", "content": "hi"}<|call|>'
+    )
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "Write"
+    assert calls[0].arguments == {"file_path": "a.md", "content": "hi"}
+    assert calls[0].id.startswith("call_")
+
+
+def test_normalize_coerces_overquoted_scalars_to_schema_types():
+    # The bug from the Qwen3-Coder session: `"replace_all": "False"` (a string) made Claude Code's
+    # validator reject the Edit call ("expected boolean, got string"). The middleware coerces each
+    # over-quoted scalar to the type its schema declares.
+    props = {
+        "replace_all": {"type": "boolean"},
+        "count": {"type": "integer"},
+        "ratio": {"type": "number"},
+        "parent": {"type": ["string", "null"]},
+        "file_path": {"type": "string"},
+    }
+    args = {
+        "replace_all": "False",  # -> False
+        "count": "3",  # -> 3
+        "ratio": "0.5",  # -> 0.5
+        "parent": "None",  # union with string -> left as "None" (ambiguous, don't guess)
+        "file_path": "None.md",  # a real string -> untouched
+        "unknown": "True",  # not in schema -> untouched
+    }
+    out = normalize_arguments(args, props)
+    assert out["replace_all"] is False
+    assert out["count"] == 3
+    assert out["ratio"] == 0.5
+    assert out["parent"] == "None"  # string union: never guessed away
+    assert out["file_path"] == "None.md"
+    assert out["unknown"] == "True"
+
+
+def test_normalize_leaves_correct_calls_and_odd_shapes_untouched():
+    # A well-formed call is never altered; missing schema / non-dict args are safe no-ops.
+    props = {"flag": {"type": "boolean"}}
+    assert normalize_arguments({"flag": True}, props) == {"flag": True}
+    assert normalize_arguments({"flag": "maybe"}, props) == {"flag": "maybe"}  # not a clean bool
+    assert normalize_arguments({"x": "1"}, {}) == {"x": "1"}  # no schema → untouched
