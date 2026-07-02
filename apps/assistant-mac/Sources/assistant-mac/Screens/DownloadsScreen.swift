@@ -60,6 +60,13 @@ struct DownloadsScreen: View {
                             .buttonStyle(.borderless).foregroundStyle(.secondary)
                             .help("Copy repo id")
                             Spacer()
+                            // A determinate bar creeps imperceptibly on a huge, slow download (a
+                            // 66 GB repo at ~1.6 MB/s moves ~0.05%/poll), so the row looks frozen.
+                            // A small spinner is an unambiguous "still working" cue that a barely-
+                            // moving bar can't give on its own.
+                            if item.status == "downloading" {
+                                ProgressView().controlSize(.small)
+                            }
                             statusBadge(item.status)
                             if item.isActive {
                                 Button("Cancel") { cancel(item.repoId) }
@@ -188,8 +195,17 @@ struct DownloadsScreen: View {
         } else if item.downloadedBytes > 0 {
             parts.append(bytes(item.downloadedBytes))
         }
-        if let r = item.rateBps, r > 0 { parts.append(speed(r)) }
-        if let secs = item.etaSeconds { parts.append("ETA \(eta(secs))") }
+        if let r = item.rateBps, r > 0 {
+            parts.append(speed(r))
+            if let secs = item.etaSeconds { parts.append("ETA \(eta(secs))") }
+        } else if item.status == "downloading" {
+            // The 10s-average rate briefly reads 0 whenever a finished shard is verified/moved
+            // before the next one streams. Without this the whole speed/ETA tail vanishes and the
+            // row collapses to a bare "36%" with a static bar — which reads as a stalled or broken
+            // transfer even though bytes are still landing. A steady marker keeps it visibly live
+            // without inventing a rate we don't have (and without implying an interruption).
+            parts.append("…")
+        }
         return parts.joined(separator: " · ")
     }
 

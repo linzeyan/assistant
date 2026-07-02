@@ -119,6 +119,38 @@ struct DTODecodingTests {
         #expect(dto.rateBps == nil)  // absent field tolerated
     }
 
+    @Test func progressTextKeepsTailStableWhileDownloadingWithoutRate() throws {
+        // A slow download's 10s-average rate dips to 0 while a shard is finalised. The line must NOT
+        // collapse to a bare "… · 36%" (which reads as stalled/broken) — it keeps a steady marker.
+        let noRate = try decode(
+            DownloadDTO.self,
+            #"{"repo_id":"m","status":"downloading","total_bytes":1000,"downloaded_bytes":360}"#)
+        let line = DownloadsScreen.progressText(noRate)
+        #expect(line.contains("36%"))
+        #expect(line.hasSuffix("…"))  // steady liveness marker, no invented speed/ETA
+        #expect(!line.contains("/s"))
+
+        // With a real rate, speed + ETA show and the placeholder is gone.
+        let withRate = try decode(
+            DownloadDTO.self,
+            """
+            {"repo_id":"m","status":"downloading","total_bytes":1000,"downloaded_bytes":360,
+             "rate_bps":1600000.0,"eta_seconds":400}
+            """)
+        let full = DownloadsScreen.progressText(withRate)
+        #expect(full.contains("/s"))
+        #expect(full.contains("ETA"))
+        #expect(!full.contains("…"))
+    }
+
+    @Test func progressTextHasNoLivenessMarkerWhenNotDownloading() throws {
+        // A queued/finished row never shows the downloading placeholder.
+        let queued = try decode(
+            DownloadDTO.self,
+            #"{"repo_id":"m","status":"queued","total_bytes":1000,"downloaded_bytes":0}"#)
+        #expect(!DownloadsScreen.progressText(queued).contains("…"))
+    }
+
     @Test func chatEventMapsSessionId() throws {
         let event = try decode(ChatEvent.self, #"{"type":"session","session_id":"abc"}"#)
         #expect(event.type == "session")
