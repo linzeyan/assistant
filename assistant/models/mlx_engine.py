@@ -136,21 +136,33 @@ def _messages_for_template(messages: list[dict]) -> list[dict]:
     return out
 
 
-def _render_prompt(templater, messages: list[dict], tools: list[dict] | None) -> str:
+def _render_prompt(
+    templater,
+    messages: list[dict],
+    tools: list[dict] | None,
+    template_kwargs: dict | None = None,
+) -> str:
     """Render the chat prompt, normalising tool_calls first and falling back ONLY when the
     tokenizer genuinely rejects the ``tools`` kwarg.
 
     A TypeError from *inside* the template (a message-shape mismatch) must surface — retrying
     without tools would just fail the same way and mask the real cause. The previous blanket
     ``except TypeError`` swallowed exactly that, hiding the Qwen3.x tool_calls render bug.
+
+    ``template_kwargs`` are forwarded into the chat template's jinja context (e.g. Qwen3.x's
+    ``enable_thinking=False``, which swaps the generation prompt's open ``<think>`` for an empty
+    block so the model answers directly). Templates that don't know a variable ignore it.
     """
     messages = _messages_for_template(messages)
+    extra = template_kwargs or {}
     try:
-        return templater(messages, tools=tools, add_generation_prompt=True, tokenize=False)
+        return templater(
+            messages, tools=tools, add_generation_prompt=True, tokenize=False, **extra
+        )
     except TypeError as exc:
         if "tools" not in str(exc):  # not the "template doesn't accept tools" case — surface it
             raise
-        return templater(messages, add_generation_prompt=True, tokenize=False)
+        return templater(messages, add_generation_prompt=True, tokenize=False, **extra)
 
 
 def _sampler_kwargs(
@@ -187,6 +199,7 @@ class MlxEngine:
         temperature: float | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        chat_template_kwargs: dict | None = None,
         **_ignored,
     ) -> Iterator[str]:
         # Imported lazily: MLX is a heavy, Apple-Silicon-only dependency.
@@ -195,7 +208,9 @@ class MlxEngine:
         # Passing tools lets the chat template render them in the model's expected
         # tool-calling format. _render_prompt normalises tool_calls and handles the
         # tools-kwarg fallback without masking real template errors.
-        prompt = _render_prompt(self._tokenizer.apply_chat_template, messages, tools)
+        prompt = _render_prompt(
+            self._tokenizer.apply_chat_template, messages, tools, chat_template_kwargs
+        )
         for response in stream_generate(
             self._model,
             self._tokenizer,
@@ -228,6 +243,7 @@ class VlmChatEngine:
         messages: list[dict],
         tools: list[dict] | None = None,
         max_tokens: int = 1024,
+        chat_template_kwargs: dict | None = None,
         **_ignored,
     ) -> Iterator[str]:
         from mlx_vlm import stream_generate
@@ -235,7 +251,7 @@ class VlmChatEngine:
         templater = getattr(self._processor, "apply_chat_template", None) or getattr(
             self._processor, "tokenizer"
         ).apply_chat_template
-        prompt = _render_prompt(templater, messages, tools)
+        prompt = _render_prompt(templater, messages, tools, chat_template_kwargs)
         for chunk in stream_generate(
             self._model, self._processor, prompt, max_tokens=max_tokens
         ):

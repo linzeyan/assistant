@@ -160,6 +160,55 @@ async def test_fusion_scheduler_survives_a_failing_panel_model(tmp_path):
     )
 
 
+def test_strip_thinking_covers_all_observed_shapes():
+    from assistant.agent.fusion import _strip_thinking
+
+    # Tagged block (model emits its own <think>…</think>).
+    assert _strip_thinking("<think>hmm</think>The answer is 4.") == "The answer is 4."
+    # Qwen3.x template-opened form: output has NO opening tag — everything before the bare
+    # closing tag is reasoning.
+    assert _strip_thinking("Let me think...\nstep 2\n</think>\n\nParis.") == "Paris."
+    # Truncated mid-thought (max_tokens ran out): a dangling opener drops the tail.
+    assert _strip_thinking("Sure.<think>step 1, step 2, step") == "Sure."
+    # gemma reasoning channels.
+    assert _strip_thinking("<|channel>thought\nhmm\n<channel|>Tokyo.") == "Tokyo."
+    assert _strip_thinking("Tokyo.<|channel>thought\ndangling") == "Tokyo."
+    # Clean text passes through untouched.
+    assert _strip_thinking("  Just the answer.  ") == "Just the answer."
+
+
+async def test_fusion_disables_thinking_and_sanitizes_candidates(tmp_path):
+    # The judge must read clean answers and answer cleanly itself: every sub-generation asks
+    # the template to disable thinking (enable_thinking=False — on Qwen3.x the open <think>
+    # becomes an empty block), and candidates are stripped of any residual reasoning before
+    # they enter the judge prompt (templates that ignore the kwarg, truncated thoughts).
+    class _ThinkingService:
+        def __init__(self):
+            self.calls: list[tuple[str, list[dict], dict]] = []
+
+        async def stream_chat(self, messages, model, tools=None, **params):
+            self.calls.append((model, messages, params))
+            if model == "j":
+                yield {"type": "text", "content": "final answer"}
+            else:
+                # A Qwen-style template-opened thought: no opening tag, </think> mid-stream.
+                yield {"type": "text", "content": f"reasoning about it\n</think>\n\nanswer-{model}"}
+
+    eng = FusionEngine(tmp_path / "f.json", enabled=True, panel=["a"], judge="j")
+    svc = _ThinkingService()
+    [ev async for ev in eng.answer(svc, [{"role": "user", "content": "Q"}])]
+
+    # Every sub-call (panel + judge) carried the no-thinking template kwarg.
+    assert all(
+        params.get("chat_template_kwargs") == {"enable_thinking": False}
+        for _, _, params in svc.calls
+    )
+    # The judge prompt contains the sanitized answer, not the reasoning.
+    judge_body = svc.calls[-1][1][-1]["content"]
+    assert "answer-a" in judge_body
+    assert "reasoning about it" not in judge_body and "</think>" not in judge_body
+
+
 def test_fusion_enabled_requires_panel_and_judge(tmp_path):
     p = tmp_path / "f.json"
     assert not FusionEngine(p, enabled=True, panel=[], judge=None).enabled

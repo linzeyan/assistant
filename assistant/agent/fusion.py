@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -28,8 +29,34 @@ _JUDGE_SYSTEM = (
     "independently. Compare them, reconcile disagreements, and produce the single most accurate "
     "answer. Prefer claims best supported by reasoning over majority vote; if a candidate is "
     "wrong on an important point, briefly correct it. Do not mention that you are a judge or "
-    "refer to 'candidates' in your final answer — just give the best answer."
+    "refer to 'candidates' in your final answer — just give the best answer, directly, without "
+    "showing any reasoning or thought process."
 )
+
+# Every fusion sub-generation (panel and judge) asks the chat template to disable thinking.
+# Qwen3.x templates honour it (`enable_thinking=False` renders an empty <think/> block instead
+# of an OPEN `<think>` — with the open form the model's whole output is untagged reasoning that
+# nothing downstream can collapse, and a tight max_tokens truncates before the answer even
+# starts). Templates without the variable (Mixtral, gemma) simply ignore it.
+_NO_THINKING = {"enable_thinking": False}
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove model reasoning from a panel candidate so the judge reads answers, not noise.
+
+    Covers the three shapes seen in practice: tagged ``<think>…</think>`` blocks; the Qwen3.x
+    template-opened form where the output has NO opening tag and everything before a bare
+    ``</think>`` is reasoning; a dangling ``<think>``/``<|channel>`` when generation was
+    truncated mid-thought; and gemma's ``<|channel>…<channel|>`` reasoning channels."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[-1]
+    if "<think>" in text:
+        text = text.split("<think>", 1)[0]
+    text = re.sub(r"<\|channel>.*?<channel\|>", "", text, flags=re.DOTALL)
+    if "<|channel>" in text:
+        text = text.split("<|channel>", 1)[0]
+    return text.strip()
 
 
 def _last_user(messages: list[dict]) -> str:
@@ -202,10 +229,14 @@ class FusionEngine:
                     prefetches.add(task)
                     task.add_done_callback(prefetches.discard)
                 parts: list[str] = []
-                async for ev in service.stream_chat(messages, model, max_tokens=max_tokens):
+                async for ev in service.stream_chat(
+                    messages, model, max_tokens=max_tokens, chat_template_kwargs=_NO_THINKING
+                ):
                     if ev.get("type") == "text":
                         parts.append(ev["content"])
-                candidates.append((model, "".join(parts)))
+                # Sanitize even with thinking disabled: some templates ignore the kwarg and a
+                # truncated thought would otherwise reach the judge as the whole "answer".
+                candidates.append((model, _strip_thinking("".join(parts))))
             except Exception as e:  # noqa: BLE001 — any per-model failure is isolated here
                 log.warning("fusion panel model %s failed, skipping: %s", model, e)
                 failures.append((model, str(e)))
@@ -235,6 +266,7 @@ class FusionEngine:
         for task in list(prefetches):
             await task  # drain in-flight prefetches (normally just the judge's) before streaming
         async for ev in service.stream_chat(
-            _judge_messages(messages, candidates), judge, max_tokens=max_tokens
+            _judge_messages(messages, candidates), judge, max_tokens=max_tokens,
+            chat_template_kwargs=_NO_THINKING,
         ):
             yield ev  # judge text deltas flow straight through as the answer

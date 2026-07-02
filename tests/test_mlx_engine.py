@@ -230,6 +230,32 @@ def test_messages_for_template_preserves_unparseable_args():
     assert out[0]["tool_calls"][0]["function"]["arguments"] == "not json"
 
 
+def test_render_prompt_forwards_template_kwargs():
+    # Fusion disables thinking via the chat template (Qwen3.x `enable_thinking=False` swaps the
+    # open `<think>` for an empty block). The kwargs must reach the templater on BOTH paths —
+    # with tools and on the no-tools fallback — or the judge silently reverts to leaking
+    # untagged reasoning as its entire answer.
+    seen: list[dict] = []
+
+    def templater(messages, tools=None, add_generation_prompt=True, tokenize=False, **kw):
+        seen.append(kw)
+        return "P"
+
+    _render_prompt(templater, [{"role": "user", "content": "q"}], None,
+                   {"enable_thinking": False})
+    assert seen[-1] == {"enable_thinking": False}
+
+    def fallback_templater(messages, tools=None, add_generation_prompt=True, tokenize=False, **kw):
+        if tools is not None:
+            raise TypeError("got an unexpected keyword argument 'tools'")
+        seen.append(kw)
+        return "P"
+
+    _render_prompt(fallback_templater, [{"role": "user", "content": "q"}], [{"function": {}}],
+                   {"enable_thinking": False})
+    assert seen[-1] == {"enable_thinking": False}
+
+
 def test_render_prompt_normalizes_for_items_template():
     # The actual bug: string args + an `| items` template = TypeError. Normalisation fixes it.
     msgs = [_msg_with_args(json.dumps({"query": "lua http"}))]
