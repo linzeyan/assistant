@@ -22,6 +22,7 @@ import logging
 import os
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 log = logging.getLogger("assistant")
@@ -318,23 +319,38 @@ class MlxEnginePool:
     def __init__(
         self,
         *,
-        max_loaded: int = 1,
+        max_loaded: int | None = 1,
         loader: Callable[..., object] | None = None,
         pinned: set[str] | None = None,
         mem_ceiling_bytes: int | None = None,
     ):
-        self._max = max(1, max_loaded)
+        # None / <=0 means "no count cap — the memory ceiling alone gates residency", which is
+        # what lets several models stay resident when they fit (fusion prefetch, fast switching).
+        self._max = max_loaded if (max_loaded and max_loaded > 0) else None
         self._loader = loader or _default_loader
         # Insertion order == LRU order; move_to_end marks most-recently-used.
         self._loaded: OrderedDict[str, object] = OrderedDict()
         # model_id -> bytes it's holding (measured active-memory delta, or disk estimate as a
         # fallback). Drives byte-level admission against the ceiling, alongside the count cap.
         self._footprint: dict[str, int] = {}
+        # model_id -> its dedicated single-thread executor. MLX (mlx-vlm especially) binds a GPU
+        # stream to the thread a model was LOADED on; generating from any other thread raises
+        # "There is no Stream(gpu, N) in current thread". So every engine gets one thread for its
+        # whole life, and both the load and all generation run there (thread affinity).
+        self._executors: dict[str, ThreadPoolExecutor] = {}
         self._pinned: set[str] = set(pinned or set())
         # None / <=0 disables byte-admission entirely — the pool then behaves exactly as the
         # count-only LRU it was before, so the guardrail is strictly opt-in via mem_ceiling_gb.
         self._ceiling = mem_ceiling_bytes if (mem_ceiling_bytes and mem_ceiling_bytes > 0) else None
         self._lock = asyncio.Lock()
+
+    def _effective_max(self) -> int | None:
+        """Count cap actually enforced: the configured one, or — when neither a cap nor a memory
+        ceiling exists — a failsafe of 1 so an unbounded pool can't OOM a machine whose RAM we
+        couldn't detect. None means "no count cap" (ceiling-gated)."""
+        if self._max is not None:
+            return self._max
+        return None if self._ceiling is not None else 1
 
     async def acquire(
         self, model_id: str, path: Path, forced_kind: str | None = None
@@ -344,8 +360,16 @@ class MlxEnginePool:
 
         Raises ``ModelAdmissionError`` *before* loading if a memory ceiling is set and the model
         can't be made to fit — fail loud rather than OOM-crash."""
+        # Lock-free fast path: pool state only mutates from the event loop and this path has no
+        # awaits, so it's atomic w.r.t. other coroutines. Without it, a resident model's acquire
+        # would queue behind whatever load currently holds the lock — i.e. generation on model A
+        # would stall for the full duration of model B's background prefetch.
+        engine = self._loaded.get(model_id)
+        if engine is not None:
+            self._loaded.move_to_end(model_id)
+            return engine
         async with self._lock:
-            if model_id in self._loaded:
+            if model_id in self._loaded:  # loaded while we waited (e.g. by its own prefetch)
                 self._loaded.move_to_end(model_id)
                 return self._loaded[model_id]
             incoming = _estimate_model_bytes(path)
@@ -354,7 +378,18 @@ class MlxEnginePool:
             # model switches, which is what we want (one heavy load at a time).
             log.info("loading model into pool: %s (~%.1fGB est)", model_id, incoming / 1e9)
             before = _active_memory_bytes()
-            engine = await asyncio.to_thread(self._loader, path, forced_kind)
+            # Load on the model's OWN thread — generation must later run on this same thread
+            # (mlx-vlm stream affinity), so the executor is created first and the load is its
+            # first job. Torn down when the model leaves the pool.
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"mlx-{model_id}")
+            try:
+                engine = await asyncio.get_running_loop().run_in_executor(
+                    executor, self._loader, path, forced_kind
+                )
+            except BaseException:
+                executor.shutdown(wait=False)
+                raise
+            self._executors[model_id] = executor
             self._loaded[model_id] = engine
             self._loaded.move_to_end(model_id)
             # Refine the disk estimate with the real footprint when MLX exposes it. The lock is
@@ -377,6 +412,11 @@ class MlxEnginePool:
     def _drop(self, model_id: str, reason: str) -> None:
         self._loaded.pop(model_id, None)
         self._footprint.pop(model_id, None)
+        # wait=False: an in-flight generation on this thread finishes on its own (the worker
+        # holds the engine reference); the executor just stops accepting new work.
+        executor = self._executors.pop(model_id, None)
+        if executor is not None:
+            executor.shutdown(wait=False)
         log.info("evicted model from pool: %s (%s)", model_id, reason)
 
     def _make_room(self, exclude: str, incoming: int) -> None:
@@ -393,7 +433,9 @@ class MlxEnginePool:
             return next((k for k in self._loaded if k != exclude and k not in self._pinned), None)
 
         # Count cap: make room for one more (ceiling-independent — preserves prior behaviour).
-        while len(self._loaded) >= self._max:
+        # No cap (None) → residency is governed by the memory ceiling alone.
+        cap = self._effective_max()
+        while cap is not None and len(self._loaded) >= cap:
             victim = next_victim()
             if victim is None:
                 break  # everything left is pinned — exceed the count budget rather than evict it
@@ -430,6 +472,9 @@ class MlxEnginePool:
             removed = self._loaded.pop(model_id, None) is not None
             if removed:
                 self._footprint.pop(model_id, None)
+                executor = self._executors.pop(model_id, None)
+                if executor is not None:
+                    executor.shutdown(wait=False)
                 log.info("unloading model from pool: %s (pool now: %s)", model_id, self.loaded_ids())
                 _release_mlx_memory()
             else:
@@ -441,6 +486,25 @@ class MlxEnginePool:
 
     def loaded_ids(self) -> list[str]:
         return list(self._loaded.keys())
+
+    def executor_for(self, model_id: str) -> ThreadPoolExecutor | None:
+        """The dedicated thread a loaded model must generate on (see ``_executors``); None when
+        the model isn't resident. Callers submit generation here rather than to a shared pool —
+        running it on any other thread breaks mlx-vlm's per-thread GPU stream."""
+        return self._executors.get(model_id)
+
+    def headroom_bytes(self) -> int | None:
+        """Bytes still admittable WITHOUT evicting anything, or None for "unbounded". Lets a
+        scheduler (fusion prefetch) ask "would another model fit alongside what's resident?" —
+        prefetching must never evict, because the victim may be mid-generation: its memory stays
+        held by the running worker while the pool's books say it's free. A full count cap means
+        the next load *will* evict, so headroom is 0 regardless of free bytes."""
+        cap = self._effective_max()
+        if cap is not None and len(self._loaded) >= cap:
+            return 0
+        if self._ceiling is None:
+            return None
+        return max(0, self._ceiling - self._loaded_bytes())
 
     def set_mem_ceiling_bytes(self, ceiling: int | None) -> None:
         """Live-update the admission ceiling (GUI Settings edit; the next acquire enforces it, no

@@ -98,6 +98,101 @@ async def test_eviction_releases_mlx_memory(monkeypatch):
     assert calls["n"] >= 1
 
 
+async def test_engine_gets_dedicated_thread_for_its_lifetime():
+    # mlx-vlm binds a GPU stream to the thread a model is LOADED on; generating anywhere else
+    # raises "There is no Stream(gpu, N) in current thread". The pool therefore owns one
+    # single-thread executor per engine: the load runs on it, and executor_for() hands the
+    # same thread to generation. Unloading tears it down.
+    import threading
+
+    load_threads: dict[str, int] = {}
+
+    def loader(path: Path, forced_kind: str | None = None) -> FakeEngine:
+        load_threads[str(path)] = threading.get_ident()
+        return FakeEngine(str(path))
+
+    pool = MlxEnginePool(max_loaded=2, loader=loader)
+    await pool.acquire("a", Path("/a"))
+    executor = pool.executor_for("a")
+    assert executor is not None
+    gen_thread = executor.submit(threading.get_ident).result()
+    assert gen_thread == load_threads["/a"]  # generation lands on the load thread
+    await pool.unload("a")
+    assert pool.executor_for("a") is None  # torn down with the engine
+
+
+async def test_no_count_cap_keeps_models_resident_under_ceiling(tmp_path):
+    # max_loaded=0 disables count-based eviction: residency is governed by the memory ceiling
+    # alone, so several models that fit stay resident (no reload thrash between switches).
+    pool = MlxEnginePool(
+        max_loaded=0, loader=lambda p, _k=None: FakeEngine(str(p)), mem_ceiling_bytes=10**9
+    )
+    for name in ("a", "b", "c"):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "w.safetensors").write_bytes(b"\x00" * 100)  # ~100B each, far under ceiling
+        await pool.acquire(name, d)
+    assert set(pool.loaded_ids()) == {"a", "b", "c"}  # nothing evicted
+
+
+async def test_no_count_cap_without_ceiling_falls_back_to_one():
+    # Uncapped count + no memory ceiling would be unbounded on a machine whose RAM we couldn't
+    # detect — the failsafe restores the old single-model behaviour.
+    pool = MlxEnginePool(max_loaded=0, loader=lambda p, _k=None: FakeEngine(str(p)))
+    await pool.acquire("a", Path("/a"))
+    await pool.acquire("b", Path("/b"))
+    assert pool.loaded_ids() == ["b"]
+
+
+async def test_headroom_is_zero_when_count_cap_full(tmp_path):
+    # Prefetch asks headroom_bytes() "can another model come in WITHOUT evicting?". A full
+    # count cap means the next load evicts regardless of free bytes — so the answer must be 0,
+    # or the prefetcher would evict a model that may be mid-generation.
+    d = tmp_path / "a"
+    d.mkdir()
+    (d / "w.safetensors").write_bytes(b"\x00" * 100)
+    capped = MlxEnginePool(
+        max_loaded=1, loader=lambda p, _k=None: FakeEngine("x"), mem_ceiling_bytes=10**9
+    )
+    await capped.acquire("a", d)
+    assert capped.headroom_bytes() == 0
+
+    uncapped = MlxEnginePool(
+        max_loaded=0, loader=lambda p, _k=None: FakeEngine("x"), mem_ceiling_bytes=10**9
+    )
+    await uncapped.acquire("a", d)
+    assert uncapped.headroom_bytes() == 10**9 - 100  # ceiling minus the resident estimate
+
+
+async def test_resident_acquire_is_not_blocked_by_an_inflight_load():
+    # The overlap that makes fusion prefetch worthwhile: while model B loads in the background
+    # (holding the pool lock for the whole load), an already-resident model A must still be
+    # acquirable instantly — otherwise A's generation queues behind B's load and the "overlap"
+    # is actually serialization.
+    import asyncio
+    import threading
+    import time
+
+    gate = threading.Event()
+
+    def loader(path: Path, forced_kind: str | None = None) -> FakeEngine:
+        if str(path) == "/slow":
+            gate.wait(5)  # hold the pool lock like a real multi-second load
+        return FakeEngine(str(path))
+
+    pool = MlxEnginePool(max_loaded=2, loader=loader)
+    await pool.acquire("a", Path("/a"))
+    slow = asyncio.ensure_future(pool.acquire("slow", Path("/slow")))
+    await asyncio.sleep(0.05)  # the slow load is now in flight, lock held
+    t0 = time.monotonic()
+    engine = await pool.acquire("a", Path("/a"))
+    elapsed = time.monotonic() - t0
+    gate.set()
+    await slow
+    assert isinstance(engine, FakeEngine)
+    assert elapsed < 0.5  # fast path — did not wait out the slow load
+
+
 # --- chat-template tool_calls rendering (the "web search just fails" root cause) ---
 
 

@@ -13,6 +13,7 @@ from the API; the model service treats fusion as a normal model id everywhere el
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -103,17 +104,83 @@ class FusionEngine:
             log.exception("could not persist fusion config to %s", self._path)
         return self.config
 
+    @staticmethod
+    def _scheduling(service) -> bool:
+        """Whether ``service`` exposes the size-aware planning API (the native MLX service does;
+        omlx / test fakes may not). Without it the panel just runs sequentially as before."""
+        return all(
+            hasattr(service, a)
+            for a in ("loaded_model_ids", "estimate_bytes", "headroom_bytes", "load", "unload")
+        )
+
+    @staticmethod
+    async def _plan_order(
+        service, panel: list[str], judge: str | None
+    ) -> tuple[list[str], dict[str, int]]:
+        """Load/unload order for the panel: already-resident models first (their load is a paid
+        cost — run them before anything evicts them), then the rest largest-first, so the big
+        loads happen while memory is emptiest and each unload-after-use frees room for the
+        progressively smaller prefetches (and finally the judge). Sizes include the judge — its
+        prefetch must pass the same headroom check as everyone else's."""
+        resident = [m for m in service.loaded_model_ids() if m in panel]
+        sizes = {m: await service.estimate_bytes(m) for m in {*panel, judge} if m}
+        rest = sorted(
+            (m for m in panel if m not in resident), key=lambda m: -sizes.get(m, 0)
+        )
+        return resident + rest, sizes
+
     async def answer(
         self, service, messages: list[dict], *, max_tokens: int = 1024, **_ignored
     ) -> AsyncIterator[dict]:
         """Run panel → judge, yielding loop-compatible events: tool_progress for the panel/judge
         phases and the judge's text deltas as the answer. ``service`` is the model service (used
-        for each sub-generation); the panel runs with no tools."""
+        for each sub-generation); the panel runs with no tools.
+
+        Memory-aware scheduling (when the service supports it): panel order is resident-first
+        then largest-first; while one model generates, the next is prefetched in the background
+        *iff it fits in the current headroom* (prefetch must never evict — the generating model
+        is memory the ceiling thinks is free the moment it's evicted, but isn't); each panel
+        model is unloaded right after its candidate is collected (a panel member runs once per
+        turn) unless the user had it loaded before the turn or it doubles as the judge — which
+        always runs last, over the freed memory."""
         panel, judge = list(self._panel), self._judge
         n = len(panel)
+        sched = self._scheduling(service)
+        if sched:
+            order, sizes = await self._plan_order(service, panel, judge)
+            pre_loaded = set(service.loaded_model_ids())
+            log.info(
+                "fusion schedule: %s -> judge %s",
+                " -> ".join(f"{m} (~{sizes.get(m, 0) / 1e9:.1f}GB)" for m in order), judge,
+            )
+        else:
+            order, sizes, pre_loaded = panel, {}, set()
+
+        async def _load_quiet(model_id: str) -> None:
+            # Prefetch failures aren't fatal here — the model's own turn retries the load and
+            # reports the real error through the normal skip path.
+            try:
+                await service.load(model_id)
+            except Exception as e:  # noqa: BLE001
+                log.debug("fusion prefetch of %s failed (will retry at its turn): %s", model_id, e)
+
+        def _start_prefetch(model_id: str | None) -> asyncio.Task | None:
+            if not (sched and model_id):
+                return None
+            headroom = service.headroom_bytes()
+            need = sizes.get(model_id, 0)
+            if headroom is not None and need > headroom:
+                return None  # doesn't fit alongside what's resident — load inline at its turn
+            log.info("fusion prefetch: %s (~%.1fGB, headroom %s)", model_id, need / 1e9,
+                     "∞" if headroom is None else f"{headroom / 1e9:.1f}GB")
+            return asyncio.create_task(_load_quiet(model_id))
+
         candidates: list[tuple[str, str]] = []
         failures: list[tuple[str, str]] = []
-        for i, model in enumerate(panel, 1):
+        # Strong refs to every in-flight prefetch: asyncio keeps only weak refs to tasks, and a
+        # collected task would abort its load midway (and strand the pool lock's queue).
+        prefetches: set[asyncio.Task] = set()
+        for i, model in enumerate(order, 1):
             yield {
                 "type": "tool_progress",
                 "name": "fusion",
@@ -124,6 +191,16 @@ class FusionEngine:
             # not sink the whole turn — skip it, keep its slot's progress, and let the judge work
             # with the survivors. Only a fully empty panel is fatal.
             try:
+                if sched:
+                    # Ensure THIS model is resident before starting the next prefetch, so the
+                    # prefetch can't win the pool lock and delay the answer we're waiting on.
+                    await service.load(model)
+                task = _start_prefetch(
+                    order[i] if i < n else (judge if judge not in pre_loaded else None)
+                )
+                if task is not None:
+                    prefetches.add(task)
+                    task.add_done_callback(prefetches.discard)
                 parts: list[str] = []
                 async for ev in service.stream_chat(messages, model, max_tokens=max_tokens):
                     if ev.get("type") == "text":
@@ -138,6 +215,14 @@ class FusionEngine:
                     "fraction": i / (n + 1),
                     "label": f"skipped {model} (failed to load)",
                 }
+            # Used panel models are done for this turn — release their memory for the next
+            # prefetch / the judge. Keep anything the user had loaded before the turn (their
+            # chat model) and the judge itself (about to be used).
+            if sched and model != judge and model not in pre_loaded and model not in order[i:]:
+                try:
+                    await service.unload(model)
+                except Exception:  # noqa: BLE001 — freeing memory is best-effort
+                    log.debug("fusion could not unload %s after use", model)
         if not candidates:
             detail = "; ".join(f"{m}: {e}" for m, e in failures) or "no panel models configured"
             raise RuntimeError(f"Fusion: every panel model failed — {detail}")
@@ -147,6 +232,8 @@ class FusionEngine:
             "fraction": n / (n + 1),
             "label": f"judge: {judge}",
         }
+        for task in list(prefetches):
+            await task  # drain in-flight prefetches (normally just the judge's) before streaming
         async for ev in service.stream_chat(
             _judge_messages(messages, candidates), judge, max_tokens=max_tokens
         ):

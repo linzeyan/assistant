@@ -26,7 +26,7 @@ from pathlib import Path
 from assistant.agent.fusion import FUSION_MODEL_ID
 
 from .mlx_discovery import DiscoveredModel, discover_models
-from .mlx_engine import MlxEnginePool, _total_ram_bytes
+from .mlx_engine import MlxEnginePool, _estimate_model_bytes, _total_ram_bytes
 from .service import ModelService
 from .status import BackendState, BackendStatus
 from .tool_parsing import TOOL_MARKERS, earliest_marker, parse_tool_calls
@@ -254,6 +254,25 @@ class MlxModelService(ModelService):
     async def unload(self, model_id: str) -> None:
         await self._pool.unload(model_id)
 
+    # --- scheduling introspection (fusion's size-aware load/unload planner) ---
+    # FusionEngine discovers these via getattr, so a service without them (omlx) simply runs
+    # the panel sequentially with no prefetch/unload planning — same events, fewer smarts.
+
+    def loaded_model_ids(self) -> list[str]:
+        return self._pool.loaded_ids()
+
+    def headroom_bytes(self) -> int | None:
+        return self._pool.headroom_bytes()
+
+    async def estimate_bytes(self, model_id: str) -> int:
+        """Pre-load footprint estimate (on-disk weights), 0 when unknown — the same signal the
+        pool's admission uses, so the scheduler and the admission gate agree on what "fits"."""
+        try:
+            entry = await self._entry_for(model_id)
+        except ValueError:
+            return 0
+        return _estimate_model_bytes(entry.path)
+
     async def context_window(self, model: str) -> int | None:
         # Read it from the model's own config.json (off-thread) — no load required, works
         # whether or not the model is currently in the pool. Unknown model → None (fallback).
@@ -296,6 +315,11 @@ class MlxModelService(ModelService):
         entry = await self._entry_for(model)
         self._require_chat_model(entry)
         engine = await self._pool.acquire(model, entry.path, forced_kind=entry.kind)
+        # Generation MUST run on the thread the model was loaded on: mlx-vlm binds a GPU
+        # stream to the load thread and raises "There is no Stream(gpu, N) in current thread"
+        # from any other (the bug that silently knocked VLM panel models out of fusion). No
+        # await between acquire and here, so the executor can't have been torn down.
+        executor = self._pool.executor_for(model)
 
         queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -315,7 +339,7 @@ class MlxModelService(ModelService):
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, ("end", None))
 
-        fut = loop.run_in_executor(None, worker)
+        fut = loop.run_in_executor(executor, worker)  # None → default pool (fake-pool tests)
         del engine, worker
         # Streaming state machine: forward prose token-by-token, but suppress any
         # tool-call markup so it never reaches the user — it's re-emitted as a

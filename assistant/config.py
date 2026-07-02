@@ -88,7 +88,11 @@ class Settings(BaseSettings):
     tts_model: str = "mlx-community/Kokoro-82M-bf16"
 
     # --- model lifecycle / memory guardrails (MLX unified memory is the top risk) ---
-    max_loaded_models: int = 1
+    # 0 = no count cap: models stay resident while they fit under the memory ceiling (which
+    # defaults to physical RAM × 0.9), so switching/fusion doesn't thrash reloads. Set a positive
+    # number to restore strict count-based eviction; the pool falls back to 1 if no ceiling can
+    # be determined.
+    max_loaded_models: int = 0
     mem_ceiling_gb: float | None = None
 
     # --- paths (XDG data dir) ---

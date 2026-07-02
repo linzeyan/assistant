@@ -81,6 +81,37 @@ async def test_type_override_shows_in_list_models(tmp_path):
     assert got["qwen"] == "vlm"  # reported under the overridden kind, not the detected one
 
 
+async def test_generation_runs_on_the_models_load_thread(tmp_path):
+    # The thread-affinity contract behind the mlx-vlm "There is no Stream(gpu, N) in current
+    # thread" crash: a model must generate on the exact thread it was loaded on. The service
+    # must therefore submit the streaming worker to the pool's per-model executor, never to
+    # the shared default executor.
+    import threading
+
+    idents: dict[str, int] = {}
+
+    class ThreadRecordingEngine:
+        def stream_text(self, messages, **kwargs):
+            idents["generate"] = threading.get_ident()
+            yield "ok"
+
+    def loader(path, forced_kind=None):
+        idents["load"] = threading.get_ident()
+        return ThreadRecordingEngine()
+
+    _make_model(tmp_path, "qwen")
+    svc = MlxModelService(
+        models_dir=tmp_path,
+        include_hf_cache=False,
+        pool=MlxEnginePool(max_loaded=1, loader=loader),
+        available_override=True,
+    )
+    await svc.start()
+    out = [ev async for ev in svc.stream_chat([{"role": "user", "content": "hi"}], "qwen")]
+    assert any(ev.get("type") == "text" for ev in out)
+    assert idents["generate"] == idents["load"]
+
+
 def test_ram_ceiling_defaults_to_physical_memory(tmp_path):
     # "Check the resource fits before loading": with no explicit ceiling, the pool still gets one
     # derived from physical RAM, so an oversized model fails loud instead of OOM-crashing.

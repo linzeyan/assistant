@@ -6,7 +6,9 @@ def test_defaults():
     assert s.backend_port == 9981
     assert s.omlx_base_url == "http://127.0.0.1:8000"
     assert s.approval_required is True
-    assert s.max_loaded_models == 1
+    # 0 = no count cap: residency is governed by the memory ceiling (RAM×0.9 default), so
+    # models that fit stay resident instead of thrashing reloads on every switch.
+    assert s.max_loaded_models == 0
 
 
 def test_env_override(monkeypatch):
