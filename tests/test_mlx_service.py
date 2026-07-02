@@ -81,6 +81,41 @@ async def test_type_override_shows_in_list_models(tmp_path):
     assert got["qwen"] == "vlm"  # reported under the overridden kind, not the detected one
 
 
+async def test_per_model_template_kwargs_reach_the_engine(tmp_path):
+    # 2-B: a model's saved chat_template_kwargs must arrive at stream_text merged with the
+    # caller's — stored keys win (same semantics as sampler overrides), caller-only keys survive.
+    from assistant.models.per_model_store import PerModelStore
+
+    _make_model(tmp_path, "qwen")
+    seen: list[dict] = []
+
+    class RecordingEngine:
+        def stream_text(self, messages, **kwargs):
+            seen.append(kwargs.get("chat_template_kwargs"))
+            yield "ok"
+
+    store = PerModelStore(tmp_path / "pm.json")
+    store.set("qwen", {"chat_template_kwargs": {"enable_thinking": True}})
+    svc = MlxModelService(
+        models_dir=tmp_path,
+        include_hf_cache=False,
+        pool=MlxEnginePool(max_loaded=1, loader=lambda p, _k=None: RecordingEngine()),
+        per_model=store,
+        available_override=True,
+    )
+    await svc.start()
+    # Caller passes its own kwargs (fusion's enable_thinking=False + an extra key): the stored
+    # enable_thinking wins, the caller's other key survives the merge.
+    [ev async for ev in svc.stream_chat(
+        [{"role": "user", "content": "hi"}], "qwen",
+        chat_template_kwargs={"enable_thinking": False, "other": 1},
+    )]
+    assert seen[-1] == {"enable_thinking": True, "other": 1}
+    # No caller kwargs → the stored dict alone.
+    [ev async for ev in svc.stream_chat([{"role": "user", "content": "hi"}], "qwen")]
+    assert seen[-1] == {"enable_thinking": True}
+
+
 async def test_generation_runs_on_the_models_load_thread(tmp_path):
     # The thread-affinity contract behind the mlx-vlm "There is no Stream(gpu, N) in current
     # thread" crash: a model must generate on the exact thread it was loaded on. The service

@@ -70,12 +70,22 @@ struct ModelSettingsDTO: Decodable {
         let topK: Int?
         let maxTokens: Int?
         let type: String?  // forced kind override (llm/vlm/image/video/embedding); nil = auto
+        // Chat-template variables the backend stores as a free dict; the GUI surfaces only
+        // enable_thinking (the Thinking picker) — other keys stay API-managed.
+        let chatTemplateKwargs: TemplateKwargs?
+        struct TemplateKwargs: Decodable {
+            let enableThinking: Bool?
+            enum CodingKeys: String, CodingKey {
+                case enableThinking = "enable_thinking"
+            }
+        }
         enum CodingKeys: String, CodingKey {
             case temperature
             case topP = "top_p"
             case topK = "top_k"
             case maxTokens = "max_tokens"
             case type
+            case chatTemplateKwargs = "chat_template_kwargs"
         }
     }
 }

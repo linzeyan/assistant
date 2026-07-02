@@ -1,17 +1,22 @@
 """Per-model overrides (oMLX-style), keyed by model id and persisted to disk.
 
-Two independent concerns share one store/file/API:
+Three independent concerns share one store/file/API:
 
 - **Generation** — sampler settings (temperature / top_p / top_k) and an optional max_tokens cap,
   applied at chat time layered over the global defaults, so a creative model and a deterministic
   coder can coexist without a config edit.
 - **Type override** — force a model's kind (llm / vlm / image / video / embed) instead of trusting
-  auto-detection. This is how a checkpoint we misclassify (e.g. gemma-4-31b auto-detected as a VLM,
-  which then crashes the mlx-vlm loader) is told to load as a plain ``llm`` and just work. "auto"
-  clears the override and returns to detection.
+  auto-detection. This is how a checkpoint we misclassify (e.g. OptiQ quants that carry the omni
+  base's vision_config but only load through mlx-lm) is told to load as a plain ``llm`` and just
+  work. "auto" clears the override and returns to detection.
+- **Chat-template kwargs** — variables forwarded into the model's chat-template jinja context on
+  every render (e.g. Qwen3.x ``enable_thinking: false``, which swaps the open ``<think>`` in the
+  generation prompt for an empty block so the model answers directly). Templates ignore variables
+  they don't know, so these are safe to store for any model.
 
-The two are kept apart at read time: generation params are merged into sampling kwargs, but the
-type override must NOT be (a stray ``type`` kwarg would break generation), so it has its own getter.
+The concerns are kept apart at read time: generation params are merged into sampling kwargs, but
+``type``/``chat_template_kwargs`` must NOT be (a stray kwarg would break generation, and the
+template kwargs need dict-merge semantics), so each has its own getter.
 """
 
 from __future__ import annotations
@@ -30,6 +35,19 @@ ALLOWED_KEYS = ("temperature", "top_p", "top_k", "max_tokens")
 VALID_TYPES = ("llm", "vlm", "image", "video", "embedding")
 
 
+def _clean_template_kwargs(value) -> dict:
+    """A usable chat_template_kwargs value: a dict of str -> JSON scalar. Non-scalar values are
+    dropped (a template variable is a jinja scalar; nesting is never meaningful there) and a
+    non-dict clears the whole entry."""
+    if not isinstance(value, dict):
+        return {}
+    return {
+        k: v
+        for k, v in value.items()
+        if isinstance(k, str) and isinstance(v, (bool, int, float, str))
+    }
+
+
 def _clean(settings: dict) -> dict:
     """Keep only known keys with usable values (a null/absent value clears that override).
 
@@ -39,6 +57,9 @@ def _clean(settings: dict) -> dict:
     t = settings.get("type")
     if isinstance(t, str) and t.strip().lower() in VALID_TYPES:
         out["type"] = t.strip().lower()
+    tpl = _clean_template_kwargs(settings.get("chat_template_kwargs"))
+    if tpl:
+        out["chat_template_kwargs"] = tpl
     return out
 
 
@@ -67,6 +88,12 @@ class PerModelStore:
         """The forced kind for this model, or None to auto-detect."""
         t = self._data.get(model_id, {}).get("type")
         return t if t in VALID_TYPES else None
+
+    def chat_template_kwargs(self, model_id: str) -> dict:
+        """This model's saved chat-template variables ({} when none). Merged into the
+        ``chat_template_kwargs`` stream param at chat time — dict-merge, stored keys win —
+        never into sampler kwargs."""
+        return dict(self._data.get(model_id, {}).get("chat_template_kwargs", {}))
 
     def set(self, model_id: str, settings: dict) -> dict:
         cleaned = _clean(settings)

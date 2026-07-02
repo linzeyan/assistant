@@ -174,6 +174,22 @@ struct DTODecodingTests {
         #expect(dto.settings.type == nil)
     }
 
+    @Test func modelSettingsDecodesThinkingTemplateKwarg() throws {
+        // 2-B: chat_template_kwargs is a free dict on the backend; the GUI decodes only
+        // enable_thinking (the Thinking picker). Unknown sibling keys must not break decoding.
+        let dto = try decode(
+            ModelSettingsDTO.self,
+            #"{"model":"m","settings":{"chat_template_kwargs":{"enable_thinking":false,"custom":"x"}}}"#)
+        #expect(dto.settings.chatTemplateKwargs?.enableThinking == false)
+    }
+
+    @Test func modelSettingsThinkingDefaultsNilWhenAbsent() throws {
+        // Nothing saved → nil → the Thinking picker shows "auto" (template default).
+        let dto = try decode(
+            ModelSettingsDTO.self, #"{"model":"m","settings":{"temperature":0.2}}"#)
+        #expect(dto.settings.chatTemplateKwargs == nil)
+    }
+
     @Test func sessionSummaryMapsCountAndTimestamp() throws {
         let dto = try decode(
             SessionSummaryDTO.self,

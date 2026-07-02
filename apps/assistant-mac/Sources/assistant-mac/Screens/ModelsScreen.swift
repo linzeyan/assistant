@@ -240,12 +240,17 @@ struct ModelSettingsView: View {
     @State private var topK = ""
     @State private var maxTokens = ""
     @State private var type = "auto"
+    @State private var thinking = "auto"
     @State private var saving = false
     @State private var error: String?
 
     // "auto" = trust detection; the rest force the loader (fixes a misdetected checkpoint, e.g. a
     // model wrongly seen as VLM that crashes the mlx-vlm loader — force it to load as a plain LLM).
     private static let typeChoices = ["auto", "llm", "vlm", "image", "video", "embedding"]
+    // Maps to the chat template's enable_thinking variable (Qwen3.x): "off" makes the model
+    // answer directly instead of streaming untagged reasoning; "auto" leaves the template's
+    // default. Templates without the variable ignore it, so the picker is safe on any model.
+    private static let thinkingChoices = ["auto", "on", "off"]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -257,6 +262,15 @@ struct ModelSettingsView: View {
                     }
                     .labelsHidden().frame(width: 96)
                     .help("Force how this model loads instead of auto-detecting its kind")
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Thinking").font(.caption2).foregroundStyle(.secondary)
+                    Picker("", selection: $thinking) {
+                        ForEach(Self.thinkingChoices, id: \.self) { Text($0).tag($0) }
+                    }
+                    .labelsHidden().frame(width: 82)
+                    .help("Enable/disable the model's reasoning via its chat template "
+                          + "(enable_thinking; Qwen3.x honours it, others ignore it)")
                 }
                 field("Temperature", $temperature)
                 field("Top-p", $topP)
@@ -293,6 +307,11 @@ struct ModelSettingsView: View {
         topK = s.topK.map { String($0) } ?? ""
         maxTokens = s.maxTokens.map { String($0) } ?? ""
         type = s.type ?? "auto"
+        switch s.chatTemplateKwargs?.enableThinking {
+        case .some(true): thinking = "on"
+        case .some(false): thinking = "off"
+        case .none: thinking = "auto"
+        }
     }
 
     private func save() async {
@@ -304,6 +323,9 @@ struct ModelSettingsView: View {
         if let v = Int(topK) { body["top_k"] = v }
         if let v = Int(maxTokens) { body["max_tokens"] = v }
         if type != "auto" { body["type"] = type }  // "auto" omits it → clears the override
+        if thinking != "auto" {  // "auto" omits it → template default applies again
+            body["chat_template_kwargs"] = ["enable_thinking": thinking == "on"]
+        }
         do {
             try await controller.client.setModelSettings(modelID, body)
             error = nil

@@ -49,6 +49,32 @@ def test_type_override_is_kept_out_of_generation_params(tmp_path):
     assert s.get("m") == {"temperature": 0.5, "type": "vlm"}  # full view keeps both
 
 
+def test_chat_template_kwargs_stored_validated_and_isolated(tmp_path):
+    # 2-B: per-model chat-template variables (e.g. Qwen3.x enable_thinking). Stored as a dict of
+    # scalars, surfaced via its own getter, and NEVER merged into generation params — a stray
+    # dict kwarg in sampler args would break generation.
+    s = PerModelStore(tmp_path / "p.json")
+    out = s.set("m", {"chat_template_kwargs": {"enable_thinking": False, "custom_var": "x"}})
+    assert out["chat_template_kwargs"] == {"enable_thinking": False, "custom_var": "x"}
+    assert s.chat_template_kwargs("m") == {"enable_thinking": False, "custom_var": "x"}
+    assert s.generation("m") == {}  # template kwargs stay out of sampler params
+    assert s.chat_template_kwargs("unset") == {}
+    # Persists across reload alongside the other concerns.
+    assert PerModelStore(tmp_path / "p.json").chat_template_kwargs("m")["enable_thinking"] is False
+
+
+def test_chat_template_kwargs_rejects_junk(tmp_path):
+    s = PerModelStore(tmp_path / "p.json")
+    # Non-dict never stores; non-scalar values / non-str keys are dropped (jinja vars are scalars).
+    s.set("m", {"chat_template_kwargs": "not a dict", "temperature": 0.5})
+    assert s.chat_template_kwargs("m") == {}
+    s.set("m", {"chat_template_kwargs": {"ok": True, "nested": {"no": 1}, 3: "bad-key"}})
+    assert s.chat_template_kwargs("m") == {"ok": True}
+    # An all-junk dict clears the entry entirely.
+    s.set("m", {"chat_template_kwargs": {"nested": [1, 2]}})
+    assert "chat_template_kwargs" not in s.get("m")
+
+
 def test_sampler_kwargs_empty_when_no_overrides():
     # No overrides → no sampler kwarg (mlx-lm keeps its own default), and crucially no mlx-lm
     # import is forced, so the helper is safe to call on a machine without mlx installed.

@@ -302,6 +302,15 @@ class MlxModelService(ModelService):
         # max_tokens overrides the loop's global cap; temperature/top_p/top_k are added).
         if self._per_model is not None:
             params = {**params, **self._per_model.generation(model)}
+            # Template kwargs merge per-key (not replace): a caller's kwargs (e.g. fusion's
+            # enable_thinking=False) survive unless the user saved that same key for this model
+            # — same stored-wins semantics as the sampler params above.
+            stored_tpl = self._per_model.chat_template_kwargs(model)
+            if stored_tpl:
+                params["chat_template_kwargs"] = {
+                    **(params.get("chat_template_kwargs") or {}),
+                    **stored_tpl,
+                }
         return self._stream(messages, model, tools, known, **params)
 
     async def _stream(
