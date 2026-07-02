@@ -9,16 +9,27 @@ def test_hermes_single_block():
     assert len(calls) == 1
     assert calls[0].name == "read_file"
     assert calls[0].arguments == {"path": "a.py"}
-    assert calls[0].id == "call_0"
+    assert calls[0].id.startswith("call_")
 
 
-def test_qwen_multiple_blocks_get_sequential_ids():
+def test_qwen_multiple_blocks_get_distinct_ids():
     text = (
         '<tool_call>{"name": "a", "arguments": {"x": 1}}</tool_call>'
         '<tool_call>{"name": "b", "arguments": {"y": 2}}</tool_call>'
     )
     calls = parse_tool_calls(text)
-    assert [(c.id, c.name) for c in calls] == [("call_0", "a"), ("call_1", "b")]
+    assert [c.name for c in calls] == ["a", "b"]
+    assert len({c.id for c in calls}) == 2
+
+
+def test_ids_are_unique_across_responses():
+    # Anthropic-protocol clients (Claude Code) key tool_use/tool_result pairs by id
+    # over the whole conversation and silently DROP a tool_use whose id repeats —
+    # a per-response counter ("call_0") killed every tool call after the first turn.
+    text = '<tool_call>{"name": "a", "arguments": {}}</tool_call>'
+    first = parse_tool_calls(text)[0].id
+    second = parse_tool_calls(text)[0].id
+    assert first != second
 
 
 def test_mistral_tool_calls_array():
@@ -80,7 +91,7 @@ def test_qwen_xml_function_call_is_parsed():
     assert len(calls) == 1
     assert calls[0].name == "web_search"
     assert calls[0].arguments == {"query": "台北今天天氣"}
-    assert calls[0].id == "call_0"
+    assert calls[0].id.startswith("call_")
 
 
 def test_qwen_xml_multiple_params_and_type_recovery():
@@ -96,13 +107,22 @@ def test_qwen_xml_multiple_params_and_type_recovery():
     assert calls[0].arguments == {"path": "a.py", "start": 10}
 
 
-def test_qwen_xml_multiple_calls_get_sequential_ids():
+def test_qwen_xml_multiple_calls_get_distinct_ids():
     text = (
         "<tool_call><function=a><parameter=x>1</parameter></function></tool_call>"
         "<tool_call><function=b><parameter=y>2</parameter></function></tool_call>"
     )
     calls = parse_tool_calls(text)
-    assert [(c.id, c.name) for c in calls] == [("call_0", "a"), ("call_1", "b")]
+    assert [c.name for c in calls] == ["a", "b"]
+    assert len({c.id for c in calls}) == 2
+
+
+def test_bare_xml_function_is_a_stream_marker():
+    # Qwen3-Coder emits <function=…> with no <tool_call> wrapper. The parser already
+    # handles it; the streaming side must ALSO suppress it, or the raw XML shows up
+    # as visible text in the client even though the call executes.
+    text = "I'll write the file.\n\n<function=Write>\n<parameter=file_path>a.md</parameter>"
+    assert earliest_marker(text) == text.index("<function=")
 
 
 def test_json_block_still_wins_over_xml_fallback():

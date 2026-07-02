@@ -9,6 +9,7 @@ HTTP *contract* — not its code — insulates us from that churn. See plan Part
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import AsyncIterator
 
 import httpx
@@ -153,7 +154,9 @@ class OmlxClient:
                     arguments = {"__raw_arguments__": raw}
                 assembled.append(
                     {
-                        "id": slot["id"] or f"call_{index}",
+                        # Unique fallback id: a per-response index collides across turns
+                        # and Anthropic-protocol clients drop tool_use blocks on repeats.
+                        "id": slot["id"] or f"call_{uuid.uuid4().hex[:24]}",
                         "name": slot["name"],
                         "arguments": arguments,
                     }

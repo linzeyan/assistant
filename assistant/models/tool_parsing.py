@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from dataclasses import dataclass
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
@@ -35,7 +36,10 @@ _PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
 
 # Markers a streaming consumer watches for to stop emitting text and start
 # buffering a tool call. Bare JSON has no marker (handled by a leading-brace check).
-TOOL_MARKERS = (_HERMES_OPEN, _PYTHON_TAG, _MISTRAL_TAG)
+# ``<function=`` covers Qwen3-Coder's wrapper-less XML form: without it the raw XML
+# streams to the client as visible text even though the call parses at end-of-turn.
+# A false positive is safe — unparseable buffered text is flushed back at the end.
+TOOL_MARKERS = (_HERMES_OPEN, _PYTHON_TAG, _MISTRAL_TAG, "<function=")
 
 
 @dataclass
@@ -87,6 +91,16 @@ def _coerce_call(obj) -> ParsedToolCall | None:
     return ParsedToolCall(id="", name=name, arguments=args)
 
 
+def _assign_ids(calls: list[ParsedToolCall]) -> list[ParsedToolCall]:
+    """Mint a globally unique id per call. A per-response index (``call_0``…) collides
+    across turns: Anthropic-protocol clients (Claude Code) key tool_use/tool_result
+    pairs by id over the WHOLE conversation and silently drop repeats, killing every
+    tool call after the first turn."""
+    for call in calls:
+        call.id = f"call_{uuid.uuid4().hex[:24]}"
+    return calls
+
+
 def _coerce_all(values: list, restrict: set[str] | None) -> list[ParsedToolCall]:
     calls: list[ParsedToolCall] = []
     for value in values:
@@ -98,9 +112,7 @@ def _coerce_all(values: list, restrict: set[str] | None) -> list[ParsedToolCall]
             if restrict is not None and call.name not in restrict:
                 continue
             calls.append(call)
-    for index, call in enumerate(calls):
-        call.id = f"call_{index}"
-    return calls
+    return _assign_ids(calls)
 
 
 def _parse_xml_functions(text: str) -> list[ParsedToolCall]:
@@ -128,9 +140,7 @@ def _parse_xml_functions(text: str) -> list[ParsedToolCall]:
                 value = raw
             args[param.group(1).strip()] = value
         calls.append(ParsedToolCall(id="", name=name, arguments=args))
-    for index, call in enumerate(calls):
-        call.id = f"call_{index}"
-    return calls
+    return _assign_ids(calls)
 
 
 def parse_tool_calls(

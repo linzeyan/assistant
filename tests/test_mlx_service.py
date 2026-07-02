@@ -300,9 +300,12 @@ async def test_stream_chat_emits_structured_tool_calls(tmp_path):
     ]
     tool_events = [e for e in events if e["type"] == "tool_calls"]
     assert len(tool_events) == 1
-    assert tool_events[0]["tool_calls"] == [
-        {"id": "call_0", "name": "read_file", "arguments": {"path": "a.py"}}
-    ]
+    (call,) = tool_events[0]["tool_calls"]
+    # Ids are minted uniquely per call (repeating "call_0" made Anthropic-protocol
+    # clients drop every tool call after the first turn), so match on shape not value.
+    assert call["id"].startswith("call_")
+    assert call["name"] == "read_file"
+    assert call["arguments"] == {"path": "a.py"}
     # The raw <tool_call> markup must never leak into streamed text.
     text = "".join(e["content"] for e in events if e["type"] == "text")
     assert "<tool_call>" not in text
