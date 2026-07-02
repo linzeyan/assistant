@@ -349,15 +349,40 @@ def _hf_total_size(repo_id: str) -> int:
     return sum((sib.size or 0) for sib in (info.siblings or []))
 
 
-def _dir_size(path: Path) -> int:
-    total = 0
+def _download_progress_bytes(path: Path) -> int:
+    """Bytes of *real* progress toward completion — what the GUI's bar/percentage reflects.
+
+    The hub writes each in-flight file to ``.cache/huggingface/download/*.incomplete`` and only
+    moves it to its final name when complete. A SIGKILL (e.g. the OOM double-restart) or a
+    cancel+retry orphans that attempt: the hub resumes into a NEW ``.incomplete`` and never reuses
+    the dead one — so several ``.incomplete`` twins for already-finished shards pile up. A plain
+    dir-size counts every finished file PLUS all that dead weight, inflating the dir ABOVE the repo
+    size, which N68's clamp then froze at a premature, stuck-looking "100%" (the user asked "is it
+    stuck?" at a real ~94%).
+
+    Fix: completed files (moved to their final names) are ground truth — sum them all. For the
+    in-progress portion, count only the SINGLE most-recently-written ``.incomplete``. We download
+    with ``max_workers=1`` (one file transfers at a time), so the newest ``.incomplete`` is the live
+    one and every older ``.incomplete`` is an abandoned orphan — no real progress is lost by dropping
+    them (their bytes get re-fetched into the live file). If max_workers were raised, this undercounts
+    concurrent transfers — the bar lags slightly but can never show a false 100%, which is the safe
+    direction. Deliberately parses no hub-internal filename/etag scheme, so a hub format change can't
+    silently corrupt the number again.
+    """
+    completed = 0
+    newest_incomplete = (0.0, 0)  # (mtime, size)
     for root, _dirs, files in os.walk(path):
         for name in files:
             try:
-                total += (Path(root) / name).stat().st_size
+                st = (Path(root) / name).stat()
             except OSError:
-                pass  # file vanished mid-walk (rename/cleanup) — skip
-    return total
+                continue  # vanished mid-walk (rename to final / cleanup) — skip
+            if name.endswith(".incomplete"):
+                if st.st_mtime > newest_incomplete[0]:
+                    newest_incomplete = (st.st_mtime, st.st_size)
+            else:
+                completed += st.st_size
+    return completed + newest_incomplete[1]
 
 
 async def _subprocess_runner(
@@ -429,7 +454,7 @@ async def _subprocess_runner(
                 break  # process exited
             except (asyncio.TimeoutError, TimeoutError):
                 now = time.monotonic()
-                bytes_now = _dir_size(target)
+                bytes_now = _download_progress_bytes(target)
                 state.downloaded_bytes = bytes_now
                 window = now - rate_anchor_t
                 if window >= _RATE_WINDOW_S:
@@ -443,7 +468,7 @@ async def _subprocess_runner(
             # FutureWarning masked a SIGKILL — the surfaced "error" said deprecation, not death).
             tail = "\n".join(stderr_tail)[-500:].strip()
             raise RuntimeError(f"exit {proc.returncode}" + (f": {tail}" if tail else ""))
-        state.downloaded_bytes = _dir_size(target) or state.downloaded_bytes
+        state.downloaded_bytes = _download_progress_bytes(target) or state.downloaded_bytes
     finally:
         watcher.cancel()
         drainer.cancel()

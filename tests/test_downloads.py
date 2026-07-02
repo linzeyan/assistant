@@ -253,6 +253,38 @@ def test_to_public_clamps_downloaded_to_total():
     assert unsized.to_public()["downloaded_bytes"] == 123
 
 
+def test_progress_bytes_counts_finished_plus_only_the_live_incomplete(tmp_path):
+    # A SIGKILL (OOM double-restart) / cancel+retry orphans in-flight `.incomplete` files; the hub
+    # resumes into a fresh one and never reuses the dead twins — including orphans of shards that
+    # LATER finished. A plain dir-size counted all that dead weight, inflating the dir above the repo
+    # size, which N68's clamp froze at a fake "100%" (the user asked "is it stuck?" at a real ~94%).
+    # Progress = every finished file + only the single newest .incomplete (the live one under
+    # max_workers=1); all older orphans — even ones whose shard is already done — are ignored.
+    import os
+
+    from assistant.downloads import _download_progress_bytes
+
+    dl = tmp_path / ".cache" / "huggingface" / "download"
+    dl.mkdir(parents=True)
+    (tmp_path / "model-00001.safetensors").write_bytes(b"x" * 1000)  # finished shard
+    (tmp_path / "model-00002.safetensors").write_bytes(b"x" * 1000)  # finished shard
+
+    live = dl / "aaa.sha.1111.incomplete"  # the shard currently transferring
+    live.write_bytes(b"x" * 300)
+    os.utime(live, (5_000, 5_000))  # newest mtime
+    # Orphan of the shard being downloaded (a prior killed attempt) — older.
+    orphan_live = dl / "aaa.sha.2222.incomplete"
+    orphan_live.write_bytes(b"x" * 250)
+    os.utime(orphan_live, (2_000, 2_000))
+    # Orphan of an ALREADY-FINISHED shard (distinct target) — the case that defeated per-key dedup.
+    orphan_done = dl / "bbb.sha.3333.incomplete"
+    orphan_done.write_bytes(b"x" * 900)
+    os.utime(orphan_done, (1_000, 1_000))
+
+    # 1000 + 1000 (finished) + 300 (live only) = 2300 — orphans (250, 900) excluded.
+    assert _download_progress_bytes(tmp_path) == 2300
+
+
 def test_manager_binds_env_and_max_workers_onto_default_runner(tmp_path):
     # N50: with no injected runner, the manager binds the download tunables onto the real
     # subprocess runner (so the fixed Runner call site carries them through).
