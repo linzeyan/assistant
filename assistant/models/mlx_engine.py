@@ -156,6 +156,32 @@ def _render_prompt(
     messages = _messages_for_template(messages)
     extra = template_kwargs or {}
     try:
+        return _apply_template(templater, messages, tools, extra)
+    except Exception as original:
+        # A strict chat template rejected Claude Code's message shape — Mixtral demands strict
+        # user/assistant alternation ("roles must alternate"), Qwen3.x demands the system message
+        # come first ("System message must be at the beginning"). Both fire from inside jinja as a
+        # TemplateError, not a TypeError, so the tools-kwarg fallback below never caught them and the
+        # panel member was silently skipped. Normalise to the strict common denominator and retry
+        # ONCE. Models whose template accepted the original never reach here, so they keep their exact
+        # (tool-aware) message shape — only the already-failing path pays for the rewrite.
+        normalized = _normalize_message_shape(messages)
+        if normalized == messages:
+            raise
+        try:
+            return _apply_template(templater, normalized, tools, extra)
+        except Exception:
+            raise original from None
+
+
+def _apply_template(templater, messages: list[dict], tools, extra: dict) -> str:
+    """Render once, falling back only when the tokenizer genuinely rejects the ``tools`` kwarg.
+
+    A TypeError from *inside* the template (a message-shape mismatch) must surface — retrying
+    without tools would just fail the same way and mask the real cause. The previous blanket
+    ``except TypeError`` swallowed exactly that, hiding the Qwen3.x tool_calls render bug.
+    """
+    try:
         return templater(
             messages, tools=tools, add_generation_prompt=True, tokenize=False, **extra
         )
@@ -163,6 +189,55 @@ def _render_prompt(
         if "tools" not in str(exc):  # not the "template doesn't accept tools" case — surface it
             raise
         return templater(messages, add_generation_prompt=True, tokenize=False, **extra)
+
+
+def _normalize_message_shape(messages: list[dict]) -> list[dict]:
+    """Rewrite a message list to the strict common denominator strict chat templates demand: a
+    single leading system message, then only user/assistant turns that alternate. Called ONLY as a
+    fallback after a template rejected the original shape, so well-behaved (tool-aware) templates are
+    never touched.
+
+    Because a template this strict has no tool slot anyway, tool structure is flattened to text: a
+    ``role: tool`` result folds into the conversation as a user turn, and an assistant's
+    ``tool_calls`` are appended to its text so the history isn't lost. Consecutive same-role turns
+    are then merged to satisfy alternation.
+    """
+    system_parts: list[str] = []
+    convo: list[tuple[str, str]] = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content")
+        if not isinstance(content, str):
+            content = "" if content is None else str(content)
+        if role == "system":
+            if content:
+                system_parts.append(content)
+            continue
+        if role == "assistant" and m.get("tool_calls"):
+            rendered = "; ".join(
+                f"{(tc.get('function') or {}).get('name', '')}"
+                f"({(tc.get('function') or {}).get('arguments', '')})"
+                for tc in m["tool_calls"]
+            )
+            content = f"{content}\n[called: {rendered}]".strip()
+        elif role == "tool":  # no tool slot in a strict template — fold the result in as a user turn
+            role = "user"
+        if role not in ("user", "assistant"):
+            role = "user"
+        convo.append((role, content))
+
+    merged: list[list] = []
+    for role, content in convo:
+        if merged and merged[-1][0] == role:
+            merged[-1][1] = f"{merged[-1][1]}\n\n{content}".strip()
+        else:
+            merged.append([role, content])
+
+    out: list[dict] = []
+    if system_parts:
+        out.append({"role": "system", "content": "\n\n".join(system_parts)})
+    out.extend({"role": r, "content": c} for r, c in merged)
+    return out
 
 
 def _sampler_kwargs(

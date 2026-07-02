@@ -9,6 +9,7 @@ from assistant.models import mlx_engine
 from assistant.models.mlx_engine import (
     MlxEnginePool,
     _messages_for_template,
+    _normalize_message_shape,
     _render_prompt,
 )
 
@@ -275,5 +276,98 @@ def test_render_prompt_surfaces_real_template_error():
         raise TypeError("Can only get item pairs from a mapping.")
 
     # A template error unrelated to the tools kwarg must NOT be swallowed by a no-tools retry.
+    # After the shape-normalisation retry ALSO fails, the ORIGINAL error is what surfaces.
     with pytest.raises(TypeError, match="mapping"):
         _render_prompt(always_fail, [_msg_with_args("{}")], tools=[{"x": 1}])
+
+
+class _TemplateReject(Exception):
+    """Stands in for jinja2's TemplateError raised from inside a strict chat template."""
+
+
+# Claude Code produces these shapes; strict templates reject them and the panel member was skipped.
+_CC_SHAPE = [
+    {"role": "system", "content": "You are Claude Code."},
+    {"role": "user", "content": "read a.py"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c1", "type": "function",
+         "function": {"name": "read_file", "arguments": {"path": "a.py"}}}]},
+    {"role": "tool", "content": "file contents"},
+    {"role": "user", "content": "now edit it"},
+    {"role": "system", "content": "<system-reminder> stay on task"},
+    {"role": "user", "content": "go"},
+]
+
+
+def _alternation_strict(messages, tools=None, add_generation_prompt=True, tokenize=False):
+    """Mixtral: only user/assistant, and roles must strictly alternate."""
+    prev = None
+    for m in messages:
+        role = m["role"]
+        if role not in ("user", "assistant", "system"):
+            raise _TemplateReject("Conversation roles must alternate user/assistant/…")
+        if role == "system":
+            continue
+        if role == prev:
+            raise _TemplateReject("Conversation roles must alternate user/assistant/…")
+        prev = role
+    return "RENDERED"
+
+
+def _system_first_strict(messages, tools=None, add_generation_prompt=True, tokenize=False):
+    """Qwen3.x: a system message may appear only at index 0."""
+    for i, m in enumerate(messages):
+        if m["role"] == "system" and i != 0:
+            raise _TemplateReject("System message must be at the beginning of the conversation.")
+    return "RENDERED"
+
+
+def test_render_prompt_normalizes_for_alternation_strict_template():
+    # Mixtral-class crash ("roles must alternate"): tool role + consecutive users. Normalisation
+    # folds the tool result in and merges consecutive turns so the retry renders.
+    assert _render_prompt(_alternation_strict, _CC_SHAPE, tools=None) == "RENDERED"
+
+
+def test_render_prompt_normalizes_for_system_first_strict_template():
+    # Qwen3.x crash ("system must be at the beginning"): the mid-conversation <system-reminder>
+    # gets hoisted/merged into the single leading system message.
+    assert _render_prompt(_system_first_strict, _CC_SHAPE, tools=None) == "RENDERED"
+
+
+def test_render_prompt_does_not_normalize_when_template_accepts_shape():
+    # A tool-aware template that renders the original must keep the EXACT (structured) messages —
+    # normalisation is a failure-path-only fallback and must never touch the happy path.
+    seen: list[list[dict]] = []
+
+    def tolerant(messages, tools=None, add_generation_prompt=True, tokenize=False):
+        seen.append(messages)
+        return "OK"
+
+    assert _render_prompt(tolerant, _CC_SHAPE, tools=None) == "OK"
+    assert len(seen) == 1  # rendered once, no retry
+    assert any(m.get("tool_calls") for m in seen[0])  # tool structure preserved, not flattened
+
+
+def test_normalize_message_shape_hoists_system_folds_tools_merges_turns():
+    out = _normalize_message_shape(_CC_SHAPE)
+    # Exactly one system message, and it leads.
+    assert out[0]["role"] == "system"
+    assert [m["role"] for m in out].count("system") == 1
+    assert "stay on task" in out[0]["content"]  # mid-list system merged in
+    # Only user/assistant after the system, strictly alternating.
+    roles = [m["role"] for m in out[1:]]
+    assert all(r in ("user", "assistant") for r in roles)
+    assert all(a != b for a, b in zip(roles, roles[1:]))
+    # The tool call survives as text on the assistant turn; the tool result folded into a user turn.
+    assert any("[called: read_file(" in m["content"] for m in out if m["role"] == "assistant")
+    assert any("file contents" in m["content"] for m in out if m["role"] == "user")
+
+
+def test_normalize_message_shape_noop_shape_is_unchanged():
+    # A list that already satisfies the strict rules round-trips to the same content.
+    clean = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    assert _normalize_message_shape(clean) == clean
