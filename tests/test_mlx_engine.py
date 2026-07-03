@@ -488,6 +488,22 @@ def test_stream_text_rebuilds_when_cache_cannot_be_trimmed(monkeypatch):
     assert calls[1]["cache"] is not first_cache  # on a fresh cache
 
 
+def test_stream_text_logs_prefill_vs_decode_split(monkeypatch, caplog):
+    # The observability contract for "why is this slow": the log line must separate cached vs
+    # prefilled prompt tokens (cache health) from decode count (model ceiling).
+    tok = _StubTok([1, 2, 3])
+    _install_mlx(monkeypatch, script=[(10, "a"), (11, "b")])
+    eng = MlxEngine(model=object(), tokenizer=tok)
+    with caplog.at_level("INFO", logger="assistant"):
+        list(eng.stream_text([{"role": "user", "content": "hi"}]))
+        tok.ids = [1, 2, 3, 10, 11, 20]  # second turn: cache hit on all but 1 token
+        list(eng.stream_text([{"role": "user", "content": "more"}]))
+    lines = [r.message for r in caplog.records if r.message.startswith("generation:")]
+    assert "prompt=3 (cached=0, prefill=3)" in lines[0]  # cold cache: everything prefilled
+    assert "prompt=6 (cached=5, prefill=1)" in lines[1]  # warm: only the new tail
+    assert "decode=2 tok" in lines[0]
+
+
 def test_stream_text_invalidates_cache_on_error(monkeypatch):
     _install_mlx(monkeypatch, script=[(10, "a"), (11, "b")], raise_after=1)
     eng = MlxEngine(model=object(), tokenizer=_StubTok([1, 2, 3]))

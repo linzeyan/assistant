@@ -20,6 +20,7 @@ import gc
 import json
 import logging
 import os
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -351,6 +352,9 @@ class MlxEngine:
         suffix, cache = self._prefill_plan(full_ids)
         generated: list[int] = []
         committed = False
+        last = None
+        t0 = time.monotonic()
+        ttft: float | None = None
         try:
             for response in stream_generate(
                 self._model,
@@ -360,6 +364,9 @@ class MlxEngine:
                 prompt_cache=cache,
                 **_sampler_kwargs(temperature, top_p, top_k),
             ):
+                if ttft is None:
+                    ttft = time.monotonic() - t0  # ≈ prefill time (first token out)
+                last = response
                 token = getattr(response, "token", None)
                 if token is not None:
                     generated.append(token)
@@ -367,6 +374,16 @@ class MlxEngine:
                 if text:
                     yield text
             committed = True
+            # The line that settles "why is this slow": prefill (cache miss cost, fixable by
+            # cache/session hygiene) vs decode (the model's ceiling, not fixable). cached = tokens
+            # served from the reused KV; prefill = tokens actually recomputed this turn.
+            log.info(
+                "generation: prompt=%d (cached=%d, prefill=%d) prefill=%.2fs decode=%d tok "
+                "in %.2fs (%.1f tok/s)",
+                len(full_ids), len(full_ids) - len(suffix), len(suffix), ttft or 0.0,
+                len(generated), max(time.monotonic() - t0 - (ttft or 0.0), 0.0),
+                getattr(last, "generation_tps", 0.0) or 0.0,
+            )
         finally:
             if committed:
                 # The cache now holds the whole prompt plus everything generated; record that so the
