@@ -261,3 +261,75 @@ def test_count_tokens_endpoint_zero_when_backend_cannot_count(tmp_path):
         r = client.post("/v1/messages/count_tokens", json={
             "model": "gemma-4", "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 200 and r.json() == {"input_tokens": 0}
+
+
+# --- K4: errors must wear the Anthropic envelope so Claude Code can read error.type ---
+
+def _assert_anthropic_error(body: dict, err_type: str):
+    # The shape Claude Code parses: {"type":"error","error":{"type":..,"message":..}} — NOT the
+    # bare FastAPI {"detail": ...}, which it can't interpret.
+    assert body.get("type") == "error"
+    assert body["error"]["type"] == err_type
+    assert isinstance(body["error"].get("message"), str) and body["error"]["message"]
+    assert "detail" not in body
+
+
+def test_anthropic_missing_messages_is_shaped_400(tmp_path):
+    with _client(tmp_path) as client:
+        client.app.state.model_service = _FakeService()
+        r = client.post("/v1/messages", json={"model": "gemma-4", "max_tokens": 10})
+    assert r.status_code == 400
+    _assert_anthropic_error(r.json(), "invalid_request_error")
+
+
+def test_count_tokens_missing_messages_is_shaped_400(tmp_path):
+    with _client(tmp_path) as client:
+        client.app.state.model_service = _FakeService()
+        r = client.post("/v1/messages/count_tokens", json={"model": "gemma-4"})
+    assert r.status_code == 400
+    _assert_anthropic_error(r.json(), "invalid_request_error")
+
+
+def test_anthropic_malformed_json_is_shaped_400(tmp_path):
+    with _client(tmp_path) as client:
+        client.app.state.model_service = _FakeService()
+        r = client.post("/v1/messages", content=b"{not json",
+                        headers={"content-type": "application/json"})
+    assert r.status_code == 400
+    _assert_anthropic_error(r.json(), "invalid_request_error")
+
+
+class _ExplodingService(_FakeService):
+    """Model service whose generation blows up mid-turn (model won't load / template render)."""
+
+    def stream_chat(self, messages, model, tools=None, **params):
+        async def gen():
+            raise RuntimeError("model failed to load")
+            yield  # pragma: no cover — marks this an async generator
+
+        return gen()
+
+
+def test_anthropic_nonstream_generation_error_is_shaped_api_error(tmp_path):
+    # A generation failure on the non-streaming path was a bare 500; now it's a shaped api_error,
+    # mirroring the streaming path's in-band error event.
+    with _client(tmp_path) as client:
+        client.app.state.model_service = _ExplodingService()
+        r = client.post("/v1/messages", json={
+            "model": "gemma-4", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 500
+    body = r.json()
+    _assert_anthropic_error(body, "api_error")
+    assert "model failed to load" in body["error"]["message"]
+
+
+def test_anthropic_stream_error_event_keeps_envelope(tmp_path):
+    # The in-stream failure event stays in the Anthropic error shape (shared _err_body).
+    with _client(tmp_path) as client:
+        client.app.state.model_service = _ExplodingService()
+        r = client.post("/v1/messages", json={
+            "model": "gemma-4", "max_tokens": 10, "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+    err = next(d for d in _sse_data(r.text) if d.get("type") == "error")
+    _assert_anthropic_error(err, "api_error")

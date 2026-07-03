@@ -12,8 +12,8 @@ from __future__ import annotations
 import json
 import uuid
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from assistant.api.compat import (
     anthropic_to_openai_messages,
@@ -24,6 +24,22 @@ from assistant.api.compat import (
 
 router = APIRouter(tags=["anthropic-compat"])
 
+# Anthropic error-type by HTTP status (the subset this shim produces). Claude Code reads
+# ``error.type`` to decide whether to retry or surface — a bare FastAPI ``{"detail": ...}`` it
+# can't interpret, so every failure here MUST wear the Anthropic error envelope (K4).
+_ERR_TYPE = {400: "invalid_request_error", 404: "not_found_error", 500: "api_error"}
+
+
+def _err_body(err_type: str, message: str) -> dict:
+    """The Anthropic error envelope shared by the JSON error responses and the in-stream error
+    event, so both framings stay byte-identical in shape."""
+    return {"type": "error", "error": {"type": err_type, "message": message}}
+
+
+def _error(status: int, message: str) -> JSONResponse:
+    return JSONResponse(status_code=status,
+                        content=_err_body(_ERR_TYPE.get(status, "api_error"), message))
+
 
 def _evt(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -32,12 +48,18 @@ def _evt(event: str, data: dict) -> str:
 @router.post("/v1/messages")
 async def messages(request: Request):
     service = request.app.state.model_service
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "request body must be valid JSON")
     if not body.get("messages"):
-        raise HTTPException(status_code=400, detail="'messages' is required")
-    model = await resolve_model(service, body.get("model", ""))
-    oa_messages = anthropic_to_openai_messages(body.get("system"), body["messages"])
-    tools = anthropic_tools_to_openai(body.get("tools"))
+        return _error(400, "'messages' is required")
+    try:
+        model = await resolve_model(service, body.get("model", ""))
+        oa_messages = anthropic_to_openai_messages(body.get("system"), body["messages"])
+        tools = anthropic_tools_to_openai(body.get("tools"))
+    except Exception as exc:  # malformed content blocks / tool schema — a client problem (400)
+        return _error(400, f"could not process request: {exc}")
     params = sampling_params(body)
     if "max_tokens" not in params:  # Anthropic requires max_tokens; honour it as the cap
         params["max_tokens"] = body.get("max_tokens", 1024)
@@ -47,16 +69,21 @@ async def messages(request: Request):
         text_parts: list[str] = []
         calls: list[dict] = []
         usage = {"input_tokens": 0, "output_tokens": 0}
-        async for ev in service.stream_chat(oa_messages, model, tools=tools, **params):
-            if ev["type"] == "text":
-                text_parts.append(ev["content"])
-            elif ev["type"] == "tool_calls":
-                calls.extend(ev["tool_calls"])
-            elif ev["type"] == "usage":
-                usage = {
-                    "input_tokens": ev.get("input_tokens", 0),
-                    "output_tokens": ev.get("output_tokens", 0),
-                }
+        try:
+            async for ev in service.stream_chat(oa_messages, model, tools=tools, **params):
+                if ev["type"] == "text":
+                    text_parts.append(ev["content"])
+                elif ev["type"] == "tool_calls":
+                    calls.extend(ev["tool_calls"])
+                elif ev["type"] == "usage":
+                    usage = {
+                        "input_tokens": ev.get("input_tokens", 0),
+                        "output_tokens": ev.get("output_tokens", 0),
+                    }
+        except Exception as exc:
+            # Mirror the streaming path's error handling: a generation failure (model won't load,
+            # chat-template render, …) becomes a shaped api_error, not a bare FastAPI 500.
+            return _error(500, str(exc))
         content: list[dict] = []
         text = "".join(text_parts)
         if text:
@@ -146,8 +173,7 @@ async def messages(request: Request):
                                    {"type": "content_block_stop", "index": index})
                         index += 1
         except Exception as exc:
-            yield _evt("error", {"type": "error",
-                                 "error": {"type": "api_error", "message": str(exc)}})
+            yield _evt("error", _err_body("api_error", str(exc)))
             return
         if text_open:
             yield _evt("content_block_stop", {"type": "content_block_stop", "index": index})
@@ -167,11 +193,20 @@ async def count_tokens(request: Request):
     model's window before sending — without it, it can only guess. Returns the rendered prompt's
     token count (0 when the backend can't count)."""
     service = request.app.state.model_service
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "request body must be valid JSON")
     if not body.get("messages"):
-        raise HTTPException(status_code=400, detail="'messages' is required")
-    model = await resolve_model(service, body.get("model", ""))
-    oa_messages = anthropic_to_openai_messages(body.get("system"), body["messages"])
-    tools = anthropic_tools_to_openai(body.get("tools"))
-    count = await service.count_tokens(oa_messages, model, tools=tools)
+        return _error(400, "'messages' is required")
+    try:
+        model = await resolve_model(service, body.get("model", ""))
+        oa_messages = anthropic_to_openai_messages(body.get("system"), body["messages"])
+        tools = anthropic_tools_to_openai(body.get("tools"))
+    except Exception as exc:  # malformed content blocks / tool schema — a client problem (400)
+        return _error(400, f"could not process request: {exc}")
+    try:
+        count = await service.count_tokens(oa_messages, model, tools=tools)
+    except Exception as exc:  # backend failed to count — a server problem (500), not the client's
+        return _error(500, str(exc))
     return {"input_tokens": int(count or 0)}
