@@ -88,6 +88,59 @@ def test_anthropic_to_openai_messages_system_and_tool_roundtrip():
     assert msgs[3] == {"role": "tool", "tool_call_id": "tu1", "content": "FILE BODY"}
 
 
+def test_anthropic_parallel_tool_use_and_results_preserve_order():
+    # Claude Code fans out several tools in one assistant turn, then returns all results in one
+    # user turn. All calls must land on ONE assistant message; each result becomes its own tool
+    # message, in the same order (so tool_call_id linkage stays sane for strict templates).
+    msgs = anthropic_to_openai_messages(
+        system=None,
+        messages=[
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "a", "name": "read", "input": {"p": "1"}},
+                {"type": "tool_use", "id": "b", "name": "read", "input": {"p": "2"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "one"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "two"},
+            ]},
+        ],
+    )
+    assert [c["id"] for c in msgs[0]["tool_calls"]] == ["a", "b"]
+    assert msgs[1] == {"role": "tool", "tool_call_id": "a", "content": "one"}
+    assert msgs[2] == {"role": "tool", "tool_call_id": "b", "content": "two"}
+
+
+def test_anthropic_tool_result_precedes_user_text_in_same_turn():
+    # A user turn carrying BOTH tool_result and new text: the tool output must come FIRST (it
+    # answers the prior assistant tool_calls), then the user's text — the OpenAI/chat-template
+    # ordering. Emitting the user text before the tool message breaks strict templates (cf. N72).
+    msgs = anthropic_to_openai_messages(
+        system=None,
+        messages=[
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu1", "name": "read", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu1", "content": "BODY"},
+                {"type": "text", "text": "now summarise it"},
+            ]},
+        ],
+    )
+    # msgs[0] = assistant(tool_calls); then tool result; then the user's new text — in that order.
+    assert msgs[1] == {"role": "tool", "tool_call_id": "tu1", "content": "BODY"}
+    assert msgs[2] == {"role": "user", "content": "now summarise it"}
+
+
+def test_anthropic_system_as_content_blocks():
+    # Claude Code sends system as a list of text blocks (cache_control markers etc.), not a str.
+    msgs = anthropic_to_openai_messages(
+        system=[{"type": "text", "text": "you are terse"},
+                {"type": "text", "text": " and precise"}],
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert msgs[0] == {"role": "system", "content": "you are terse and precise"}
+
+
 def test_anthropic_tools_to_openai_schema():
     out = anthropic_tools_to_openai([
         {"name": "read", "description": "read a file",

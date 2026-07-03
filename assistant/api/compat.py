@@ -137,9 +137,14 @@ def anthropic_to_openai_messages(system, messages: list[dict]) -> list[dict]:
                 "content": "".join(text_parts),
                 "tool_calls": tool_calls,
             })
-        elif text_parts:
-            out.append({"role": role, "content": "".join(text_parts)})
-        out.extend(tool_results)
+            out.extend(tool_results)
+        else:
+            # Tool outputs answer the PRIOR assistant tool_calls, so they must precede any new user
+            # text in this same turn — the OpenAI/chat-template ordering. Emitting the user's text
+            # before its role:tool answers breaks strict templates (the N72 failure class).
+            out.extend(tool_results)
+            if text_parts:
+                out.append({"role": role, "content": "".join(text_parts)})
     return out
 
 
