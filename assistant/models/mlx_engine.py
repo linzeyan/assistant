@@ -259,12 +259,68 @@ def _sampler_kwargs(
     }
 
 
+def _common_prefix_len(a: list[int], b: list[int]) -> int:
+    """Length of the longest shared leading run of two token sequences."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
 class MlxEngine:
     """A loaded mlx-lm model + tokenizer that streams text for one chat turn."""
 
     def __init__(self, model: object, tokenizer: object):
         self._model = model
         self._tokenizer = tokenizer
+        # Single-slot prompt cache reused across turns (see _prefill_plan). ``_cache_ids`` is the
+        # token sequence the KV in ``_cache`` currently represents; both are only valid together.
+        # Safe without a lock: the pool pins each model to a single-thread executor, so all of a
+        # model's generation is serialized.
+        self._cache: object | None = None
+        self._cache_ids: list[int] = []
+
+    def _encode_for_generation(self, prompt: str) -> list[int]:
+        # Mirror stream_generate's own tokenisation exactly so the ids we prefix-match against the
+        # cache are the ids the model actually sees: BOS is added only when the prompt doesn't
+        # already start with it.
+        bos = getattr(self._tokenizer, "bos_token", None)
+        add_special = bos is None or not prompt.startswith(bos)
+        return list(self._tokenizer.encode(prompt, add_special_tokens=add_special))
+
+    def _prefill_plan(self, full_ids: list[int]) -> tuple[list[int], object]:
+        """Reuse the KV of the longest common prefix with the previous turn and prefill only the new
+        tail. Claude Code re-sends the whole conversation every turn, so without this each turn
+        re-prefills tens of thousands of tokens (system prompt + tools + history + file reads) before
+        the first output token — the dominant per-turn cost. Falls back to a fresh full prefill when
+        nothing is shared or the cache can't be trimmed back to the shared prefix.
+        """
+        from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+
+        common = _common_prefix_len(self._cache_ids, full_ids)
+        common = min(common, len(full_ids) - 1)  # always leave ≥1 token to feed the generator
+        if self._cache is not None and common > 0:
+            drop = len(self._cache_ids) - common
+            # drop==0: cache already exactly the shared prefix. Otherwise trim it back; if the cache
+            # can't drop them all (rotating/quantised KV), trim_prompt_cache mangles it in place, so
+            # discard and rebuild rather than reuse a mismatched cache.
+            if drop == 0 or trim_prompt_cache(self._cache, drop) == drop:
+                return full_ids[common:], self._cache
+        return full_ids, make_prompt_cache(self._model)
+
+    def count_tokens(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict | None = None,
+    ) -> int:
+        """Token length of the rendered prompt — powers /v1/messages/count_tokens and the usage
+        Claude Code reads to track how full the context is."""
+        prompt = _render_prompt(
+            self._tokenizer.apply_chat_template, messages, tools, chat_template_kwargs
+        )
+        return len(self._encode_for_generation(prompt))
 
     def stream_text(
         self,
@@ -275,6 +331,7 @@ class MlxEngine:
         top_p: float | None = None,
         top_k: int | None = None,
         chat_template_kwargs: dict | None = None,
+        usage_out: dict | None = None,
         **_ignored,
     ) -> Iterator[str]:
         # Imported lazily: MLX is a heavy, Apple-Silicon-only dependency.
@@ -286,16 +343,43 @@ class MlxEngine:
         prompt = _render_prompt(
             self._tokenizer.apply_chat_template, messages, tools, chat_template_kwargs
         )
-        for response in stream_generate(
-            self._model,
-            self._tokenizer,
-            prompt,
-            max_tokens=max_tokens,
-            **_sampler_kwargs(temperature, top_p, top_k),
-        ):
-            text = getattr(response, "text", None)
-            if text:
-                yield text
+        full_ids = self._encode_for_generation(prompt)
+        if usage_out is not None:
+            # Full prompt count regardless of cache reuse — it's the context size Claude Code tracks.
+            usage_out["input_tokens"] = len(full_ids)
+
+        suffix, cache = self._prefill_plan(full_ids)
+        generated: list[int] = []
+        committed = False
+        try:
+            for response in stream_generate(
+                self._model,
+                self._tokenizer,
+                suffix,
+                max_tokens=max_tokens,
+                prompt_cache=cache,
+                **_sampler_kwargs(temperature, top_p, top_k),
+            ):
+                token = getattr(response, "token", None)
+                if token is not None:
+                    generated.append(token)
+                text = getattr(response, "text", None)
+                if text:
+                    yield text
+            committed = True
+        finally:
+            if committed:
+                # The cache now holds the whole prompt plus everything generated; record that so the
+                # next turn of this conversation reuses it instead of re-prefilling from scratch.
+                self._cache = cache
+                self._cache_ids = full_ids + generated
+                if usage_out is not None:
+                    usage_out["output_tokens"] = len(generated)
+            else:
+                # Early stop / error / client disconnect left the cache extended past _cache_ids —
+                # invalidate so a stale mismatch can't corrupt the next turn's prefix reuse.
+                self._cache = None
+                self._cache_ids = []
 
 
 class VlmChatEngine:

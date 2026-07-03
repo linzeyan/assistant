@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
 
 from assistant.models import mlx_engine
 from assistant.models.mlx_engine import (
+    MlxEngine,
     MlxEnginePool,
+    _common_prefix_len,
     _messages_for_template,
     _normalize_message_shape,
     _render_prompt,
@@ -371,3 +375,123 @@ def test_normalize_message_shape_noop_shape_is_unchanged():
         {"role": "assistant", "content": "hello"},
     ]
     assert _normalize_message_shape(clean) == clean
+
+
+# --- prompt/KV cache reuse across turns (B) ---
+
+
+def test_common_prefix_len():
+    assert _common_prefix_len([1, 2, 3], [1, 2, 9]) == 2
+    assert _common_prefix_len([1, 2], [1, 2, 3]) == 2  # shorter bounds it
+    assert _common_prefix_len([], [1]) == 0
+    assert _common_prefix_len([5, 6], [7, 8]) == 0
+
+
+class _StubTok:
+    """A tokenizer whose encode() returns a settable id list, so a test can script two turns'
+    prompts and control the prefix overlap between them."""
+
+    bos_token = None
+
+    def __init__(self, ids):
+        self.ids = list(ids)
+
+    def apply_chat_template(self, messages, tools=None, add_generation_prompt=True,
+                            tokenize=False, **kw):
+        return "RENDERED"
+
+    def encode(self, text, add_special_tokens=True):
+        return list(self.ids)
+
+
+class _FakeCache:
+    """Distinguishable stand-in for an mlx-lm prompt cache (identity is what the tests check)."""
+
+
+def _install_mlx(monkeypatch, *, script, trim_result=None, raise_after=None):
+    """Stub mlx_lm.stream_generate + the cache helpers (the real package can't import in CI). Records
+    each stream_generate call's (prompt, cache) so a test can assert what got prefilled and reused."""
+    calls: list[dict] = []
+
+    def stream_generate(model, tokenizer, prompt, max_tokens=256, prompt_cache=None, **kw):
+        calls.append({"prompt": list(prompt), "cache": prompt_cache, "max_tokens": max_tokens})
+        for i, (tid, text) in enumerate(script):
+            if raise_after is not None and i == raise_after:
+                raise RuntimeError("boom")
+            yield types.SimpleNamespace(token=tid, text=text)
+
+    def make_prompt_cache(model, max_kv_size=None):
+        return _FakeCache()
+
+    def trim_prompt_cache(cache, n):
+        return n if trim_result is None else trim_result
+
+    mlx_lm = types.ModuleType("mlx_lm")
+    mlx_lm.stream_generate = stream_generate
+    models = types.ModuleType("mlx_lm.models")
+    cache_mod = types.ModuleType("mlx_lm.models.cache")
+    cache_mod.make_prompt_cache = make_prompt_cache
+    cache_mod.trim_prompt_cache = trim_prompt_cache
+    models.cache = cache_mod
+    mlx_lm.models = models
+    monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models", models)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.cache", cache_mod)
+    return calls
+
+
+def test_stream_text_first_turn_prefills_full_and_reports_usage(monkeypatch):
+    calls = _install_mlx(monkeypatch, script=[(10, "a"), (11, "b")])
+    eng = MlxEngine(model=object(), tokenizer=_StubTok([1, 2, 3]))
+    usage: dict = {}
+    out = list(eng.stream_text([{"role": "user", "content": "hi"}], usage_out=usage))
+    assert out == ["a", "b"]
+    assert calls[0]["prompt"] == [1, 2, 3]  # no prior cache → whole prompt prefilled
+    assert usage == {"input_tokens": 3, "output_tokens": 2}
+    assert eng._cache_ids == [1, 2, 3, 10, 11]  # prompt + generated
+    assert eng._cache is calls[0]["cache"]  # the fresh cache was committed
+
+
+def test_stream_text_reuses_cache_on_shared_prefix(monkeypatch):
+    tok = _StubTok([1, 2, 3])
+    calls = _install_mlx(monkeypatch, script=[(10, "a"), (11, "b")])
+    eng = MlxEngine(model=object(), tokenizer=tok)
+    list(eng.stream_text([{"role": "user", "content": "hi"}]))  # cache_ids -> [1,2,3,10,11]
+    first_cache = eng._cache
+    tok.ids = [1, 2, 3, 10, 11, 20]  # next turn = full prior context + one new token
+    list(eng.stream_text([{"role": "user", "content": "more"}]))
+    assert calls[1]["prompt"] == [20]  # ONLY the new tail is prefilled
+    assert calls[1]["cache"] is first_cache  # against the retained cache
+
+
+def test_stream_text_trims_cache_to_shared_prefix(monkeypatch):
+    tok = _StubTok([1, 2, 3])
+    calls = _install_mlx(monkeypatch, script=[(10, "a"), (11, "b")])  # trim returns n (full)
+    eng = MlxEngine(model=object(), tokenizer=tok)
+    list(eng.stream_text([{"role": "user", "content": "hi"}]))  # cache_ids -> [1,2,3,10,11]
+    first_cache = eng._cache
+    tok.ids = [1, 2, 3, 99]  # diverges after [1,2,3]; cache must drop its last 2 tokens
+    list(eng.stream_text([{"role": "user", "content": "x"}]))
+    assert calls[1]["prompt"] == [99]
+    assert calls[1]["cache"] is first_cache  # trimmed back to the shared prefix and reused
+
+
+def test_stream_text_rebuilds_when_cache_cannot_be_trimmed(monkeypatch):
+    tok = _StubTok([1, 2, 3])
+    calls = _install_mlx(monkeypatch, script=[(10, "a")], trim_result=0)  # trim can't drop → 0
+    eng = MlxEngine(model=object(), tokenizer=tok)
+    list(eng.stream_text([{"role": "user", "content": "hi"}]))  # cache_ids -> [1,2,3,10]
+    first_cache = eng._cache
+    tok.ids = [1, 2, 3, 99]  # needs a 1-token trim, which the cache refuses
+    list(eng.stream_text([{"role": "user", "content": "x"}]))
+    assert calls[1]["prompt"] == [1, 2, 3, 99]  # fall back to a full prefill
+    assert calls[1]["cache"] is not first_cache  # on a fresh cache
+
+
+def test_stream_text_invalidates_cache_on_error(monkeypatch):
+    _install_mlx(monkeypatch, script=[(10, "a"), (11, "b")], raise_after=1)
+    eng = MlxEngine(model=object(), tokenizer=_StubTok([1, 2, 3]))
+    with pytest.raises(RuntimeError):
+        list(eng.stream_text([{"role": "user", "content": "hi"}]))
+    # A mid-stream failure must not leave a cache whose token record is out of sync.
+    assert eng._cache is None and eng._cache_ids == []

@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 class _FakeService:
     """Records the (messages, model, tools) it was called with; scripts events back."""
 
-    def __init__(self, events=None, models=None):
+    def __init__(self, events=None, models=None, count=None):
         self._events = events or [{"type": "text", "content": "hello"}]
         self._models = models or [
             ModelInfo(id="mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit", type="llm",
@@ -33,13 +33,19 @@ class _FakeService:
             ModelInfo(id="mlx-community/gemma-4-31b-it-4bit", type="llm", loaded=False,
                       source="local", size_bytes=1),
         ]
+        self._count = count
         self.seen: dict = {}
+        self.seen_count: dict | None = None
 
     async def reachable(self):
         return True
 
     async def list_models(self):
         return self._models
+
+    async def count_tokens(self, messages, model, tools=None):
+        self.seen_count = {"messages": messages, "model": model, "tools": tools}
+        return self._count
 
     def stream_chat(self, messages, model, tools=None, **params):
         self.seen = {"messages": messages, "model": model, "tools": tools, "params": params}
@@ -182,3 +188,76 @@ def test_anthropic_messages_streams_event_sequence(tmp_path):
     assert events[0] == "message_start" and events[-1] == "message_stop"
     assert "content_block_start" in events and "content_block_delta" in events
     assert "message_delta" in events
+
+
+def _sse_data(text: str) -> list[dict]:
+    return [json.loads(ln[len("data: "):])
+            for ln in text.splitlines() if ln.startswith("data: ")]
+
+
+def test_anthropic_nonstream_reports_real_usage(tmp_path):
+    # A: the compat route must surface the engine's token counts (was hardcoded 0/0), so Claude
+    # Code can track context fill. The usage event never leaks into content blocks.
+    svc = _FakeService(events=[
+        {"type": "text", "content": "hi"},
+        {"type": "usage", "input_tokens": 1234, "output_tokens": 7},
+    ])
+    with _client(tmp_path) as client:
+        client.app.state.model_service = svc
+        r = client.post("/v1/messages", json={
+            "model": "gemma-4", "max_tokens": 50,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    body = r.json()
+    assert body["usage"] == {"input_tokens": 1234, "output_tokens": 7}
+    assert [b["type"] for b in body["content"]] == ["text"]  # no stray "usage" block
+
+
+def test_anthropic_stream_reports_usage_from_count_and_event(tmp_path):
+    # A (streaming): input_tokens comes from count_tokens at message_start (known up front so Claude
+    # Code sizes the window); output_tokens comes from the usage event at message_delta.
+    svc = _FakeService(count=8000, events=[
+        {"type": "text", "content": "hello"},
+        {"type": "usage", "input_tokens": 8000, "output_tokens": 3},
+    ])
+    with _client(tmp_path) as client:
+        client.app.state.model_service = svc
+        r = client.post("/v1/messages", json={
+            "model": "gemma-4", "max_tokens": 50, "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    payloads = _sse_data(r.text)
+    start = next(p for p in payloads if p["type"] == "message_start")
+    delta = next(p for p in payloads if p["type"] == "message_delta")
+    assert start["message"]["usage"]["input_tokens"] == 8000
+    assert delta["usage"]["output_tokens"] == 3
+    # The usage event must not surface as a text delta.
+    assert all("usage" not in json.dumps(p.get("delta", {})) for p in payloads
+               if p["type"] == "content_block_delta")
+
+
+def test_count_tokens_endpoint_translates_and_returns_count(tmp_path):
+    # C: /v1/messages/count_tokens renders via the translation layer and returns the model count.
+    svc = _FakeService(count=4242)
+    with _client(tmp_path) as client:
+        client.app.state.model_service = svc
+        r = client.post("/v1/messages/count_tokens", json={
+            "model": "Qwen3-Coder-30B-A3B-Instruct-8bit",
+            "system": "be terse",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "read", "input_schema": {"type": "object", "properties": {}}}],
+        })
+    assert r.status_code == 200 and r.json() == {"input_tokens": 4242}
+    assert svc.seen_count["model"] == "mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit"
+    assert svc.seen_count["messages"][0] == {"role": "system", "content": "be terse"}
+    assert svc.seen_count["tools"][0]["function"]["name"] == "read"
+
+
+def test_count_tokens_endpoint_zero_when_backend_cannot_count(tmp_path):
+    # None from the backend (can't count) → 0, never a crash.
+    svc = _FakeService(count=None)
+    with _client(tmp_path) as client:
+        client.app.state.model_service = svc
+        r = client.post("/v1/messages/count_tokens", json={
+            "model": "gemma-4", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200 and r.json() == {"input_tokens": 0}

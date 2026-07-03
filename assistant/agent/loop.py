@@ -244,6 +244,11 @@ class AgentLoop:
                         yield {"type": "assistant_delta", "content": ev["content"]}
                     elif ev["type"] == "tool_calls":
                         tool_calls = ev["tool_calls"]
+                    elif ev["type"] == "usage":
+                        # Token counts for the Anthropic compat route only; the GUI/gateway SSE has
+                        # no use for them. Swallow here so it doesn't reach the client. (A future
+                        # token-accounting feature would consume ev["input_tokens"]/["output_tokens"].)
+                        continue
                     else:
                         # Forward any other event the model layer emits (e.g. Fusion's panel
                         # tool_progress) straight to the gateway/SSE consumer.

@@ -46,11 +46,17 @@ async def messages(request: Request):
     if not body.get("stream"):
         text_parts: list[str] = []
         calls: list[dict] = []
+        usage = {"input_tokens": 0, "output_tokens": 0}
         async for ev in service.stream_chat(oa_messages, model, tools=tools, **params):
             if ev["type"] == "text":
                 text_parts.append(ev["content"])
             elif ev["type"] == "tool_calls":
                 calls.extend(ev["tool_calls"])
+            elif ev["type"] == "usage":
+                usage = {
+                    "input_tokens": ev.get("input_tokens", 0),
+                    "output_tokens": ev.get("output_tokens", 0),
+                }
         content: list[dict] = []
         text = "".join(text_parts)
         if text:
@@ -70,8 +76,16 @@ async def messages(request: Request):
             "content": content,
             "stop_reason": "tool_use" if calls else "end_turn",
             "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": usage,
         }
+
+    # Count the input up front so message_start carries the real context size — Claude Code reads
+    # usage.input_tokens to know how full the window is and to trigger its own compaction. None
+    # (backend can't count) → 0, the prior behaviour.
+    try:
+        input_tokens = await service.count_tokens(oa_messages, model, tools=tools) or 0
+    except Exception:
+        input_tokens = 0
 
     async def event_stream():
         yield _evt("message_start", {
@@ -79,14 +93,18 @@ async def messages(request: Request):
             "message": {
                 "id": mid, "type": "message", "role": "assistant", "model": model,
                 "content": [], "stop_reason": None, "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
             },
         })
         index = 0
         text_open = False
         stop_reason = "end_turn"
+        output_tokens = 0
         try:
             async for ev in service.stream_chat(oa_messages, model, tools=tools, **params):
+                if ev["type"] == "usage":
+                    output_tokens = ev.get("output_tokens", output_tokens)
+                    continue
                 if ev["type"] == "text":
                     if not ev["content"]:
                         continue
@@ -136,8 +154,24 @@ async def messages(request: Request):
         yield _evt("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": 0},
+            "usage": {"output_tokens": output_tokens},
         })
         yield _evt("message_stop", {"type": "message_stop"})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/v1/messages/count_tokens")
+async def count_tokens(request: Request):
+    """Anthropic's token-counting endpoint. Claude Code calls it to size a conversation against the
+    model's window before sending — without it, it can only guess. Returns the rendered prompt's
+    token count (0 when the backend can't count)."""
+    service = request.app.state.model_service
+    body = await request.json()
+    if not body.get("messages"):
+        raise HTTPException(status_code=400, detail="'messages' is required")
+    model = await resolve_model(service, body.get("model", ""))
+    oa_messages = anthropic_to_openai_messages(body.get("system"), body["messages"])
+    tools = anthropic_tools_to_openai(body.get("tools"))
+    count = await service.count_tokens(oa_messages, model, tools=tools)
+    return {"input_tokens": int(count or 0)}

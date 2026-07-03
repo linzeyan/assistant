@@ -289,6 +289,21 @@ class MlxModelService(ModelService):
             return None
         return await asyncio.to_thread(_read_context_window, entry.path)
 
+    async def count_tokens(
+        self, messages: list[dict], model: str, tools: list[dict] | None = None
+    ) -> int | None:
+        # Render + encode via the model's own tokenizer/template so the count matches the prompt the
+        # model would actually see (including per-model chat_template_kwargs). Reuses the pool: on an
+        # active Claude Code session the engine is already loaded, so this is just a tokenizer pass.
+        # Fusion is a virtual model with no single engine/tokenizer — nothing to count against.
+        if not self.available() or model == FUSION_MODEL_ID:
+            return None
+        entry = await self._entry_for(model)
+        self._require_chat_model(entry)
+        engine = await self._pool.acquire(model, entry.path, forced_kind=entry.kind)
+        tpl = self._per_model.chat_template_kwargs(model) if self._per_model is not None else None
+        return await asyncio.to_thread(engine.count_tokens, messages, tools, tpl)
+
     def stream_chat(
         self, messages: list[dict], model: str, tools: list[dict] | None = None, **params
     ) -> AsyncIterator[dict]:
@@ -337,6 +352,10 @@ class MlxModelService(ModelService):
 
         queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
+        # Filled by the engine thread as it generates; read after the stream ends to emit a usage
+        # event (input/output token counts) so the Anthropic compat route reports real numbers and
+        # Claude Code can track how full the context is. Empty for engines that don't count (VLM).
+        usage: dict = {}
 
         # Bind the engine as a default arg (the worker's own reference) and then drop
         # both `engine` and `worker` from this async generator's frame. Otherwise the
@@ -346,7 +365,9 @@ class MlxModelService(ModelService):
         # holds its own reference only until the worker finishes.
         def worker(eng: object = engine) -> None:
             try:
-                for text in eng.stream_text(messages, tools=tools, **params):
+                for text in eng.stream_text(
+                    messages, tools=tools, usage_out=usage, **params
+                ):
                     loop.call_soon_threadsafe(queue.put_nowait, ("token", text))
             except Exception as exc:  # surfaced to the consumer below
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
@@ -426,5 +447,7 @@ class MlxModelService(ModelService):
             # else: a tool marker opened but yielded no valid call (truncated at max_tokens/EOS, or
             # malformed) — drop the raw markup instead of leaking a bare "<tool_call>" to the user
             # (the symptom the user saw). Tool syntax must never surface as text (cf. N3/N67).
+            if usage:  # engine reported token counts (empty for VLM / non-counting engines)
+                yield {"type": "usage", **usage}
         finally:
             await fut

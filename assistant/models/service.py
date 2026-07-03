@@ -45,6 +45,14 @@ class ModelService(ABC):
         by default (returns None); only backends that can introspect a window override it."""
         return None
 
+    async def count_tokens(
+        self, messages: list[dict], model: str, tools: list[dict] | None = None
+    ) -> int | None:
+        """Input token count of the rendered prompt, for ``/v1/messages/count_tokens`` and the
+        usage Claude Code reads to track context fill. ``None`` when the backend can't count (the
+        caller reports 0). Only backends with a local tokenizer override this."""
+        return None
+
 
 class OmlxModelService(ModelService):
     def __init__(self, client: OmlxClient, process: OmlxProcess):
