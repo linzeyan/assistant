@@ -301,8 +301,11 @@ class MlxModelService(ModelService):
         entry = await self._entry_for(model)
         self._require_chat_model(entry)
         engine = await self._pool.acquire(model, entry.path, forced_kind=entry.kind)
+        counter = getattr(engine, "count_tokens", None)
+        if counter is None:  # an engine variant that can't count → unknown, never a 500
+            return None
         tpl = self._per_model.chat_template_kwargs(model) if self._per_model is not None else None
-        return await asyncio.to_thread(engine.count_tokens, messages, tools, tpl)
+        return await asyncio.to_thread(counter, messages, tools, tpl)
 
     def stream_chat(
         self, messages: list[dict], model: str, tools: list[dict] | None = None, **params

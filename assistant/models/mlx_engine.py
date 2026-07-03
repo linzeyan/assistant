@@ -397,6 +397,24 @@ class VlmChatEngine:
         self._model = model
         self._processor = processor
 
+    def _templater(self):
+        return getattr(self._processor, "apply_chat_template", None) or getattr(
+            self._processor, "tokenizer"
+        ).apply_chat_template
+
+    def count_tokens(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict | None = None,
+    ) -> int:
+        """Token length of the rendered prompt, via the processor's tokenizer. Mirrors MlxEngine so
+        /v1/messages/count_tokens works for VLM-loaded chat models too (mlx-vlm has no prompt cache,
+        so these don't get the KV reuse, but counting must still not crash)."""
+        prompt = _render_prompt(self._templater(), messages, tools, chat_template_kwargs)
+        tok = getattr(self._processor, "tokenizer", None) or self._processor
+        return len(tok.encode(prompt))
+
     def stream_text(
         self,
         messages: list[dict],
@@ -407,9 +425,7 @@ class VlmChatEngine:
     ) -> Iterator[str]:
         from mlx_vlm import stream_generate
 
-        templater = getattr(self._processor, "apply_chat_template", None) or getattr(
-            self._processor, "tokenizer"
-        ).apply_chat_template
+        templater = self._templater()
         prompt = _render_prompt(templater, messages, tools, chat_template_kwargs)
         for chunk in stream_generate(
             self._model, self._processor, prompt, max_tokens=max_tokens
