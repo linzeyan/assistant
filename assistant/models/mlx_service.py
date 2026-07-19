@@ -19,6 +19,7 @@ import asyncio
 import importlib.util
 import json
 import shutil
+import threading
 from dataclasses import replace
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -355,6 +356,13 @@ class MlxModelService(ModelService):
 
         queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
+        # Cooperative cancellation: the blocking engine generator runs on an executor
+        # thread that nothing can interrupt, so a client disconnect used to leave it
+        # decoding to max_tokens — burning the model's single engine slot for minutes
+        # while every later request silently queued behind the zombie (N81). The worker
+        # checks this flag each token; breaking closes the engine generator, whose
+        # GeneratorExit path already invalidates the KV cache like any early stop.
+        stop = threading.Event()
         # Filled by the engine thread as it generates; read after the stream ends to emit a usage
         # event (input/output token counts) so the Anthropic compat route reports real numbers and
         # Claude Code can track how full the context is. Empty for engines that don't count (VLM).
@@ -371,6 +379,8 @@ class MlxModelService(ModelService):
                 for text in eng.stream_text(
                     messages, tools=tools, usage_out=usage, **params
                 ):
+                    if stop.is_set():
+                        break
                     loop.call_soon_threadsafe(queue.put_nowait, ("token", text))
             except Exception as exc:  # surfaced to the consumer below
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
@@ -453,4 +463,5 @@ class MlxModelService(ModelService):
             if usage:  # engine reported token counts (empty for VLM / non-counting engines)
                 yield {"type": "usage", **usage}
         finally:
+            stop.set()  # even if the await below is itself cancelled, the thread exits
             await fut

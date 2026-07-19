@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from assistant.api.sse import with_keepalive
 from assistant.tools.approval import InteractiveApprover, resolve_pending
 
 router = APIRouter(tags=["chat"])
@@ -102,7 +103,12 @@ async def chat(req: ChatRequest, request: Request):
             except Exception:
                 log.exception("checkpoint after failed turn failed: session=%s", session.id)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    # SSE-comment keepalive: silence during queueing/prefill/suppressed tool-call
+    # buffering must not look like a dead connection to client read-timeouts (N81).
+    # Every consumer parses only ``data:`` lines, so the comment is invisible.
+    return StreamingResponse(
+        with_keepalive(event_stream()), media_type="text/event-stream"
+    )
 
 
 @router.post("/chat/approve")

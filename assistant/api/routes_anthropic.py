@@ -21,6 +21,7 @@ from assistant.api.compat import (
     resolve_model,
     sampling_params,
 )
+from assistant.api.sse import with_keepalive
 
 router = APIRouter(tags=["anthropic-compat"])
 
@@ -184,7 +185,13 @@ async def messages(request: Request):
         })
         yield _evt("message_stop", {"type": "message_stop"})
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    # Keepalive rides Anthropic's documented ``ping`` event so compat clients (Claude
+    # Code) treat silence during queueing/prefill/suppressed tool-call buffering as a
+    # live connection instead of a dead one (N81).
+    return StreamingResponse(
+        with_keepalive(event_stream(), payload=_evt("ping", {"type": "ping"})),
+        media_type="text/event-stream",
+    )
 
 
 @router.post("/v1/messages/count_tokens")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -485,3 +486,44 @@ async def test_pool_without_ceiling_keeps_count_only_behaviour(tmp_path, monkeyp
     await pool.acquire("a", a)
     await pool.acquire("b", b)
     assert pool.loaded_ids() == ["a", "b"]  # both held; no rejection despite large sizes
+
+
+async def test_client_disconnect_stops_engine_generation(tmp_path):
+    # The N81 zombie: the engine generator runs on an executor thread nothing can
+    # interrupt, so after a disconnect it used to decode to max_tokens — burning the
+    # model's single engine slot while later requests queued behind it. Closing the
+    # stream must reach the worker via the stop flag within ~one token.
+    import threading
+    import time
+
+    class SlowEngine:
+        def __init__(self):
+            self.consumed = 0
+            self.closed = threading.Event()
+
+        def stream_text(self, messages, **kwargs):
+            try:
+                for i in range(2000):
+                    self.consumed = i
+                    time.sleep(0.005)
+                    yield f"token {i} "
+            finally:
+                self.closed.set()
+
+    _make_model(tmp_path, "qwen")
+    eng = SlowEngine()
+    svc = MlxModelService(
+        models_dir=tmp_path,
+        include_hf_cache=False,
+        pool=MlxEnginePool(max_loaded=2, loader=lambda path, _k=None: eng),
+        available_override=True,
+    )
+    gen = svc.stream_chat([{"role": "user", "content": "hi"}], "qwen")
+    assert (await gen.__anext__())["type"] == "text"  # generation is live
+    await gen.aclose()  # client disconnects
+    for _ in range(400):  # worker must wind down promptly, not run all 2000 tokens
+        if eng.closed.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert eng.closed.is_set()
+    assert eng.consumed < 1900
