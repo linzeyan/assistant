@@ -541,3 +541,46 @@ def test_load_vlm_accepts_checkpoint_with_chat_template(monkeypatch):
     _install_mlx_vlm(monkeypatch, processor)
     engine = mlx_engine._load_vlm(Path("/m/ok"))
     assert engine._processor is processor
+
+
+def test_harmony_history_splits_thinking_and_content():
+    # N82: gpt-oss's template rejects assistant content containing <|channel|> tags —
+    # analysis must move to the 'thinking' field, final prose to 'content', and
+    # commentary (tool calls) drop out entirely (already structured in tool_calls).
+    raw = (
+        "<|channel|>analysis<|message|>Need to search first.<|end|>"
+        "<|start|>assistant<|channel|>commentary to=functions.web_search "
+        '<|constrain|>json<|message|>{"query": "x"}<|call|>'
+        "<|channel|>final<|message|>Python 3.13.14 is the latest."
+    )
+    msgs = [{"role": "assistant", "content": raw}]
+    out = _messages_for_template(msgs)
+    assert out[0]["content"] == "Python 3.13.14 is the latest."
+    assert out[0]["thinking"] == "Need to search first."
+    assert msgs[0]["content"] == raw  # copy-on-write: persisted history untouched
+
+
+def test_harmony_tool_call_only_turn_renders_empty_content():
+    # The common step-0 shape: analysis + a commentary call, no final yet. Content must
+    # come out empty (the template renders the structured tool_calls), thinking kept.
+    raw = (
+        "<|channel|>analysis<|message|>Think.<|end|>"
+        '<|start|>assistant<|channel|>commentary to=functions.f <|message|>{"a": 1}<|call|>'
+    )
+    out = _messages_for_template(
+        [{"role": "assistant", "content": raw,
+          "tool_calls": [{"function": {"name": "f", "arguments": '{"a": 1}'}}]}]
+    )
+    assert out[0]["content"] == ""
+    assert out[0]["thinking"] == "Think."
+    assert out[0]["tool_calls"][0]["function"]["arguments"] == {"a": 1}  # still normalized
+
+
+def test_non_harmony_messages_pass_through_unchanged():
+    msgs = [
+        {"role": "user", "content": "plain <|channel|> mention"},  # not assistant — untouched
+        {"role": "assistant", "content": "just prose"},
+    ]
+    out = _messages_for_template(msgs)
+    assert out[0] is msgs[0]
+    assert out[1] is msgs[1]
