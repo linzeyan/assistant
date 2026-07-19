@@ -71,7 +71,20 @@ async def _measure(args: argparse.Namespace, prompts: list[str]) -> int:
         for prompt in prompts:
             for _ in range(args.runs):
                 try:
-                    session_id = await _run_one(client, model, prompt, args.timeout)
+                    # Wall-clock cap per turn: SSE keepalives (N81) reset the read timeout
+                    # every 15s, so --timeout can no longer catch a runaway turn. Cutting
+                    # the connection here also STOPS the backend generation (N81's
+                    # disconnect handling), so a killed turn doesn't poison the next one.
+                    async with asyncio.timeout(args.turn_deadline or None):
+                        session_id = await _run_one(client, model, prompt, args.timeout)
+                except TimeoutError:
+                    print(
+                        f"  turn exceeded --turn-deadline {args.turn_deadline:.0f}s; "
+                        "counting as crash",
+                        file=sys.stderr,
+                    )
+                    buckets.append(reliability.CRASH)
+                    continue
                 except (httpx.HTTPError, json.JSONDecodeError) as exc:
                     # httpx timeout exceptions stringify to "" — fall back to the class
                     # name so a ReadTimeout doesn't print as an anonymous "()" (N80).
@@ -160,6 +173,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--prompts", default=None, help="file with one prompt per line (default: built-in set)")
     p.add_argument("--append-corpus", default=None, help="append raw captures to this JSONL")
     p.add_argument("--timeout", type=float, default=600.0, help="per-turn HTTP timeout seconds")
+    p.add_argument(
+        "--turn-deadline", type=float, default=1800.0,
+        help="wall-clock cap per turn in seconds, 0 = none (keepalives defeat --timeout, "
+        "so a runaway turn is cut here; the disconnect also stops backend generation)",
+    )
     args = p.parse_args(argv)
     return asyncio.run(_measure(args, _load_prompts(args.prompts)))
 
