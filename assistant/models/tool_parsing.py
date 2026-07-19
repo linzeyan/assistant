@@ -13,6 +13,10 @@ Supported formats (the common ones across MLX-community tool-capable models):
 * Qwen XML      — ``<tool_call><function=NAME><parameter=KEY>VALUE</parameter>…</function></tool_call>``
                   nested-XML carrying *no JSON*, as some Qwen3.x templates emit (notably
                   via mlx-vlm). Parsed only as a fallback when the block holds no JSON.
+* Gemma 4       — ``<|tool_call>call:NAME{key:<|"|>text<|"|>,n:3}<tool_call|>``: JSON-ish
+                  braces but strings are wrapped in ``<|"|>`` escape tokens, not quotes.
+                  Taught by the gemma-4 chat template; mlx-vlm ships a reference parser
+                  (``tool_parsers/gemma4.py``) this mirrors.
 * Bare JSON     — a lone ``{...}``/``[...]`` describing a call (Llama without the
                   tag). Ambiguous, so only accepted when its name is a known tool.
 """
@@ -44,12 +48,21 @@ _HARMONY_CALL_RE = re.compile(
     r"to=functions\.([\w.-]+).*?<\|message\|>\s*(\{.*?\})\s*<\|call\|>", re.DOTALL
 )
 
+# Gemma 4 native syntax, taught by its chat template:
+#   <|tool_call>call:NAME{key:<|"|>string<|"|>,n:3,nested:{...},arr:[...]}<tool_call|>
+# Strings ride between <|"|> escape tokens instead of JSON quotes; bare literals
+# (numbers/booleans/null) parse as JSON. Braces balance manually (no recursive regex)
+# so the truncated-generation case degrades to a best-effort parse like the others.
+_GEMMA_OPEN = "<|tool_call>"
+_GEMMA_ESCAPE = '<|"|>'
+_GEMMA_CALL_RE = re.compile(r"call:([\w.-]+)\s*\{")
+
 # Markers a streaming consumer watches for to stop emitting text and start
 # buffering a tool call. Bare JSON has no marker (handled by a leading-brace check).
 # ``<function=`` covers Qwen3-Coder's wrapper-less XML form: without it the raw XML
 # streams to the client as visible text even though the call parses at end-of-turn.
 # A false positive is safe — unparseable buffered text is flushed back at the end.
-TOOL_MARKERS = (_HERMES_OPEN, _PYTHON_TAG, _MISTRAL_TAG, "<function=")
+TOOL_MARKERS = (_HERMES_OPEN, _PYTHON_TAG, _MISTRAL_TAG, "<function=", _GEMMA_OPEN)
 
 
 @dataclass
@@ -153,6 +166,94 @@ def _parse_xml_functions(text: str) -> list[ParsedToolCall]:
     return _assign_ids(calls)
 
 
+def _gemma_matching_brace(text: str, start: int) -> int:
+    """Index of the ``}``/``]`` closing the bracket at ``start``, skipping over ``<|"|>``-escaped
+    string spans (they may contain braces). Returns ``len(text)`` when unbalanced — a truncated
+    generation — so the caller still parses what's there."""
+    depth, i = 0, start
+    while i < len(text):
+        if text.startswith(_GEMMA_ESCAPE, i):
+            end = text.find(_GEMMA_ESCAPE, i + len(_GEMMA_ESCAPE))
+            if end == -1:
+                return len(text)
+            i = end + len(_GEMMA_ESCAPE)
+            continue
+        ch = text[i]
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return len(text)
+
+
+def _gemma_split_top(text: str) -> list[str]:
+    """Split on top-level commas only — not inside nested braces or escaped strings."""
+    parts: list[str] = []
+    depth, cur, i = 0, 0, 0
+    while i < len(text):
+        if text.startswith(_GEMMA_ESCAPE, i):
+            end = text.find(_GEMMA_ESCAPE, i + len(_GEMMA_ESCAPE))
+            i = len(text) if end == -1 else end + len(_GEMMA_ESCAPE)
+            continue
+        ch = text[i]
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(text[cur:i])
+            cur = i + 1
+        i += 1
+    if text[cur:].strip():
+        parts.append(text[cur:])
+    return parts
+
+
+def _gemma_value(text: str):
+    text = text.strip()
+    if text.startswith(_GEMMA_ESCAPE):  # escaped string — everything up to the closing escape
+        inner = text[len(_GEMMA_ESCAPE) :]
+        end = inner.find(_GEMMA_ESCAPE)
+        return inner if end == -1 else inner[:end]
+    if text.startswith("{"):
+        return _gemma_object(text[1 : _gemma_matching_brace(text, 0)])
+    if text.startswith("["):
+        inner = text[1 : _gemma_matching_brace(text, 0)]
+        return [_gemma_value(item) for item in _gemma_split_top(inner) if item.strip()]
+    try:  # bare literal: number / boolean / null
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return text
+
+
+def _gemma_object(text: str) -> dict:
+    out: dict = {}
+    for entry in _gemma_split_top(text):
+        colon = entry.find(":")
+        if colon == -1:
+            continue
+        key = entry[:colon].strip()
+        if key:
+            out[key] = _gemma_value(entry[colon + 1 :])
+    return out
+
+
+def _parse_gemma_calls(text: str) -> list[ParsedToolCall]:
+    calls: list[ParsedToolCall] = []
+    for m in _GEMMA_CALL_RE.finditer(text):
+        brace = m.end() - 1
+        close = _gemma_matching_brace(text, brace)
+        calls.append(
+            ParsedToolCall(
+                id="", name=m.group(1), arguments=_gemma_object(text[brace + 1 : close])
+            )
+        )
+    return _assign_ids(calls)
+
+
 def parse_tool_calls(
     text: str, known_names: set[str] | None = None
 ) -> list[ParsedToolCall]:
@@ -175,6 +276,15 @@ def parse_tool_calls(
         # form (Qwen3.x, commonly via mlx-vlm), which carries no JSON at all. Without
         # this the block would leak back as raw text and the tool would never run.
         return _parse_xml_functions("\n".join(blocks))
+
+    # Gemma 4's ``<|tool_call>`` opener is distinctive (the pipe keeps it from ever matching
+    # the Hermes ``<tool_call>`` forms above). Brace balancing tolerates a missing closer, so
+    # a truncated call still parses; marker seen but nothing parsed falls through to the
+    # generic saw-marker discard in the stream consumer.
+    if _GEMMA_OPEN in text:
+        calls = _parse_gemma_calls(text.split(_GEMMA_OPEN, 1)[1])
+        if calls:
+            return calls
 
     if _HERMES_OPEN in text:  # opened but never closed (truncated generation)
         after = text.split(_HERMES_OPEN, 1)[1]

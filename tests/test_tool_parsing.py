@@ -186,3 +186,61 @@ def test_normalize_leaves_correct_calls_and_odd_shapes_untouched():
     assert normalize_arguments({"flag": True}, props) == {"flag": True}
     assert normalize_arguments({"flag": "maybe"}, props) == {"flag": "maybe"}  # not a clean bool
     assert normalize_arguments({"x": "1"}, {}) == {"x": "1"}  # no schema → untouched
+
+
+def test_gemma4_call_with_escaped_string_arg():
+    # Byte-for-byte the shape the gemma-4 chat template teaches (N80): strings ride
+    # between <|"|> escape tokens, not JSON quotes.
+    text = '<|tool_call>call:web_search{query:<|"|>latest python<|"|>}<tool_call|>'
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "web_search"
+    assert calls[0].arguments == {"query": "latest python"}
+
+
+def test_gemma4_bare_literals_nested_and_arrays():
+    text = (
+        "<|tool_call>call:edit{count:3,ratio:0.5,on:true,off:null,"
+        'nested:{a:<|"|>x,y<|"|>,b:[1,2]},tags:[<|"|>p<|"|>,<|"|>q<|"|>]}<tool_call|>'
+    )
+    calls = parse_tool_calls(text)
+    assert calls[0].arguments == {
+        "count": 3,
+        "ratio": 0.5,
+        "on": True,
+        "off": None,
+        "nested": {"a": "x,y", "b": [1, 2]},  # comma inside the escape must not split
+        "tags": ["p", "q"],
+    }
+
+
+def test_gemma4_truncated_call_still_parses():
+    # EOS-truncated generation: opener present, closer (and closing brace) missing.
+    text = '<|tool_call>call:web_search{query:<|"|>latest python<|"|>'
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].arguments == {"query": "latest python"}
+
+
+def test_gemma4_multiple_calls_get_distinct_ids():
+    text = (
+        '<|tool_call>call:a{x:<|"|>1<|"|>}<tool_call|>\n'
+        '<|tool_call>call:b{y:<|"|>2<|"|>}<tool_call|>'
+    )
+    calls = parse_tool_calls(text)
+    assert [c.name for c in calls] == ["a", "b"]
+    assert calls[0].id != calls[1].id
+
+
+def test_gemma4_opener_is_a_stream_marker():
+    # The streaming consumer must buffer from the gemma opener, or raw call syntax
+    # leaks to the client as visible text (same failure class as N67's <function=).
+    text = 'answer coming <|tool_call>call:a{x:<|"|>1<|"|>}'
+    assert earliest_marker(text) == len("answer coming ")
+
+
+def test_gemma4_does_not_shadow_hermes():
+    # The pipe in <|tool_call> must not be confused with Hermes' <tool_call> block.
+    text = '<tool_call>{"name": "t", "arguments": {"q": "v"}}</tool_call>'
+    calls = parse_tool_calls(text)
+    assert calls[0].name == "t" and calls[0].arguments == {"q": "v"}
