@@ -20,6 +20,11 @@ from .registry import registry
 # A desktop UA — DuckDuckGo's HTML endpoint serves a usable result page to it; an empty
 # UA tends to get the JS-only page with no parseable results.
 _UA = "Mozilla/5.0 (Macintosh; Apple Silicon) Assistant/0.1"
+# fetch_url needs the OPPOSITE of _UA: Wikimedia 403s browser-claiming UAs whose TLS
+# fingerprint isn't a real browser (robot policy https://w.wiki/4wJS), but accepts a
+# descriptive UA with a contact URL. DDG conversely rejects this one (202 challenge),
+# hence two constants.
+_FETCH_UA = "Assistant/0.1 (+https://gitlab.com/linzeyan/assistant) python-httpx"
 _TIMEOUT = 12.0
 _MAX_FETCH_CHARS = 6000  # cap fetched text so a long page can't blow the token budget
 
@@ -164,7 +169,7 @@ async def fetch_url(args: dict, ctx: ToolContext) -> ToolResult:
     cap = max(500, min(int(args.get("max_chars") or _MAX_FETCH_CHARS), 20_000))
     try:
         async with httpx.AsyncClient(
-            timeout=_TIMEOUT, follow_redirects=True, headers={"User-Agent": _UA}
+            timeout=_TIMEOUT, follow_redirects=True, headers={"User-Agent": _FETCH_UA}
         ) as client:
             resp = await client.get(url)
             resp.raise_for_status()
