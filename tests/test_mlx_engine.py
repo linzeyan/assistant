@@ -511,3 +511,33 @@ def test_stream_text_invalidates_cache_on_error(monkeypatch):
         list(eng.stream_text([{"role": "user", "content": "hi"}]))
     # A mid-stream failure must not leave a cache whose token record is out of sync.
     assert eng._cache is None and eng._cache_ids == []
+
+
+def _install_mlx_vlm(monkeypatch, processor):
+    """Stub mlx_vlm so _load_vlm can run in CI (mlx_vlm isn't importable there)."""
+    mlx_vlm = types.ModuleType("mlx_vlm")
+    mlx_vlm.load = lambda path: (object(), processor)
+    monkeypatch.setitem(sys.modules, "mlx_vlm", mlx_vlm)
+
+
+def test_load_vlm_refuses_checkpoint_without_chat_template(monkeypatch):
+    # A template-less checkpoint must fail AT LOAD: mlx-vlm's apply_chat_template silently
+    # renders bare "System:/User:" text (no turn tokens, no tools, no stop discipline) and
+    # the model rambles for tens of thousands of tokens per turn (N80, gemma-4-12B-bf16).
+    processor = types.SimpleNamespace(
+        chat_template=None, tokenizer=types.SimpleNamespace(chat_template=None)
+    )
+    _install_mlx_vlm(monkeypatch, processor)
+    with pytest.raises(RuntimeError, match="no chat template"):
+        mlx_engine._load_vlm(Path("/m/broken"))
+
+
+def test_load_vlm_accepts_checkpoint_with_chat_template(monkeypatch):
+    # Template on the processor OR its tokenizer is fine — both are where mlx-vlm puts it.
+    processor = types.SimpleNamespace(
+        chat_template=None,
+        tokenizer=types.SimpleNamespace(chat_template="{{ messages }}"),
+    )
+    _install_mlx_vlm(monkeypatch, processor)
+    engine = mlx_engine._load_vlm(Path("/m/ok"))
+    assert engine._processor is processor

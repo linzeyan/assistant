@@ -507,6 +507,22 @@ def _load_vlm(path: Path) -> VlmChatEngine:
             f"mlx-vlm's architecture ({head}). It's likely a custom or unsupported variant; "
             f"pick a standard chat model instead."
         ) from exc
+    # A checkpoint that ships no chat template can't be chatted with: mlx-vlm's
+    # apply_chat_template swallows the ``tools`` kwarg and silently degrades to bare
+    # "System:/User:/Assistant:" text — no turn tokens, no tool schemas, no stop
+    # discipline — so the model roleplays both sides for tens of thousands of tokens
+    # per turn (N80, gemma-4-12B-bf16). Refuse at load so the user gets one clear
+    # error instead of a silent 50-minute garbage turn.
+    template = getattr(processor, "chat_template", None) or getattr(
+        getattr(processor, "tokenizer", None), "chat_template", None
+    )
+    if not template:
+        raise RuntimeError(
+            "this model's checkpoint ships no chat template (likely an incomplete "
+            "conversion) — chat would silently render as untemplated text and the "
+            "model rambles instead of answering. Re-download it or pick another "
+            "checkpoint."
+        )
     return VlmChatEngine(model, processor)
 
 
