@@ -73,7 +73,10 @@ async def _measure(args: argparse.Namespace, prompts: list[str]) -> int:
                 try:
                     session_id = await _run_one(client, model, prompt, args.timeout)
                 except (httpx.HTTPError, json.JSONDecodeError) as exc:
-                    print(f"  request failed ({exc}); counting as crash", file=sys.stderr)
+                    # httpx timeout exceptions stringify to "" — fall back to the class
+                    # name so a ReadTimeout doesn't print as an anonymous "()" (N80).
+                    detail = str(exc) or type(exc).__name__
+                    print(f"  request failed ({detail}); counting as crash", file=sys.stderr)
                     buckets.append(reliability.CRASH)
                     continue
                 trace = await _latest_trace(client, session_id) if session_id else None
@@ -81,7 +84,12 @@ async def _measure(args: argparse.Namespace, prompts: list[str]) -> int:
                     print("  no trace (is trace_enabled set?); skipping", file=sys.stderr)
                     continue
                 buckets.append(reliability.classify_turn(trace, expects_tool=True))
-                captures.append(_capture_row(trace))
+                row = _capture_row(trace)
+                captures.append(row)
+                if args.append_corpus:
+                    # Append per turn, not at the end: on a slow model a run can take hours
+                    # and get Ctrl-C'd — captures already paid for must survive (N80).
+                    _append_corpus(Path(args.append_corpus), [row])
 
     if not buckets:
         print("no turns measured — is the backend running with tracing enabled?", file=sys.stderr)
@@ -89,7 +97,6 @@ async def _measure(args: argparse.Namespace, prompts: list[str]) -> int:
     summary = reliability.summarize(buckets)
     print(reliability.format_report(summary, model=args.model, runs=args.runs))
     if args.append_corpus:
-        _append_corpus(Path(args.append_corpus), captures)
         print(f"\nappended {len(captures)} captures to {args.append_corpus}", file=sys.stderr)
     return 0
 
