@@ -73,6 +73,43 @@ def test_classify_reads_terminal_outcomes_straight_through():
     assert R.classify_turn({"outcome": "error"}) == R.CRASH
 
 
+class _FakeModelsClient:
+    """Just enough httpx.AsyncClient to answer the harness's /models probe."""
+
+    def __init__(self, models):
+        self._models = models
+
+    async def get(self, _path):
+        import types as _t
+
+        return _t.SimpleNamespace(json=lambda: {"models": self._models})
+
+
+async def test_autodetect_never_falls_back_to_the_fusion_panel():
+    # After a crash leaves nothing loaded, the fallback used to take models[0] — which is the
+    # virtual `fusion` entry. Measuring it loads the entire panel at once and OOM-kills the
+    # backend, so a sweep that already died once would immediately kill it again.
+    from assistant.eval.measure import _autodetect_model
+
+    models = [
+        {"id": "fusion", "type": "llm", "source": "virtual", "loaded": False},
+        {"id": "some/image-model", "type": "image", "source": "local", "loaded": False},
+        {"id": "some/chat-model", "type": "llm", "source": "local", "loaded": False},
+    ]
+    assert await _autodetect_model(_FakeModelsClient(models)) == "some/chat-model"
+
+
+async def test_autodetect_returns_none_when_only_unusable_models_exist():
+    # Better to tell the user to pass --model than to silently measure an image model.
+    from assistant.eval.measure import _autodetect_model
+
+    models = [
+        {"id": "fusion", "type": "llm", "source": "virtual", "loaded": True},
+        {"id": "some/image-model", "type": "image", "source": "local", "loaded": True},
+    ]
+    assert await _autodetect_model(_FakeModelsClient(models)) is None
+
+
 def test_summarize_counts_and_rate():
     buckets = [R.SUCCESS, R.SUCCESS, R.NO_CALL, R.PARSE_MISS]
     summary = R.summarize(buckets)

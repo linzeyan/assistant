@@ -115,11 +115,17 @@ async def _measure(args: argparse.Namespace, prompts: list[str]) -> int:
 
 
 async def _autodetect_model(client: httpx.AsyncClient) -> str | None:
-    """Pick the currently-loaded chat model, else the first listed one — a convenience so the
-    harness can run without --model against whatever the backend already has hot."""
+    """Pick the currently-loaded chat model, else the first real one — a convenience so the
+    harness can run without --model against whatever the backend already has hot.
+
+    Virtual and non-chat entries are skipped, not merely deprioritised. ``fusion`` is a
+    multi-model panel that loads its whole roster (a 220GB+ schedule on this machine), so
+    falling through to it after a crash left nothing loaded turned the next sweep into a second
+    OOM kill; image/audio models can't answer a chat prompt at all."""
     models = (await client.get("/models")).json().get("models") or []
-    loaded = next((m["id"] for m in models if m.get("loaded")), None)
-    return loaded or (models[0]["id"] if models else None)
+    usable = [m for m in models if m.get("type") == "llm" and m.get("source") != "virtual"]
+    loaded = next((m["id"] for m in usable if m.get("loaded")), None)
+    return loaded or (usable[0]["id"] if usable else None)
 
 
 def _capture_row(trace: dict) -> dict:
