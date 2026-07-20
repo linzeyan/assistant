@@ -178,7 +178,7 @@ class FusionEngine:
             pre_loaded = set(service.loaded_model_ids())
             log.info(
                 "fusion schedule: %s -> judge %s",
-                " -> ".join(f"{m} (~{sizes.get(m, 0) / 1e9:.1f}GB)" for m in order), judge,
+                " -> ".join(f"{m} (~{sizes.get(m, 0) / 1e9:.1f}GB resident)" for m in order), judge,
             )
         else:
             order, sizes, pre_loaded = panel, {}, set()
@@ -198,7 +198,7 @@ class FusionEngine:
             need = sizes.get(model_id, 0)
             if headroom is not None and need > headroom:
                 return None  # doesn't fit alongside what's resident — load inline at its turn
-            log.info("fusion prefetch: %s (~%.1fGB, headroom %s)", model_id, need / 1e9,
+            log.info("fusion prefetch: %s (~%.1fGB resident, headroom %s)", model_id, need / 1e9,
                      "∞" if headroom is None else f"{headroom / 1e9:.1f}GB")
             return asyncio.create_task(_load_quiet(model_id))
 

@@ -273,13 +273,16 @@ class MlxModelService(ModelService):
         return self._pool.headroom_bytes()
 
     async def estimate_bytes(self, model_id: str) -> int:
-        """Pre-load footprint estimate (on-disk weights), 0 when unknown — the same signal the
-        pool's admission uses, so the scheduler and the admission gate agree on what "fits"."""
+        """What keeping ``model_id`` resident costs, 0 when unknown — weights plus the working
+        memory generation needs, i.e. the exact number the pool's admission gate checks, so the
+        scheduler and the gate agree on what "fits". Returning bare weights here (as this did
+        before the gate started budgeting working memory) let the fusion scheduler prefetch into
+        room that wasn't there."""
         try:
             entry = await self._entry_for(model_id)
         except ValueError:
             return 0
-        return _estimate_model_bytes(entry.path)
+        return self._pool.admission_bytes(model_id, _estimate_model_bytes(entry.path))
 
     async def context_window(self, model: str) -> int | None:
         # Read it from the model's own config.json (off-thread) — no load required, works

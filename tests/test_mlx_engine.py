@@ -204,6 +204,39 @@ async def test_measured_working_memory_replaces_the_cold_start_guess(tmp_path):
     assert pool.headroom_bytes() == 10**9 - 105
 
 
+async def test_admission_counts_memory_an_evicted_model_has_not_returned(tmp_path, monkeypatch):
+    # _drop can't wait for an in-flight generation to release its engine, so the books can read
+    # "free" while those weights are still physically resident. Admitting on the books alone
+    # stacked a new model on memory that never left — a fusion panel evicted a 70GB judge, loaded
+    # 79GB a second later, and the OS killed the backend.
+    for name, size in (("resident", 60), ("incoming", 50)):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "w.safetensors").write_bytes(b"\x00" * size)
+    pool = MlxEnginePool(
+        max_loaded=1, loader=lambda p, _k=None: FakeEngine(str(p)), mem_ceiling_bytes=100
+    )
+    await pool.acquire("resident", tmp_path / "resident")
+    # The eviction below will drop `resident` from the books, but MLX still reports its weights
+    # as held (its generation hasn't finished). On the books alone the incoming model costs
+    # 50*1.2 = 60 against an empty pool and would sail in; counting the 60 that never came back
+    # puts it at 120 over a 100 ceiling.
+    monkeypatch.setattr(mlx_engine, "_active_memory_bytes", lambda: 60)
+    with pytest.raises(mlx_engine.ModelAdmissionError) as err:
+        await pool.acquire("incoming", tmp_path / "incoming")
+    assert "just evicted" in str(err.value)  # names the real cause, not "pinned models"
+
+
+async def test_admission_bytes_is_the_policy_the_gate_enforces(tmp_path):
+    # The fusion scheduler sizes prefetches with this number; when it disagrees with the gate it
+    # under-books every load by the working-memory reserve and prefetches into room that is not
+    # there. Same input must give the same answer on both sides.
+    pool = MlxEnginePool(max_loaded=0, loader=lambda p, _k=None: FakeEngine("x"))
+    assert pool.admission_bytes("m", 100) == 120  # cold start: the 1.2 factor
+    pool.record_working_memory("m", 5)
+    assert pool.admission_bytes("m", 100) == 105  # measured working memory wins
+
+
 async def test_resident_acquire_is_not_blocked_by_an_inflight_load():
     # The overlap that makes fusion prefetch worthwhile: while model B loads in the background
     # (holding the pool lock for the whole load), an already-resident model A must still be

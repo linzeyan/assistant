@@ -731,6 +731,16 @@ class MlxEnginePool:
             )
             return engine
 
+    def admission_bytes(self, model_id: str, weights: int) -> int:
+        """What admitting ``model_id`` costs the budget: its weights plus the working memory it
+        needs to generate — measured if this pool has watched it, else the cold-start factor.
+        Public so the fusion scheduler can size prefetches with the exact policy the gate
+        enforces; when the two disagree the scheduler under-books every load by the reserve."""
+        measured = self._working_memory.get(model_id)
+        if measured is not None:
+            return weights + measured
+        return int(weights * _WORKING_MEMORY_FACTOR)
+
     def _admission_cost(self, model_id: str) -> int:
         """What a resident model really costs the memory budget: its weights plus the working
         memory generation needs. Uses the measured working memory once the model has streamed a
@@ -766,11 +776,7 @@ class MlxEnginePool:
         still overflows the ceiling (it's larger than the budget, or pinned models leave no room)."""
         evicted = False
         # The incoming model needs room to generate too, not just to sit there.
-        measured = self._working_memory.get(exclude)
-        incoming = (
-            incoming + measured if measured is not None
-            else int(incoming * _WORKING_MEMORY_FACTOR)
-        )
+        incoming = self.admission_bytes(exclude, incoming)
 
         def next_victim() -> str | None:
             return next((k for k in self._loaded if k != exclude and k not in self._pinned), None)
@@ -797,15 +803,32 @@ class MlxEnginePool:
         if evicted:
             _release_mlx_memory()
 
-        if self._ceiling is not None and self._loaded_bytes(exclude) + incoming > self._ceiling:
-            held = self._loaded_bytes(exclude)
-            raise ModelAdmissionError(
-                f"{exclude} needs ~{incoming / 1e9:.1f}GB but only "
-                f"{max(0.0, (self._ceiling - held) / 1e9):.1f}GB is free under the "
-                f"{self._ceiling / 1e9:.0f}GB memory limit"
-                + (f" ({held / 1e9:.1f}GB held by pinned models)" if held else "")
-                + ". Free memory (unload other models / close apps) or pick a smaller model."
+        if self._ceiling is None:
+            return
+        # The books say what SHOULD be resident; MLX says what IS. They diverge when an evicted
+        # model's memory hasn't come back yet — ``_drop`` can't wait for an in-flight generation
+        # to release its engine (a long turn would block every model switch), so the books can
+        # read "free" while those weights are still physically there. Budgeting on the books
+        # alone stacks the incoming model on memory that never left: a fusion panel evicted a
+        # 70GB judge and loaded 79GB one second later, and the OS killed the backend.
+        booked = self._loaded_bytes(exclude)
+        actual = _active_memory_bytes() or 0
+        held = max(booked, actual)
+        if held + incoming <= self._ceiling:
+            return
+        stale = actual > booked  # memory from an evicted model hasn't been reclaimed yet
+        raise ModelAdmissionError(
+            f"{exclude} needs ~{incoming / 1e9:.1f}GB but only "
+            f"{max(0.0, (self._ceiling - held) / 1e9):.1f}GB is free under the "
+            f"{self._ceiling / 1e9:.0f}GB memory limit"
+            + (
+                f" ({actual / 1e9:.1f}GB is still held by a model that was just evicted — a "
+                "generation still running on it hasn't released its weights; retry once it finishes)"
+                if stale
+                else f" ({held / 1e9:.1f}GB held by pinned models)" if held else ""
             )
+            + ". Free memory (unload other models / close apps) or pick a smaller model."
+        )
 
     async def load(self, model_id: str, path: Path, forced_kind: str | None = None) -> None:
         await self.acquire(model_id, path, forced_kind)
