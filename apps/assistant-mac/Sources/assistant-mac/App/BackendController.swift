@@ -172,6 +172,9 @@ final class BackendController: ObservableObject {
     /// effect. No-op for an externally-run backend (nothing to restart).
     func restart() async {
         guard canManageBackend else { return }
+        // Every restart was previously invisible in app.log — the monitor once killed a busy
+        // backend without leaving a single line (N93). Whoever triggers one, record it.
+        AppLog.log("backend restart: begin (pid \(backend.pid.map(String.init) ?? "none"))")
         starting = true
         defer { starting = false }
         // A deliberate restart wants the backend running afterwards, so clear any stale
@@ -223,16 +226,37 @@ final class BackendController: ObservableObject {
         guard monitorTask == nil, canManageBackend else { return }
         monitorTask = Task { [weak self] in
             var backoff: UInt64 = 0
+            var strikes = 0  // consecutive failed probes, reset by any success or restart
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)  // probe cadence
                 guard let self, !Task.isCancelled else { return }
                 if await self.probe() {
                     backoff = 0  // healthy — reset the backoff
+                    strikes = 0
                     continue
                 }
                 // Unreachable: only act if we own the process and aren't deliberately stopping
                 // it (a UI restart already holds `starting`, app quit holds `expectingExit`).
                 guard self.canManageBackend, !self.expectingExit, !self.starting else { continue }
+                // A failed probe against a LIVE child means busy, not dead: a heavy generation
+                // can starve the event loop (and the whole machine) past the probe timeout, and
+                // restarting on that one signal SIGTERMs a working backend mid-turn (N93). So a
+                // live child is restarted only after a sustained outage; a child that actually
+                // exited is restarted immediately — crash recovery must stay fast.
+                let alive = self.backend.isRunning
+                strikes += 1
+                guard Self.shouldRestart(processAlive: alive, consecutiveFailures: strikes) else {
+                    AppLog.log(
+                        "health: probe failed but backend alive (pid "
+                            + "\(self.backend.pid.map(String.init) ?? "?")) — "
+                            + "strike \(strikes)/\(Self.probeStrikeLimit)")
+                    continue
+                }
+                AppLog.log(
+                    alive
+                        ? "health: backend unresponsive for \(strikes) consecutive probes — restarting"
+                        : "health: backend process exited — restarting")
+                strikes = 0
                 await self.restart()
                 if await self.probe() {
                     backoff = 0
@@ -242,6 +266,21 @@ final class BackendController: ObservableObject {
                 }
             }
         }
+    }
+
+    /// How many consecutive failed probes a LIVE child gets before the monitor concludes it
+    /// is wedged rather than busy. A probe can take up to the URLSession request timeout
+    /// (60s), so three strikes tolerates a few minutes of event-loop starvation — a heavy
+    /// generation under memory pressure — while still recovering a truly deadlocked backend.
+    nonisolated static let probeStrikeLimit = 3
+
+    /// Monitor policy for one failed probe: restart now, or wait for more evidence. A child
+    /// that exited restarts on the first failure; a live one only after `probeStrikeLimit`
+    /// consecutive failures, because killing a live-but-busy backend mid-generation is the
+    /// friendly fire this policy exists to prevent (N93). Pure (nonisolated) so the policy
+    /// is unit-testable without the main actor.
+    nonisolated static func shouldRestart(processAlive: Bool, consecutiveFailures: Int) -> Bool {
+        !processAlive || consecutiveFailures >= probeStrikeLimit
     }
 
     /// Backoff policy: 1s → 2s → 4s … capped at 30s. Pure (nonisolated), so the schedule is

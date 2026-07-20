@@ -68,6 +68,11 @@ final class BackendProcess {
             .split(whereSeparator: \.isNewline)
             .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) } ?? []
         for pid in pids { kill(pid_t(pid), SIGTERM) }
+        if !pids.isEmpty {
+            AppLog.log(
+                "evicting stale server on port \(port): "
+                    + "SIGTERM pid(s) \(pids.map(String.init).joined(separator: " "))")
+        }
     }
 
     func spawn() {
@@ -106,6 +111,9 @@ final class BackendProcess {
 
     var isRunning: Bool { process?.isRunning ?? false }
 
+    /// The managed child's pid, if this instance spawned one (nil in connect-only mode).
+    var pid: Int32? { process?.processIdentifier }
+
     /// Graceful stop: SIGTERM first, then SIGKILL if the backend hasn't exited within `grace`.
     /// uvicorn handles SIGTERM promptly (usually well under 0.5s), so the bounded wait is short
     /// in practice; the escalation guarantees we never leave a wedged backend holding the port
@@ -114,12 +122,16 @@ final class BackendProcess {
         guard let proc = process else { return }
         process = nil
         guard proc.isRunning else { return }
+        // Both signals are logged: an unexplained backend death is otherwise indistinguishable
+        // from a crash when reconstructing a timeline from app.log (N93).
+        AppLog.log("backend stop: SIGTERM pid \(proc.processIdentifier)")
         proc.terminate()  // SIGTERM
         let deadline = Date().addingTimeInterval(grace)
         while proc.isRunning && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.05)
         }
         if proc.isRunning {
+            AppLog.log("backend stop: SIGKILL pid \(proc.processIdentifier) — SIGTERM grace expired")
             kill(proc.processIdentifier, SIGKILL)  // escalate — it ignored SIGTERM
         }
     }
