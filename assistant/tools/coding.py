@@ -104,6 +104,17 @@ async def glob_files(args: dict, ctx: ToolContext) -> ToolResult:
     return ToolResult(True, "\n".join(matches[:_MAX_MATCHES]))
 
 
+def _is_file(p: Path) -> bool:
+    """``is_file()`` raises rather than returning False on a path this process can't stat at all
+    (macOS system paths like /usr/sbin/weakpass_edit, other users' directories). Unguarded, a
+    single such entry anywhere under the root aborted the whole search — the caller got an error
+    instead of the matches from every readable file."""
+    try:
+        return p.is_file()
+    except OSError:
+        return False
+
+
 @registry.tool(
     name="grep",
     description="Search file contents for a regular expression.",
@@ -125,7 +136,7 @@ async def grep(args: dict, ctx: ToolContext) -> ToolResult:
     except re.error as exc:
         return ToolResult(False, f"bad regex: {exc}")
     root = _resolve(args["path"], ctx) if args.get("path") else ctx.cwd
-    files = [root] if root.is_file() else (p for p in root.rglob("*") if p.is_file())
+    files = [root] if _is_file(root) else (p for p in root.rglob("*") if _is_file(p))
     hits: list[str] = []
     for f in files:
         try:

@@ -47,6 +47,27 @@ async def test_glob_and_grep(ctx, tools):
     assert hits.ok and hits.content.count("VALUE =") == 2
 
 
+async def test_grep_survives_an_unstattable_entry(ctx, tools, monkeypatch):
+    # Real failure from an A1 sweep: is_file() RAISES (not returns False) on paths this process
+    # can't stat — macOS system paths, other users' dirs. One such entry under the root aborted
+    # the entire search, so the caller got an error instead of every other file's matches.
+    from pathlib import Path
+
+    (ctx.cwd / "ok.txt").write_text("match here\n")
+    (ctx.cwd / "vault").write_text("")
+    real_is_file = Path.is_file
+
+    def exploding_is_file(self):
+        if self.name == "vault":
+            raise PermissionError(13, "Permission denied")
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", exploding_is_file)
+    hits = await tools["grep"].handler({"pattern": "match"}, ctx)
+    assert hits.ok, hits.content  # the unreadable entry must not fail the search
+    assert "ok.txt" in hits.content  # and the readable file's match still comes back
+
+
 async def test_grep_skips_binary(ctx, tools):
     (ctx.cwd / "bin.dat").write_bytes(b"\x00\x01\x02match\xff")
     (ctx.cwd / "ok.txt").write_text("match here\n")
