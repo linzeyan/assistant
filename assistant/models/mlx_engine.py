@@ -64,6 +64,93 @@ def _release_mlx_memory() -> None:
         )
 
 
+# MLX keeps its compiled-graph cache in THREAD-LOCAL storage, and mlx-lm compiles on every
+# generation (its sampler is ``@mx.compile``d), so every model thread ends up holding one. When such
+# a thread exits, that cache's C++ destructor runs from a pthread TSD callback and frees Python
+# objects with no GIL held — racing whatever the event loop is doing. We caught it exactly that way:
+# a crash report shows the dying thread in ``CompilerCache::~CompilerCache -> tupledealloc`` while
+# the main thread sat in ``gc_collect`` (our own ``_release_mlx_memory``, called microseconds after
+# ``_drop`` shut the thread down), and the backend took a SIGSEGV. MLX exposes no Python API to clear
+# this cache, so we call the C++ symbol directly — ON that thread, before it is allowed to exit.
+_COMPILE_CACHE_CLEAR_SYMBOL = "_ZN3mlx4core6detail19compile_clear_cacheEv"
+_UNRESOLVED = object()
+# Resolved once, lazily. No lock: the GIL makes the store atomic and resolving twice is harmless.
+_compile_cache_clear: object = _UNRESOLVED
+# Threads we must never let exit because MLX is loaded but its clear symbol is gone (see
+# ``_retire_executor``). A leaked idle thread is cheap; the alternative is a crashed backend.
+_immortal_executors: list[ThreadPoolExecutor] = []
+
+
+def _compile_cache_cleaner():
+    """MLX's thread-local compile-cache clear, or None when it can't be called.
+
+    ``ctypes.PyDLL``, not ``CDLL``: the clear decrefs Python objects, so it must run with the GIL
+    held — which is the whole point of doing this on purpose instead of leaving it to thread exit.
+    """
+    global _compile_cache_clear
+    if _compile_cache_clear is not _UNRESOLVED:
+        return _compile_cache_clear
+    fn = None
+    try:
+        import ctypes
+
+        import mlx.core as mx
+
+        lib = Path(mx.__file__).parent / "lib" / "libmlx.dylib"
+        fn = getattr(ctypes.PyDLL(str(lib)), _COMPILE_CACHE_CLEAR_SYMBOL, None)
+    except Exception:  # MLX absent, or the library moved — both mean "can't clear"
+        fn = None
+    if fn is None and _mlx_importable():
+        log.warning(
+            "mlx compile-cache clear (%s) not found in libmlx — model threads will be kept alive "
+            "instead of exiting, to avoid the thread-local teardown crash",
+            _COMPILE_CACHE_CLEAR_SYMBOL,
+        )
+    _compile_cache_clear = fn
+    return fn
+
+
+def _clear_thread_compile_cache() -> None:
+    """Clear the calling thread's MLX compile cache. Submitted as a model thread's LAST job.
+
+    Module-level and zero-argument on purpose: a closure or bound method would keep whatever it
+    captured alive until the thread drains, which is exactly what
+    ``test_unload_frees_engine_not_pinned_by_stream_frame`` forbids.
+    """
+    clear = _compile_cache_cleaner()
+    if clear is not None:
+        clear()
+
+
+def _mlx_importable() -> bool:
+    try:
+        import mlx.core  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _retire_executor(executor: ThreadPoolExecutor) -> None:
+    """Retire a model's dedicated thread without triggering the MLX teardown crash.
+
+    The clear is submitted as ordinary work, so it queues *behind* any in-flight generation and is
+    provably the last thing that thread runs; ``shutdown(wait=False)`` then returns immediately, so
+    the event loop is never blocked. (omlx solves the same crash by blocking on the clear with a
+    timeout and calling ``os._exit`` if it expires — it can afford that behind a supervisor; here it
+    would freeze the backend for the length of a turn.)
+    """
+    if _compile_cache_cleaner() is not None:
+        executor.submit(_clear_thread_compile_cache)
+        executor.shutdown(wait=False)
+    elif not _mlx_importable():
+        # Nothing was ever compiled on it (fake-loader tests / non-MLX machines) — and taking the
+        # immortal path here would leak a thread per model in every test run.
+        executor.shutdown(wait=False)
+    else:
+        _immortal_executors.append(executor)
+
+
 def _total_ram_bytes() -> int | None:
     """Physical RAM in bytes, or None if it can't be determined. Used to default the pool's
     admission ceiling to the machine's actual memory so an oversized model fails loud with a clear
@@ -712,7 +799,8 @@ class MlxEnginePool:
                     executor, self._loader, path, forced_kind
                 )
             except BaseException:
-                executor.shutdown(wait=False)
+                # A failed load still ran mlx code on this thread, so it retires like any other.
+                _retire_executor(executor)
                 raise
             self._executors[model_id] = executor
             self._loaded[model_id] = engine
@@ -759,11 +847,14 @@ class MlxEnginePool:
     def _drop(self, model_id: str, reason: str) -> None:
         self._loaded.pop(model_id, None)
         self._footprint.pop(model_id, None)
-        # wait=False: an in-flight generation on this thread finishes on its own (the worker
-        # holds the engine reference); the executor just stops accepting new work.
+        # Non-blocking: an in-flight generation on this thread finishes on its own (the worker holds
+        # the engine reference); the executor just stops accepting new work, after one final
+        # compile-cache clear. That clear is not optional — see ``_retire_executor``; the caller
+        # (``_make_room``) runs ``_release_mlx_memory`` microseconds later, and a thread exiting into
+        # MLX's teardown during that GC is what segfaulted the backend.
         executor = self._executors.pop(model_id, None)
         if executor is not None:
-            executor.shutdown(wait=False)
+            _retire_executor(executor)
         log.info("evicted model from pool: %s (%s)", model_id, reason)
 
     def _make_room(self, exclude: str, incoming: int) -> None:
@@ -840,7 +931,7 @@ class MlxEnginePool:
                 self._footprint.pop(model_id, None)
                 executor = self._executors.pop(model_id, None)
                 if executor is not None:
-                    executor.shutdown(wait=False)
+                    _retire_executor(executor)  # never a bare shutdown — see _retire_executor
                 log.info("unloading model from pool: %s (pool now: %s)", model_id, self.loaded_ids())
                 _release_mlx_memory()
             else:

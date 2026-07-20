@@ -204,6 +204,62 @@ async def test_measured_working_memory_replaces_the_cold_start_guess(tmp_path):
     assert pool.headroom_bytes() == 10**9 - 105
 
 
+def test_retire_executor_clears_the_compile_cache_as_the_threads_last_job(monkeypatch):
+    # The crash this prevents: a model thread exiting runs MLX's thread-local CompilerCache
+    # destructor with no GIL, while the event loop is inside _release_mlx_memory's gc.collect().
+    # Clearing must happen ON that thread, AFTER any in-flight generation, and must not block the
+    # caller (the event loop holds the pool lock here).
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    order: list[str] = []
+    monkeypatch.setattr(mlx_engine, "_compile_cache_clear", lambda: order.append("clear"))
+    ex = ThreadPoolExecutor(max_workers=1)
+    started = threading.Event()
+
+    def generation():
+        started.wait(2)
+        order.append("generation")
+
+    ex.submit(generation)
+    started.set()
+    mlx_engine._retire_executor(ex)
+    ex.shutdown(wait=True)  # let the queue drain so we can see the final order
+    assert order == ["generation", "clear"]  # queued behind the turn, never before it
+
+
+def test_retire_executor_plain_shutdown_when_mlx_is_absent(monkeypatch):
+    # No MLX means nothing was ever compiled on the thread — and taking the immortal path here
+    # would leak a thread per model in every test run and on every non-MLX machine.
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(mlx_engine, "_compile_cache_clear", None)
+    monkeypatch.setattr(mlx_engine, "_mlx_importable", lambda: False)
+    before = len(mlx_engine._immortal_executors)
+    ex = ThreadPoolExecutor(max_workers=1)
+    mlx_engine._retire_executor(ex)
+    assert len(mlx_engine._immortal_executors) == before  # not leaked
+    assert ex._shutdown
+
+
+def test_retire_executor_keeps_the_thread_alive_when_it_cannot_clear(monkeypatch):
+    # MLX is loaded but the symbol is gone (a future version renamed it). Letting the thread exit
+    # would risk the segfault, so we deliberately leak it: an idle thread beats a dead backend.
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(mlx_engine, "_compile_cache_clear", None)
+    monkeypatch.setattr(mlx_engine, "_mlx_importable", lambda: True)
+    before = len(mlx_engine._immortal_executors)
+    ex = ThreadPoolExecutor(max_workers=1)
+    try:
+        mlx_engine._retire_executor(ex)
+        assert len(mlx_engine._immortal_executors) == before + 1
+        assert not ex._shutdown  # never shut down => the thread never exits
+    finally:
+        mlx_engine._immortal_executors.clear()
+        ex.shutdown(wait=False)
+
+
 async def test_admission_counts_memory_an_evicted_model_has_not_returned(tmp_path, monkeypatch):
     # _drop can't wait for an in-flight generation to release its engine, so the books can read
     # "free" while those weights are still physically resident. Admitting on the books alone
