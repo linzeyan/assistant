@@ -86,6 +86,28 @@ def _active_memory_bytes() -> int | None:
     return int(active()) if callable(active) else None
 
 
+def _peak_memory_bytes() -> int | None:
+    """MLX's high-water unified-memory mark since the last reset, or None when MLX isn't
+    importable. Paired with ``_reset_peak_memory`` to measure what one turn of generation really
+    costs on top of the resident weights (see ``MlxEngine.working_memory_bytes``)."""
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return None
+    peak = getattr(mx, "get_peak_memory", None)
+    return int(peak()) if callable(peak) else None
+
+
+def _reset_peak_memory() -> None:
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return
+    reset = getattr(mx, "reset_peak_memory", None)
+    if callable(reset):
+        reset()
+
+
 def _estimate_model_bytes(path: Path) -> int:
     """Estimate a model's resident footprint from its on-disk weight shards.
 
@@ -322,6 +344,10 @@ class MlxEngine:
         # model's generation is serialized.
         self._cache: object | None = None
         self._cache_ids: list[int] = []
+        # High-water working memory (KV cache + activations) this model needed for a turn, over and
+        # above its resident weights. The pool harvests it at admission time so a load is budgeted
+        # against what generation actually costs rather than a guess (N86).
+        self.working_memory_bytes = 0
 
     def _encode_for_generation(self, prompt: str) -> list[int]:
         # Mirror stream_generate's own tokenisation exactly so the ids we prefix-match against the
@@ -398,6 +424,10 @@ class MlxEngine:
         last = None
         t0 = time.monotonic()
         ttft: float | None = None
+        # Baseline for the working-memory measurement below: everything MLX holds before this turn
+        # allocates anything (i.e. the resident weights, this model's and any other's).
+        resident_before = _active_memory_bytes()
+        _reset_peak_memory()
         try:
             for response in stream_generate(
                 self._model,
@@ -428,6 +458,15 @@ class MlxEngine:
                 getattr(last, "generation_tps", 0.0) or 0.0,
             )
         finally:
+            # What this turn cost beyond the resident weights. Measured even on an early stop —
+            # a turn killed by a disconnect still peaked. Both readings are process-wide, so a
+            # second model generating concurrently can clip this one's peak; keeping the
+            # high-water mark across turns lets a later uncontended turn correct it upward.
+            peak = _peak_memory_bytes()
+            if peak is not None and resident_before is not None:
+                self.working_memory_bytes = max(
+                    self.working_memory_bytes, peak - resident_before
+                )
             if committed:
                 # The cache now holds the whole prompt plus everything generated; record that so the
                 # next turn of this conversation reuses it instead of re-prefilling from scratch.
@@ -658,6 +697,7 @@ class MlxEnginePool:
                 self._loaded.move_to_end(model_id)
                 return self._loaded[model_id]
             incoming = _estimate_model_bytes(path)
+            self._harvest_working_memory()
             self._make_room(exclude=model_id, incoming=incoming)
             # Load outside would race the lock; loading under the lock serialises
             # model switches, which is what we want (one heavy load at a time).
@@ -808,6 +848,13 @@ class MlxEnginePool:
         if self._ceiling is None:
             return None
         return max(0, self._ceiling - self._loaded_bytes())
+
+    def _harvest_working_memory(self) -> None:
+        """Pull each resident engine's measured generation peak into the budget. Done at admission
+        time — the one moment the number can change a decision — so engines never need a reference
+        back to the pool. Engines that don't measure (VLM) just report nothing and keep the guess."""
+        for model_id, engine in self._loaded.items():
+            self.record_working_memory(model_id, getattr(engine, "working_memory_bytes", 0) or 0)
 
     def record_working_memory(self, model_id: str, peak_bytes: int) -> None:
         """Book the working memory a model actually needed to generate (measured by the engine over

@@ -487,6 +487,67 @@ def test_stream_text_first_turn_prefills_full_and_reports_usage(monkeypatch):
     assert eng._cache is calls[0]["cache"]  # the fresh cache was committed
 
 
+def _fake_memory(monkeypatch, *, resident: int, peak: int):
+    """Stub the two MLX memory probes so a turn reports a known working-memory delta."""
+    monkeypatch.setattr(mlx_engine, "_active_memory_bytes", lambda: resident)
+    monkeypatch.setattr(mlx_engine, "_peak_memory_bytes", lambda: peak)
+    monkeypatch.setattr(mlx_engine, "_reset_peak_memory", lambda: None)
+
+
+def test_stream_text_measures_working_memory_above_resident_weights(monkeypatch):
+    # The pool budgets loads against this number, so it must be the turn's cost ON TOP of the
+    # weights already resident — not the absolute peak, which would double-count every model.
+    _install_mlx(monkeypatch, script=[(10, "a"), (11, "b")])
+    _fake_memory(monkeypatch, resident=100, peak=175)
+    eng = MlxEngine(model=object(), tokenizer=_StubTok([1, 2, 3]))
+    list(eng.stream_text([{"role": "user", "content": "hi"}]))
+    assert eng.working_memory_bytes == 75
+
+
+def test_working_memory_keeps_high_water_across_turns(monkeypatch):
+    # Admission has to survive the model's worst turn: a cheap turn after an expensive one must
+    # not lower the budget back down.
+    _install_mlx(monkeypatch, script=[(10, "a")])
+    tok = _StubTok([1, 2, 3])
+    eng = MlxEngine(model=object(), tokenizer=tok)
+    _fake_memory(monkeypatch, resident=100, peak=900)
+    list(eng.stream_text([{"role": "user", "content": "long"}]))
+    _fake_memory(monkeypatch, resident=100, peak=120)
+    list(eng.stream_text([{"role": "user", "content": "short"}]))
+    assert eng.working_memory_bytes == 800
+
+
+def test_working_memory_is_measured_even_when_the_turn_dies(monkeypatch):
+    # A turn killed mid-decode (client disconnect / error) still allocated its peak — dropping the
+    # measurement would let the pool keep under-booking exactly the turns that OOM.
+    _install_mlx(monkeypatch, script=[(10, "a"), (11, "b")], raise_after=1)
+    _fake_memory(monkeypatch, resident=100, peak=400)
+    eng = MlxEngine(model=object(), tokenizer=_StubTok([1, 2, 3]))
+    with pytest.raises(RuntimeError):
+        list(eng.stream_text([{"role": "user", "content": "hi"}]))
+    assert eng.working_memory_bytes == 300
+
+
+async def test_pool_harvests_measured_working_memory_at_admission(tmp_path):
+    # End-to-end of the feedback loop: what an engine measured while generating must reach the
+    # budget the next load is checked against, without the engine knowing about the pool.
+    d = tmp_path / "a"
+    d.mkdir()
+    (d / "w.safetensors").write_bytes(b"\x00" * 100)
+    engine = FakeEngine("a")
+    pool = MlxEnginePool(
+        max_loaded=0, loader=lambda p, _k=None: engine, mem_ceiling_bytes=10**9
+    )
+    await pool.acquire("a", d)
+    engine.working_memory_bytes = 500  # the model then generated a heavy turn
+
+    other = tmp_path / "b"
+    other.mkdir()
+    (other / "w.safetensors").write_bytes(b"\x00" * 10)
+    await pool.acquire("b", other)  # admission harvests before deciding
+    assert pool.headroom_bytes() == 10**9 - (100 + 500) - 12
+
+
 def test_stream_text_reuses_cache_on_shared_prefix(monkeypatch):
     tok = _StubTok([1, 2, 3])
     calls = _install_mlx(monkeypatch, script=[(10, "a"), (11, "b")])
