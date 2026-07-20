@@ -831,3 +831,37 @@ async def test_h3_no_audit_for_read_only_tool(tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger="assistant"):
         await _collect(loop.run(Session(id="s"), "go", "m"))
     assert not any("approval audit" in r.getMessage() for r in caplog.records)
+
+
+async def test_n94_batch_token_cap_bounds_model_view_not_events(tmp_path):
+    # WHY (N94): compaction trims only BETWEEN turns, so one iteration's tool batch could
+    # inject unbounded context — a batch of web fetches once grew a turn by ~20k tokens and
+    # ground the whole machine into swap. Past the budget results are cut, never dropped:
+    # every tool_call_id still gets a reply, and the SSE/trace view keeps the full content.
+    big = "x" * 20_000  # ~5k estimated tokens per result vs the 6k batch budget
+
+    async def dump(args, ctx):
+        return ToolResult(True, big)
+
+    reg = _reg_with(_tool("dump", dump))
+    llm = FakeLLM(
+        [
+            [{"type": "tool_calls", "tool_calls": [
+                {"id": f"c{i}", "name": "dump", "arguments": {"i": i}} for i in range(3)
+            ]}],
+            [{"type": "text", "content": "done"}],
+        ]
+    )
+    loop = AgentLoop(llm, reg, PolicyApprover(approval_required=False), ToolContext(cwd=tmp_path))
+    session = Session(id="cap")
+    events = await _collect(loop.run(session, "go", "m"))
+
+    tool_msgs = [m for m in session.messages if m.get("role") == "tool"]
+    assert [m["tool_call_id"] for m in tool_msgs] == ["c0", "c1", "c2"]
+    assert tool_msgs[0]["content"] == big  # first result fits the budget untouched
+    assert "6000-token budget" in tool_msgs[1]["content"]  # second cut mid-way, told why
+    assert len(tool_msgs[1]["content"]) < len(big)
+    assert tool_msgs[2]["content"].startswith("[not shown")  # budget exhausted
+    # The events (GUI/trace view) still carry the full output — only the model's view shrinks.
+    results = [e for e in events if e["type"] == "tool_result"]
+    assert [e["content"] for e in results] == [big, big, big]

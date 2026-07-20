@@ -52,3 +52,54 @@ def test_fetch_url_rejects_non_http_without_network():
     res = asyncio.run(fetch_url({"url": "ftp://nope"}, ToolContext(cwd=".")))
     assert res.ok is False
     assert "http" in res.content
+
+
+class _FakeResp:
+    def __init__(self, text: str, ctype: str = "text/plain"):
+        self.text = text
+        self.headers = {"content-type": ctype}
+
+    def raise_for_status(self) -> None:
+        pass
+
+
+class _FakeClient:
+    def __init__(self, resp: _FakeResp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url):
+        return self._resp
+
+
+def test_fetch_url_budgets_cjk_by_tokens(monkeypatch):
+    # WHY (N94): max_chars protects context TOKENS, and CJK tokenizes ~1 token/char — a plain
+    # [:cap] slice admitted ~4x the intended context, and one such page grew a turn by ~20k
+    # tokens. The same budget must admit ~4x fewer of the denser characters.
+    import assistant.tools.web_tools as wt
+
+    page = "頁" * 4000
+    monkeypatch.setattr(wt.httpx, "AsyncClient", lambda **kw: _FakeClient(_FakeResp(page)))
+    res = asyncio.run(fetch_url({"url": "https://example.com"}, ToolContext(cwd=".")))
+    assert res.ok
+    body = res.content.split("\n...[truncated")[0]
+    assert len(body) == 1500  # default 6000-char cap -> 1500-token budget -> 1500 CJK chars
+    assert "4000 chars total" in res.content
+
+
+def test_fetch_url_english_cap_unchanged(monkeypatch):
+    # WHY: the token-aware cut must not change English behavior — the default cap still
+    # returns exactly 6000 ASCII chars (identical to the old char slice).
+    import assistant.tools.web_tools as wt
+
+    page = "a" * 10_000
+    monkeypatch.setattr(wt.httpx, "AsyncClient", lambda **kw: _FakeClient(_FakeResp(page)))
+    res = asyncio.run(fetch_url({"url": "https://example.com"}, ToolContext(cwd=".")))
+    body = res.content.split("\n...[truncated")[0]
+    assert len(body) == 6000
+    assert "10000 chars total" in res.content

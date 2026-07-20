@@ -28,7 +28,7 @@ from .prompt import (
     wrap_workspace_context,
 )
 from .session import Session
-from .tokens import estimate_messages_tokens, estimate_tokens
+from .tokens import cut_at_tokens, estimate_messages_tokens, estimate_tokens
 from .trace import TraceStep, TraceStore, TurnTrace
 
 log = logging.getLogger("assistant")
@@ -38,6 +38,14 @@ log = logging.getLogger("assistant")
 # so the signal isn't call count — it's the same (name, args) repeating. Three ignored repeats is a
 # stuck loop, not work. A backstop constant, not a user knob: max_iters is the tunable budget.
 _THRASH_REPEAT_CAP = 3
+
+# Context fuse (N94): combined estimated-token cap on the tool results one iteration's batch may
+# inject into the conversation. Compaction (S6) only trims BETWEEN turns, so an in-turn bomb —
+# several fetch_url calls, or one dense CJK page — had no bound at all: one such batch grew a
+# turn by ~20k tokens on a 65.7GB model and ground the whole machine into swap. 6000 ≈ four
+# max-size fetch_url results: roomy for real multi-tool steps, small enough that no single step
+# can blow the context. A backstop, not a knob.
+_TOOL_RESULT_BATCH_TOKENS = 6000
 
 # Path-like substrings in a user turn: something containing a slash (a/b, /abs, ~/x, src/),
 # a bare filename.ext (config.toml, README.md), or a well-known extensionless name (Makefile,
@@ -287,6 +295,7 @@ class AgentLoop:
                     step.parsed_calls = [
                         {"name": tc["name"], "arguments": tc["arguments"]} for tc in tool_calls
                     ]
+                batch_tokens = 0  # N94: this iteration's injected tool-result total
                 for tc in tool_calls:
                     yield {
                         "type": "tool_call",
@@ -406,8 +415,25 @@ class AgentLoop:
                         and result.ok
                     ):
                         generated_images.add(result.content)
+                    # Context fuse (N94): cap what this batch feeds back to the model. Past the
+                    # budget, results are cut — never dropped, since the API requires a reply
+                    # per tool_call_id. The full content still reaches the trace and the
+                    # tool_result event below; only what the MODEL sees is bounded.
+                    content = result.content
+                    remaining = _TOOL_RESULT_BATCH_TOKENS - batch_tokens
+                    if remaining <= 0:
+                        content = (
+                            "[not shown: this step's combined tool results exceeded the "
+                            "context budget — narrow the request or fetch less at once]"
+                        )
+                    elif estimate_tokens(content) > remaining:
+                        content = cut_at_tokens(content, remaining) + (
+                            f"\n...[truncated: combined tool results this step hit the "
+                            f"{_TOOL_RESULT_BATCH_TOKENS}-token budget]"
+                        )
+                    batch_tokens += estimate_tokens(content)
                     session.messages.append(
-                        {"role": "tool", "tool_call_id": tc["id"], "content": result.content}
+                        {"role": "tool", "tool_call_id": tc["id"], "content": content}
                     )
                     if trace is not None:
                         step.tool_results.append(

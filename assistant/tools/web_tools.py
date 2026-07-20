@@ -14,6 +14,8 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 
+from assistant.agent.tokens import cut_at_tokens
+
 from .base import ToolContext, ToolResult
 from .registry import registry
 
@@ -183,6 +185,12 @@ async def fetch_url(args: dict, ctx: ToolContext) -> ToolResult:
         text = "\n".join(extractor.parts).strip()
     else:
         text = body.strip()
-    if len(text) > cap:
-        text = text[:cap] + f"\n...[truncated, {len(text)} chars total]"
-    return ToolResult(True, text or "(empty page)")
+    # The cap is expressed in characters, but the resource it protects is context TOKENS: a
+    # CJK page tokenizes at ~1 token/char, so a plain [:cap] slice admitted ~4x the intended
+    # context — one such page grew a turn by ~20k tokens and ground the whole machine into
+    # swap (N94). Spend the same budget token-weighted instead: identical for English,
+    # proportionally shorter for dense scripts.
+    kept = cut_at_tokens(text, cap // 4)
+    if len(kept) < len(text):
+        kept += f"\n...[truncated, {len(text)} chars total]"
+    return ToolResult(True, kept or "(empty page)")
