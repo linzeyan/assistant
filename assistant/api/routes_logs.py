@@ -27,6 +27,7 @@ _LOG_FILES = (
     "backend.log.2",
     "backend.log.3",
     "backend.out.log",
+    "backend.out.log.1",  # previous spawn's tee, rotated by the GUI on respawn (N95)
     "app.log",
 )
 

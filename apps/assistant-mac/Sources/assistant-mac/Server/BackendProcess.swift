@@ -83,8 +83,9 @@ final class BackendProcess {
         // A GUI-spawned backend inherits no usable console, so its stdout/stderr — uvicorn's
         // lifecycle lines and any traceback raised *before* Python logging is configured —
         // would be lost, defeating diagnosis. Tee them to a file beside the backend's own
-        // rotating log. Truncated per spawn so it holds just the current run (the backend's
-        // backend.log keeps the rotated history); best-effort — nil just inherits the app's.
+        // rotating log. Rotated per spawn (previous run kept as backend.out.log.1) so it holds
+        // just the current run without destroying the last exit's evidence (N95); best-effort —
+        // nil just inherits the app's.
         if let handle = Self.spawnOutHandle() {
             proc.standardOutput = handle
             proc.standardError = handle
@@ -99,13 +100,20 @@ final class BackendProcess {
         }
     }
 
-    /// A fresh, append-positioned handle to `logs/backend.out.log` for this spawn.
+    /// A fresh handle to `logs/backend.out.log` for this spawn, after rotating the previous
+    /// spawn's file to `backend.out.log.1`. Truncating in place destroyed the dying process's
+    /// last stderr — the only record of an exit that leaves no crash report — exactly when it
+    /// was needed (N95). One generation of history is enough; the backend's own backend.log
+    /// keeps the rotated rest.
     private static func spawnOutHandle() -> FileHandle? {
         let fm = FileManager.default
         let dir = Bootstrap.logsDir()
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent("backend.out.log")
-        guard fm.createFile(atPath: url.path, contents: nil) else { return nil }  // truncate
+        let previous = dir.appendingPathComponent("backend.out.log.1")
+        try? fm.removeItem(at: previous)
+        try? fm.moveItem(at: url, to: previous)
+        guard fm.createFile(atPath: url.path, contents: nil) else { return nil }
         return try? FileHandle(forWritingTo: url)
     }
 
