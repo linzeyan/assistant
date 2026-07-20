@@ -31,8 +31,10 @@ from .mlx_engine import MlxEnginePool, _estimate_model_bytes, _total_ram_bytes
 from .service import ModelService
 from .status import BackendState, BackendStatus
 from .tool_parsing import (
+    HARMONY_CHANNEL,
     TOOL_MARKERS,
     earliest_marker,
+    harmony_fields,
     normalize_arguments,
     parse_tool_calls,
 )
@@ -398,6 +400,7 @@ class MlxModelService(ModelService):
         first_char_seen = False
         json_mode = False
         saw_marker = False
+        harmony_mode = False
         # name → JSON-Schema properties, for the argument-normalization middleware below.
         schemas = {
             fn.get("name"): (fn.get("parameters") or {}).get("properties") or {}
@@ -418,7 +421,13 @@ class MlxModelService(ModelService):
                     if stripped:
                         first_char_seen = True
                         json_mode = stripped[0] in "{["
-                if json_mode or saw_marker or not first_char_seen:
+                        # Harmony (gpt-oss) opens every step with <|channel|> (an atomic
+                        # special token, so it can't straddle chunks). Its markup
+                        # interleaves reasoning, calls, and prose — buffer the whole
+                        # step and emit the sanitized split at the end (N84). Keepalive
+                        # (N81) keeps the silent buffering from looking like a stall.
+                        harmony_mode = stripped.startswith(HARMONY_CHANNEL)
+                if json_mode or saw_marker or harmony_mode or not first_char_seen:
                     continue  # buffer silently; classify at end
 
                 pos = earliest_marker(buffer, emitted)
@@ -435,6 +444,17 @@ class MlxModelService(ModelService):
                     emitted = safe
 
             calls = parse_tool_calls(buffer, known_names=known_names)
+            if harmony_mode:
+                # Raw channel markup must never surface (cf. N3/N67 for other formats).
+                # Reasoning rides the product's <think> display convention (the GUI
+                # collapses it, N1); the render side maps it back to the template's
+                # thinking field so the wire format stays faithful (N82/N84).
+                thinking, final = harmony_fields(buffer)
+                display = f"<think>{thinking}</think>" if thinking else ""
+                if final:
+                    display = f"{display}\n\n{final}" if display else final
+                if display:
+                    yield {"type": "text", "content": display}
             if calls:
                 # Normalize each call's arguments against its tool schema (the shared middleware):
                 # local models over-quote scalars (e.g. Qwen3-Coder's `"replace_all": "False"`),
@@ -452,7 +472,7 @@ class MlxModelService(ModelService):
                         for c in calls
                     ],
                 }
-            elif not saw_marker:
+            elif not saw_marker and not harmony_mode:
                 # No call parsed AND no marker was seen: this is genuine prose — flush it.
                 remainder = buffer[emitted:]
                 if remainder:

@@ -20,11 +20,14 @@ import gc
 import json
 import logging
 import os
+import re
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+from .tool_parsing import HARMONY_CHANNEL, harmony_fields
 
 log = logging.getLogger("assistant")
 
@@ -104,42 +107,18 @@ class ModelAdmissionError(RuntimeError):
     instead of letting MLX OOM-crash the whole backend."""
 
 
-# Harmony (gpt-oss) raw output interleaves channel segments:
-#   <|channel|>analysis<|message|>…<|end|><|start|>assistant<|channel|>commentary
-#   to=functions.NAME <|constrain|>json<|message|>{…}<|call|><|channel|>final<|message|>…
-# The agent loop stores that raw text as assistant history, but gpt-oss's chat template
-# rejects content containing <|channel|> tags — it demands analysis in a ``thinking``
-# field and final prose in ``content`` (N82). Commentary segments are dropped: their
-# calls are already carried structurally in ``tool_calls``.
-_HARMONY_CHANNEL = "<|channel|>"
-_HARMONY_SEG_ENDS = ("<|end|>", "<|call|>", "<|return|>", "<|start|>")
+# The N84 stream sanitizer emits harmony reasoning in the product's ``<think>`` display
+# convention (N1), so NEW history arrives think-wrapped; OLD sessions still carry raw
+# <|channel|> markup. Both must map back to the template's thinking/content fields —
+# gpt-oss's template rejects <|channel|> in content (N82) and would replay <think> text
+# as final-channel prose.
+_THINK_RE = re.compile(r"^\s*<think>(.*?)</think>\s*(.*)$", re.DOTALL)
 
 
-def _harmony_fields(text: str) -> tuple[str, str]:
-    """Split raw harmony output into ``(thinking, content)`` per its channel headers."""
-    thinking: list[str] = []
-    finals: list[str] = []
-    for chunk in text.split(_HARMONY_CHANNEL)[1:]:
-        header, sep, body = chunk.partition("<|message|>")
-        if not sep:
-            continue
-        cut = min(
-            (i for t in _HARMONY_SEG_ENDS if (i := body.find(t)) != -1),
-            default=len(body),
-        )
-        body = body[:cut].strip()
-        channel = header.split()[0] if header.split() else ""
-        if channel == "analysis" and body:
-            thinking.append(body)
-        elif channel == "final" and body:
-            finals.append(body)
-    return "\n\n".join(thinking), "\n\n".join(finals)
-
-
-def _messages_for_template(messages: list[dict]) -> list[dict]:
+def _messages_for_template(messages: list[dict], harmony: bool = False) -> list[dict]:
     """Return messages reshaped for chat-template rendering only: assistant tool_calls'
-    ``arguments`` parsed from JSON string to a dict, and raw harmony channel text split
-    into ``thinking``/``content`` fields.
+    ``arguments`` parsed from JSON string to a dict, and (for harmony models) reasoning
+    text split back into ``thinking``/``content`` fields.
 
     Sessions persist tool_calls in OpenAI wire format — ``arguments`` is a JSON *string* — but
     HF chat templates expect a parsed mapping: Qwen3.x iterates it with jinja ``| items``,
@@ -153,12 +132,16 @@ def _messages_for_template(messages: list[dict]) -> list[dict]:
             isinstance(m, dict)
             and m.get("role") == "assistant"
             and isinstance(m.get("content"), str)
-            and _HARMONY_CHANNEL in m["content"]
         ):
-            thinking, content = _harmony_fields(m["content"])
-            m = {**m, "content": content}
-            if thinking:
-                m["thinking"] = thinking
+            if HARMONY_CHANNEL in m["content"]:  # pre-N84 history: raw channel markup
+                thinking, content = harmony_fields(m["content"])
+                m = {**m, "content": content}
+                if thinking:
+                    m["thinking"] = thinking
+            elif harmony and (tm := _THINK_RE.match(m["content"])):
+                m = {**m, "content": tm.group(2).strip()}
+                if tm.group(1).strip():
+                    m["thinking"] = tm.group(1).strip()
         tcs = m.get("tool_calls") if isinstance(m, dict) else None
         if not tcs:
             out.append(m)
@@ -185,6 +168,7 @@ def _render_prompt(
     messages: list[dict],
     tools: list[dict] | None,
     template_kwargs: dict | None = None,
+    harmony: bool = False,
 ) -> str:
     """Render the chat prompt, normalising tool_calls first and falling back ONLY when the
     tokenizer genuinely rejects the ``tools`` kwarg.
@@ -197,7 +181,7 @@ def _render_prompt(
     ``enable_thinking=False``, which swaps the generation prompt's open ``<think>`` for an empty
     block so the model answers directly). Templates that don't know a variable ignore it.
     """
-    messages = _messages_for_template(messages)
+    messages = _messages_for_template(messages, harmony=harmony)
     extra = template_kwargs or {}
     try:
         return _apply_template(templater, messages, tools, extra)
@@ -315,9 +299,13 @@ def _common_prefix_len(a: list[int], b: list[int]) -> int:
 class MlxEngine:
     """A loaded mlx-lm model + tokenizer that streams text for one chat turn."""
 
-    def __init__(self, model: object, tokenizer: object):
+    def __init__(self, model: object, tokenizer: object, harmony: bool = False):
         self._model = model
         self._tokenizer = tokenizer
+        # Harmony (gpt-oss) checkpoints need their reasoning text mapped back into the
+        # template's thinking/content fields at render time (N82/N84). Decided once at
+        # load (vocab carries <|call|>), so render never guesses per turn.
+        self._harmony = harmony
         # Single-slot prompt cache reused across turns (see _prefill_plan). ``_cache_ids`` is the
         # token sequence the KV in ``_cache`` currently represents; both are only valid together.
         # Safe without a lock: the pool pins each model to a single-thread executor, so all of a
@@ -362,7 +350,8 @@ class MlxEngine:
         """Token length of the rendered prompt — powers /v1/messages/count_tokens and the usage
         Claude Code reads to track how full the context is."""
         prompt = _render_prompt(
-            self._tokenizer.apply_chat_template, messages, tools, chat_template_kwargs
+            self._tokenizer.apply_chat_template, messages, tools, chat_template_kwargs,
+            harmony=self._harmony,
         )
         return len(self._encode_for_generation(prompt))
 
@@ -385,7 +374,8 @@ class MlxEngine:
         # tool-calling format. _render_prompt normalises tool_calls and handles the
         # tools-kwarg fallback without masking real template errors.
         prompt = _render_prompt(
-            self._tokenizer.apply_chat_template, messages, tools, chat_template_kwargs
+            self._tokenizer.apply_chat_template, messages, tools, chat_template_kwargs,
+            harmony=self._harmony,
         )
         full_ids = self._encode_for_generation(prompt)
         if usage_out is not None:
@@ -527,13 +517,15 @@ def _load_llm(path: Path) -> MlxEngine:
     # and the model hallucinated results + more calls until the loop's thrash guard
     # killed the turn (N83). Register it whenever the vocab carries the exact token;
     # the round-trip check keeps an unk-mapping tokenizer from adding unk as EOS.
+    harmony = False
     try:
         call_id = tokenizer.convert_tokens_to_ids("<|call|>")
         if call_id is not None and tokenizer.convert_ids_to_tokens(call_id) == "<|call|>":
             tokenizer.add_eos_token("<|call|>")
+            harmony = True
     except Exception:  # vocab probing must never break a load
         pass
-    return MlxEngine(model, tokenizer)
+    return MlxEngine(model, tokenizer, harmony=harmony)
 
 
 def _load_vlm(path: Path) -> VlmChatEngine:

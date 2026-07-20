@@ -50,6 +50,35 @@ _HARMONY_CALL_RE = re.compile(
     r"to=functions\.([\w.-]+).*?<\|message\|>\s*(\{.*?\})\s*(?:<\|call\|>|$)", re.DOTALL
 )
 
+# Harmony's raw output interleaves channel segments; besides call parsing (below),
+# consumers need the TEXT split too: analysis segments are reasoning, final segments
+# are the answer, commentary carries tool calls (represented structurally elsewhere).
+# Shared by the stream sanitizer (display) and the prompt renderer (history fidelity).
+HARMONY_CHANNEL = "<|channel|>"
+_HARMONY_SEG_ENDS = ("<|end|>", "<|call|>", "<|return|>", "<|start|>")
+
+
+def harmony_fields(text: str) -> tuple[str, str]:
+    """Split raw harmony output into ``(thinking, content)`` per its channel headers."""
+    thinking: list[str] = []
+    finals: list[str] = []
+    for chunk in text.split(HARMONY_CHANNEL)[1:]:
+        header, sep, body = chunk.partition("<|message|>")
+        if not sep:
+            continue
+        cut = min(
+            (i for t in _HARMONY_SEG_ENDS if (i := body.find(t)) != -1),
+            default=len(body),
+        )
+        body = body[:cut].strip()
+        channel = header.split()[0] if header.split() else ""
+        if channel == "analysis" and body:
+            thinking.append(body)
+        elif channel == "final" and body:
+            finals.append(body)
+    return "\n\n".join(thinking), "\n\n".join(finals)
+
+
 # Gemma 4 native syntax, taught by its chat template:
 #   <|tool_call>call:NAME{key:<|"|>string<|"|>,n:3,nested:{...},arr:[...]}<tool_call|>
 # Strings ride between <|"|> escape tokens instead of JSON quotes; bare literals

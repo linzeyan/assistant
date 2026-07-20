@@ -636,3 +636,19 @@ def test_load_llm_skips_stop_token_on_unk_mapping(monkeypatch):
     tok = _UnkTok({})
     _load_llm_with_tokenizer(monkeypatch, tok)
     assert tok.added == []
+
+
+def test_think_wrapped_history_maps_to_thinking_field_for_harmony():
+    # N84 stores sanitized <think> text as history; harmony renders must map it back to
+    # the template's thinking/content fields or analysis replays as final-channel prose.
+    msgs = [{"role": "assistant", "content": "<think>Reasoned.</think>\n\nThe answer."}]
+    out = _messages_for_template(msgs, harmony=True)
+    assert out[0]["content"] == "The answer."
+    assert out[0]["thinking"] == "Reasoned."
+
+
+def test_think_wrapped_history_untouched_for_non_harmony():
+    # Qwen-style models keep their own <think> convention — their templates handle it.
+    msgs = [{"role": "assistant", "content": "<think>t</think> x"}]
+    out = _messages_for_template(msgs)
+    assert out[0] is msgs[0]

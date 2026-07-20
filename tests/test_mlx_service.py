@@ -527,3 +527,44 @@ async def test_client_disconnect_stops_engine_generation(tmp_path):
         await asyncio.sleep(0.01)
     assert eng.closed.is_set()
     assert eng.consumed < 1900
+
+
+HARMONY_STEP = (
+    "<|channel|>analysis<|message|>Need to search first.<|end|>"
+    "<|start|>assistant<|channel|>commentary to=functions.web_search "
+    '<|constrain|>json<|message|>{"query": "x"}'
+)
+
+
+async def test_harmony_stream_sanitizes_channel_markup(tmp_path):
+    # N84: raw <|channel|> markup must never reach the client. Reasoning is re-shaped
+    # into the product's <think> convention (the GUI collapses it, N1) and the call
+    # arrives structurally — same contract every other tool format already honors.
+    _make_model(tmp_path, "qwen")
+    svc = _service(tmp_path, tokens=(HARMONY_STEP[:40], HARMONY_STEP[40:]))
+    events = [
+        e async for e in svc.stream_chat(
+            [{"role": "user", "content": "hi"}], "qwen",
+            tools=[{"function": {"name": "web_search", "parameters": {}}}],
+        )
+    ]
+    texts = [e["content"] for e in events if e["type"] == "text"]
+    assert texts == ["<think>Need to search first.</think>"]
+    calls = [e for e in events if e["type"] == "tool_calls"]
+    assert len(calls) == 1
+    assert calls[0]["tool_calls"][0]["name"] == "web_search"
+
+
+async def test_harmony_final_answer_emits_think_and_prose(tmp_path):
+    _make_model(tmp_path, "qwen")
+    final_step = (
+        "<|channel|>analysis<|message|>Sum up.<|end|>"
+        "<|start|>assistant<|channel|>final<|message|>Python 3.13.14 is the latest."
+    )
+    svc = _service(tmp_path, tokens=(final_step,))
+    events = [
+        e async for e in svc.stream_chat([{"role": "user", "content": "hi"}], "qwen")
+    ]
+    texts = [e["content"] for e in events if e["type"] == "text"]
+    assert texts == ["<think>Sum up.</think>\n\nPython 3.13.14 is the latest."]
+    assert not [e for e in events if e["type"] == "tool_calls"]
