@@ -444,6 +444,40 @@ class MlxEngine:
         add_special = bos is None or not prompt.startswith(bos)
         return list(self._tokenizer.encode(prompt, add_special_tokens=add_special))
 
+    def _new_prompt_cache(self) -> object:
+        """Build a prompt cache every layer of which can be trimmed, so prefix reuse actually works.
+
+        mlx-lm gives each sliding-window layer a ``RotatingKVCache``, whose ``is_trimmable()`` is
+        False once its ring has wrapped (``offset >= max_size``, i.e. after ~128 tokens). Since
+        ``trim_prompt_cache`` is all-or-nothing, ONE such layer makes the whole cache untrimmable
+        and every turn re-prefills the entire prompt: measured on gpt-oss-120b as 45 consecutive
+        generations at ``cached=0``, prompts growing to 13.7k and prefill to 12s per step. This is
+        not recoverable by trimming smarter — a wrapped ring has already overwritten the keys a
+        rolled-back window would need, which is exactly why mlx-lm reports it untrimmable.
+
+        A plain ``KVCache`` is equivalent for these layers because the model masks the window
+        itself: sliding layers always call ``create_attention_mask(..., window_size=W)``, and
+        ``cache.create_attention_mask`` tests ``window_size is not None`` *before* the ``N == 1``
+        shortcut, so both prefill and decode get a banded mask. Verified against mlx-lm 0.31.3 at
+        offset 500: rotating and full caches each attend exactly 128 keys, for N=1 and N=3. RoPE is
+        unaffected — it reads ``cache.offset``, which both classes track absolutely.
+
+        The cost is memory: sliding layers keep the whole sequence instead of ``max_size`` tokens.
+        For gpt-oss (half its layers sliding) that is 2x the KV total — +500MB at a 13.7k context —
+        against re-prefilling 13.7k tokens through 36 layers on *every* step, which is what the
+        machine was actually dying of.
+        """
+        from mlx_lm.models import cache as cache_mod
+
+        cache = cache_mod.make_prompt_cache(self._model)
+        # getattr, not import: the fake mlx_lm in tests defines only the two functions, and a
+        # future mlx-lm that drops either name should degrade to today's behaviour, not crash.
+        rotating = getattr(cache_mod, "RotatingKVCache", None)
+        kv_cls = getattr(cache_mod, "KVCache", None)
+        if rotating is None or kv_cls is None:
+            return cache
+        return [kv_cls() if isinstance(entry, rotating) else entry for entry in cache]
+
     def _prefill_plan(self, full_ids: list[int]) -> tuple[list[int], object]:
         """Reuse the KV of the longest common prefix with the previous turn and prefill only the new
         tail. Claude Code re-sends the whole conversation every turn, so without this each turn
@@ -451,18 +485,19 @@ class MlxEngine:
         the first output token — the dominant per-turn cost. Falls back to a fresh full prefill when
         nothing is shared or the cache can't be trimmed back to the shared prefix.
         """
-        from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+        from mlx_lm.models.cache import trim_prompt_cache
 
         common = _common_prefix_len(self._cache_ids, full_ids)
         common = min(common, len(full_ids) - 1)  # always leave ≥1 token to feed the generator
         if self._cache is not None and common > 0:
             drop = len(self._cache_ids) - common
-            # drop==0: cache already exactly the shared prefix. Otherwise trim it back; if the cache
-            # can't drop them all (rotating/quantised KV), trim_prompt_cache mangles it in place, so
-            # discard and rebuild rather than reuse a mismatched cache.
+            # drop==0: cache already exactly the shared prefix. Otherwise trim it back — a cache
+            # that can't drop them all leaves the KV out of step with _cache_ids, so rebuild rather
+            # than reuse a mismatched one. (trim_prompt_cache itself is all-or-nothing: it checks
+            # every layer first and returns 0 without touching anything.)
             if drop == 0 or trim_prompt_cache(self._cache, drop) == drop:
                 return full_ids[common:], self._cache
-        return full_ids, make_prompt_cache(self._model)
+        return full_ids, self._new_prompt_cache()
 
     def count_tokens(
         self,

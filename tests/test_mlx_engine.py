@@ -564,6 +564,40 @@ def _install_mlx(monkeypatch, *, script, trim_result=None, raise_after=None):
     return calls
 
 
+class _StubRotating:
+    pass
+
+
+class _StubKV:
+    pass
+
+
+def test_new_prompt_cache_swaps_rotating_entries_for_trimmable_ones(monkeypatch):
+    # A RotatingKVCache reports itself untrimmable once its ring wraps, and trim_prompt_cache is
+    # all-or-nothing — so one sliding layer forces a full re-prefill on every single turn (measured
+    # on gpt-oss: 45 generations, cached=0 on all of them). Swapping those entries for plain
+    # KVCache is what makes prefix reuse possible at all.
+    _install_mlx(monkeypatch, script=[(1, "a")])
+    cache_mod = sys.modules["mlx_lm.models.cache"]
+    cache_mod.RotatingKVCache = _StubRotating
+    cache_mod.KVCache = _StubKV
+    layers = [_StubKV(), _StubRotating(), _StubKV(), _StubRotating()]  # gpt-oss's alternation
+    cache_mod.make_prompt_cache = lambda model, max_kv_size=None: list(layers)
+
+    eng = MlxEngine(model=object(), tokenizer=_StubTok([1, 2, 3]))
+    out = eng._new_prompt_cache()
+    assert [type(c).__name__ for c in out] == ["_StubKV"] * 4  # no rotating entry survives
+    assert out[0] is layers[0] and out[2] is layers[2]  # non-rotating entries pass through as-is
+
+
+def test_new_prompt_cache_degrades_when_mlx_lm_lacks_the_classes(monkeypatch):
+    # The names are read with getattr, not imported, so a stubbed or future mlx-lm that doesn't
+    # expose them keeps today's behaviour instead of raising on every turn.
+    _install_mlx(monkeypatch, script=[(1, "a")])
+    eng = MlxEngine(model=object(), tokenizer=_StubTok([1, 2, 3]))
+    assert isinstance(eng._new_prompt_cache(), _FakeCache)
+
+
 def test_stream_text_first_turn_prefills_full_and_reports_usage(monkeypatch):
     calls = _install_mlx(monkeypatch, script=[(10, "a"), (11, "b")])
     eng = MlxEngine(model=object(), tokenizer=_StubTok([1, 2, 3]))
