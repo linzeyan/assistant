@@ -166,7 +166,42 @@ async def test_headroom_is_zero_when_count_cap_full(tmp_path):
         max_loaded=0, loader=lambda p, _k=None: FakeEngine("x"), mem_ceiling_bytes=10**9
     )
     await uncapped.acquire("a", d)
-    assert uncapped.headroom_bytes() == 10**9 - 100  # ceiling minus the resident estimate
+    # Ceiling minus what the resident model actually costs — weights plus the working memory
+    # generation will need, not the bare weight estimate (which is what OOM-killed the backend).
+    assert uncapped.headroom_bytes() == 10**9 - 120
+
+
+async def test_admission_budgets_working_memory_not_just_weights(tmp_path):
+    # The real incident, scaled down: three models whose WEIGHTS sum to 114 under a 124 ceiling
+    # were all admitted, then the first decode OOM-killed the backend. Booking weights alone is
+    # the bug — generation needs room too, so the third load must evict rather than "fit".
+    pool = MlxEnginePool(
+        max_loaded=0, loader=lambda p, _k=None: FakeEngine(str(p)), mem_ceiling_bytes=124
+    )
+    for name, weights in (("big", 66), ("mid", 16), ("last", 32)):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "w.safetensors").write_bytes(b"\x00" * weights)
+        await pool.acquire(name, d)
+    assert "last" in pool.loaded_ids()
+    assert "big" not in pool.loaded_ids()  # LRU evicted to make honest room
+
+
+async def test_measured_working_memory_replaces_the_cold_start_guess(tmp_path):
+    # Once a model has generated, the pool knows its real working memory and must budget that
+    # instead of the coarse multiplier — otherwise a model that barely uses a KV cache stays
+    # penalised forever (and one that uses a huge one stays under-booked).
+    d = tmp_path / "a"
+    d.mkdir()
+    (d / "w.safetensors").write_bytes(b"\x00" * 100)
+    pool = MlxEnginePool(
+        max_loaded=0, loader=lambda p, _k=None: FakeEngine("x"), mem_ceiling_bytes=10**9
+    )
+    await pool.acquire("a", d)
+    assert pool.headroom_bytes() == 10**9 - 120  # cold-start guess: 100 * 1.2
+
+    pool.record_working_memory("a", 5)  # observed: this model barely allocates
+    assert pool.headroom_bytes() == 10**9 - 105
 
 
 async def test_resident_acquire_is_not_blocked_by_an_inflight_load():

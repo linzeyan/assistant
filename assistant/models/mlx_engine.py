@@ -101,6 +101,16 @@ def _estimate_model_bytes(path: Path) -> int:
         return 0
 
 
+# Weights are only part of what a resident model costs: generation adds a KV cache and
+# activations that no pre-load signal can see. Booking weights alone is what let three models
+# total 114GB "fit" under a 124GB ceiling and then OOM-kill the backend on the first decode.
+# Until a model has actually generated — at which point the pool books its measured working
+# memory instead — budget this multiple of its weights. Proportional rather than a flat reserve
+# because the KV cache scales with the model, and deliberately coarse: it only has to stop an
+# admission that would leave no room to decode.
+_WORKING_MEMORY_FACTOR = 1.2
+
+
 class ModelAdmissionError(RuntimeError):
     """A model can't be admitted under the configured memory ceiling. Raised *before* the load so
     a too-big model fails with a clear message (surfaced as a chat error / a 502 on /models load)
@@ -601,9 +611,13 @@ class MlxEnginePool:
         self._loader = loader or _default_loader
         # Insertion order == LRU order; move_to_end marks most-recently-used.
         self._loaded: OrderedDict[str, object] = OrderedDict()
-        # model_id -> bytes it's holding (measured active-memory delta, or disk estimate as a
+        # model_id -> bytes its WEIGHTS hold (measured active-memory delta, or disk estimate as a
         # fallback). Drives byte-level admission against the ceiling, alongside the count cap.
         self._footprint: dict[str, int] = {}
+        # model_id -> peak working memory (KV cache + activations) measured while it generated.
+        # Survives eviction on purpose: it's learned knowledge about the model, not about this
+        # residency, so re-admitting it later budgets the real number instead of guessing again.
+        self._working_memory: dict[str, int] = {}
         # model_id -> its dedicated single-thread executor. MLX (mlx-vlm especially) binds a GPU
         # stream to the thread a model was LOADED on; generating from any other thread raises
         # "There is no Stream(gpu, N) in current thread". So every engine gets one thread for its
@@ -670,15 +684,27 @@ class MlxEnginePool:
             measured = (after - before) if (before is not None and after is not None and after > before) else 0
             self._footprint[model_id] = measured or incoming
             log.info(
-                "model loaded: %s (%.1fGB, pool now: %s = %.1fGB%s)",
+                "model loaded: %s (%.1fGB weights, pool now: %s = %.1fGB budgeted%s)",
                 model_id, self._footprint[model_id] / 1e9, self.loaded_ids(),
                 self._loaded_bytes() / 1e9,
                 f"/{self._ceiling / 1e9:.0f}GB ceiling" if self._ceiling else "",
             )
             return engine
 
+    def _admission_cost(self, model_id: str) -> int:
+        """What a resident model really costs the memory budget: its weights plus the working
+        memory generation needs. Uses the measured working memory once the model has streamed a
+        turn, and ``_WORKING_MEMORY_FACTOR`` as the cold-start guess until then."""
+        weights = self._footprint.get(model_id, 0)
+        measured = self._working_memory.get(model_id)
+        if measured is not None:
+            return weights + measured
+        return int(weights * _WORKING_MEMORY_FACTOR)
+
     def _loaded_bytes(self, exclude: str | None = None) -> int:
-        return sum(self._footprint.get(k, 0) for k in self._loaded if k != exclude)
+        """Total budget the resident models hold — admission costs, not bare weights, so the
+        number compared against the ceiling is the one that has to survive generation."""
+        return sum(self._admission_cost(k) for k in self._loaded if k != exclude)
 
     def _drop(self, model_id: str, reason: str) -> None:
         self._loaded.pop(model_id, None)
@@ -699,6 +725,12 @@ class MlxEnginePool:
         Raises ``ModelAdmissionError`` if, after evicting everything evictable, the incoming model
         still overflows the ceiling (it's larger than the budget, or pinned models leave no room)."""
         evicted = False
+        # The incoming model needs room to generate too, not just to sit there.
+        measured = self._working_memory.get(exclude)
+        incoming = (
+            incoming + measured if measured is not None
+            else int(incoming * _WORKING_MEMORY_FACTOR)
+        )
 
         def next_victim() -> str | None:
             return next((k for k in self._loaded if k != exclude and k not in self._pinned), None)
@@ -776,6 +808,20 @@ class MlxEnginePool:
         if self._ceiling is None:
             return None
         return max(0, self._ceiling - self._loaded_bytes())
+
+    def record_working_memory(self, model_id: str, peak_bytes: int) -> None:
+        """Book the working memory a model actually needed to generate (measured by the engine over
+        one turn). Keeps the high-water mark: admission has to survive this model's *worst* turn, so
+        a later short turn must not make the long one impossible. That means a freak turn inflates
+        the budget for the session — deliberate, since the failure it prevents is an OOM kill."""
+        if peak_bytes <= 0 or peak_bytes <= self._working_memory.get(model_id, 0):
+            return
+        self._working_memory[model_id] = peak_bytes
+        log.info(
+            "working memory measured: %s needs %.1fGB to generate (was budgeting %.1fGB)",
+            model_id, peak_bytes / 1e9,
+            self._footprint.get(model_id, 0) * (_WORKING_MEMORY_FACTOR - 1) / 1e9,
+        )
 
     def set_mem_ceiling_bytes(self, ceiling: int | None) -> None:
         """Live-update the admission ceiling (GUI Settings edit; the next acquire enforces it, no
