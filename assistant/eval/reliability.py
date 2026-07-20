@@ -27,6 +27,10 @@ from collections import Counter
 # Buckets a turn can land in. The four death modes plus the loop-control outcomes (which are real
 # failures too — a turn that hit the iteration ceiling or the wall-clock budget didn't succeed).
 SUCCESS = "success"
+# Answered, and a tool did run, but some other call failed along the way and the model routed
+# around it. Structurally a delivered turn — same epistemic standing as SUCCESS (neither judges
+# answer quality; see mode 4) — but tracked apart so the flailing stays visible.
+RECOVERED = "recovered"
 NO_CALL = "no_call"  # death mode 1
 PARSE_MISS = "parse_miss"  # death mode 2
 TOOL_ERROR = "tool_error"  # death mode 3
@@ -35,11 +39,14 @@ MAX_ITERS = "max_iters"  # loop control: ran out of tool steps
 TIMEOUT = "timeout"  # loop control: exceeded the per-turn wall-clock budget (B1)
 THRASH = "thrash"  # loop control: repeated an identical tool call with no progress (B2)
 
-# Order is the report's display order: success first, then the four death modes, then loop control.
-BUCKETS = (SUCCESS, NO_CALL, PARSE_MISS, TOOL_ERROR, CRASH, MAX_ITERS, TIMEOUT, THRASH)
+# Order is the report's display order: delivered first, then the four death modes, then loop control.
+BUCKETS = (SUCCESS, RECOVERED, NO_CALL, PARSE_MISS, TOOL_ERROR, CRASH, MAX_ITERS, TIMEOUT, THRASH)
+# Buckets that mean the turn delivered an answer with a tool in the loop.
+DELIVERED = (SUCCESS, RECOVERED)
 
 LABELS = {
     SUCCESS: "success (answered, tool ran)",
+    RECOVERED: "recovered (answered after a tool call failed)",
     NO_CALL: "mode 1 · no tool call emitted",
     PARSE_MISS: "mode 2 · emitted but parser missed it",
     TOOL_ERROR: "mode 3 · tool backend failed",
@@ -56,6 +63,16 @@ def _called_a_tool(trace: dict) -> bool:
     return any(step.get("parsed_calls") for step in trace.get("steps") or [])
 
 
+def _any_tool_succeeded(trace: dict) -> bool:
+    """True if at least one tool call returned ok — i.e. the model got real data to answer from,
+    even if another call failed."""
+    return any(
+        r.get("ok")
+        for step in trace.get("steps") or []
+        for r in step.get("tool_results") or []
+    )
+
+
 def classify_turn(trace: dict, *, expects_tool: bool = True) -> str:
     """Bucket one turn trace. ``expects_tool`` says whether the prompt was meant to require a tool;
     when False, an ``answered`` turn with no tool call is a legitimate success, not death mode 1.
@@ -66,7 +83,14 @@ def classify_turn(trace: dict, *, expects_tool: bool = True) -> str:
     no-call-vs-success split, which mode 4 (ignored result) hides behind — see the module docstring.
     """
     outcome = trace.get("outcome")
-    if outcome in (PARSE_MISS, TOOL_ERROR, MAX_ITERS, TIMEOUT, THRASH):
+    if outcome == TOOL_ERROR:
+        # ``finalize`` only marks tool_error on a turn that reached an answer, so the trace's own
+        # outcome can't say whether the failure was terminal. It is if NOTHING worked — the model
+        # answered from nothing. If some call did return data, the model routed around the failure,
+        # which is a delivered turn, not death mode 3. Counting those as failures is what made a
+        # 15/16 sweep report 38%.
+        return RECOVERED if _any_tool_succeeded(trace) else TOOL_ERROR
+    if outcome in (PARSE_MISS, MAX_ITERS, TIMEOUT, THRASH):
         return outcome
     if outcome == "error":
         return CRASH
@@ -78,14 +102,21 @@ def classify_turn(trace: dict, *, expects_tool: bool = True) -> str:
 
 
 def summarize(buckets: list[str]) -> dict:
-    """Aggregate per-turn buckets into a report: total, success count, success rate, breakdown."""
+    """Aggregate per-turn buckets into a report: total, delivered count, rate, breakdown.
+
+    The headline rate is over DELIVERED (clean + recovered), because that's what a user
+    experiences: the turn answered with a tool in the loop. ``success`` keeps the strict count
+    so a rise in ``recovered`` — the model flailing but coping — stays visible."""
     counts = Counter(buckets)
     total = len(buckets)
     success = counts.get(SUCCESS, 0)
+    delivered = sum(counts.get(b, 0) for b in DELIVERED)
     return {
         "total": total,
         "success": success,
-        "success_rate": (success / total) if total else 0.0,
+        "recovered": counts.get(RECOVERED, 0),
+        "delivered": delivered,
+        "success_rate": (delivered / total) if total else 0.0,
         # Stable, display-ordered breakdown (omit buckets that never occurred to keep it scannable).
         "breakdown": [(b, counts[b]) for b in BUCKETS if counts.get(b)],
     }
@@ -98,17 +129,22 @@ def format_report(summary: dict, *, model: str | None = None, runs: int | None =
     head = "tool-calling reliability"
     if model:
         head += f" · {model}"
+    delivered = summary.get("delivered", summary["success"])
+    headline = f"delivered: {delivered}/{total}  ({rate:.0f}%)"
+    if summary.get("recovered"):
+        # Spell out the split: a high rate carried by recoveries is a different health story
+        # from a clean one, and the difference must not hide inside one percentage.
+        headline += f"  — {summary['success']} clean, {summary['recovered']} after a failed call"
+    failures = [(b, c) for b, c in summary["breakdown"] if b not in DELIVERED]
     lines = [
         head,
         "─" * len(head),
         f"runs: {total}" + (f" (×{runs} per prompt)" if runs else ""),
-        f"success: {summary['success']}/{total}  ({rate:.0f}%)",
+        headline,
         "",
-        "failures by death mode:" if summary["breakdown"] else "no failures recorded.",
+        "failures by death mode:" if failures else "no failures recorded.",
     ]
-    for bucket, count in summary["breakdown"]:
-        if bucket == SUCCESS:
-            continue
+    for bucket, count in failures:
         lines.append(f"  {count:>3}  {LABELS.get(bucket, bucket)}")
     return "\n".join(lines)
 
@@ -123,10 +159,10 @@ def format_report(summary: dict, *, model: str | None = None, runs: int | None =
 #   "List the files in the current working directory."
 #   "Read this project's README and summarise it in two sentences."
 #
-# Caveat on the numbers: ``tool_error`` counts a turn where *any* tool call failed, even one the
-# model then recovered from (e.g. a fetch_url 403 it routed around) — the coarse trace outcome can't
-# tell a fatal failure from a recovered one, so it slightly *under*-counts real success. Honest
-# floor, not the ceiling.
+# Caveat on the numbers: ``recovered`` vs ``tool_error`` is a *structural* split (did any tool
+# return data before the model answered), not an answer-quality judgment — a turn that routed
+# around a failure and then answered wrongly still counts as delivered, exactly as a clean
+# ``success`` with a wrong answer does. Mode 4 stays invisible to both; see the module docstring.
 DEFAULT_PROMPTS = (
     "Search the web for the latest stable version of Python and tell me the version number.",
     "Use a web search to find who currently holds the men's 100m world record, and the time.",
