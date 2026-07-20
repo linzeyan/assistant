@@ -244,3 +244,17 @@ def test_gemma4_does_not_shadow_hermes():
     text = '<tool_call>{"name": "t", "arguments": {"q": "v"}}</tool_call>'
     calls = parse_tool_calls(text)
     assert calls[0].name == "t" and calls[0].arguments == {"q": "v"}
+
+
+def test_harmony_call_without_terminator_parses():
+    # With <|call|> registered as a stop token (N83), decoding ends right BEFORE it, so
+    # the payload arrives unterminated. It must still parse.
+    text = (
+        "<|channel|>analysis<|message|>Search first.<|end|>"
+        "<|start|>assistant<|channel|>commentary to=functions.web_search "
+        '<|constrain|>json<|message|>{"query": "latest python"}'
+    )
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "web_search"
+    assert calls[0].arguments == {"query": "latest python"}

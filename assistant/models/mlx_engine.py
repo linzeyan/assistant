@@ -521,6 +521,18 @@ def _load_llm(path: Path) -> MlxEngine:
                 "then restart the backend."
             ) from exc
         raise
+    # Harmony (gpt-oss) hands control back to the runtime at <|call|>, but neither the
+    # checkpoint's generation_config (eos = <|return|>/<|endoftext|> only) nor mlx-lm
+    # registers it as a stop token — generation blew straight past the first tool call
+    # and the model hallucinated results + more calls until the loop's thrash guard
+    # killed the turn (N83). Register it whenever the vocab carries the exact token;
+    # the round-trip check keeps an unk-mapping tokenizer from adding unk as EOS.
+    try:
+        call_id = tokenizer.convert_tokens_to_ids("<|call|>")
+        if call_id is not None and tokenizer.convert_ids_to_tokens(call_id) == "<|call|>":
+            tokenizer.add_eos_token("<|call|>")
+    except Exception:  # vocab probing must never break a load
+        pass
     return MlxEngine(model, tokenizer)
 
 

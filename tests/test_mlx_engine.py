@@ -584,3 +584,55 @@ def test_non_harmony_messages_pass_through_unchanged():
     out = _messages_for_template(msgs)
     assert out[0] is msgs[0]
     assert out[1] is msgs[1]
+
+
+def _load_llm_with_tokenizer(monkeypatch, tokenizer):
+    mlx_lm = types.ModuleType("mlx_lm")
+    mlx_lm.load = lambda path: (object(), tokenizer)
+    monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm)
+    return mlx_engine._load_llm(Path("/m/x"))
+
+
+class _StopTok:
+    def __init__(self, vocab):
+        self._vocab = vocab
+        self._rev = {v: k for k, v in vocab.items()}
+        self.added: list[str] = []
+
+    def convert_tokens_to_ids(self, t):
+        return self._vocab.get(t)
+
+    def convert_ids_to_tokens(self, i):
+        return self._rev.get(i)
+
+    def add_eos_token(self, token):
+        self.added.append(token)
+
+
+def test_load_llm_registers_harmony_call_stop_token(monkeypatch):
+    # gpt-oss's generation_config omits <|call|>, so nothing stopped generation at a
+    # tool call and the model hallucinated results + more calls (N83).
+    tok = _StopTok({"<|call|>": 200012})
+    _load_llm_with_tokenizer(monkeypatch, tok)
+    assert tok.added == ["<|call|>"]
+
+
+def test_load_llm_skips_stop_token_for_non_harmony_vocab(monkeypatch):
+    tok = _StopTok({})  # no <|call|> in vocab -> ids lookup returns None
+    _load_llm_with_tokenizer(monkeypatch, tok)
+    assert tok.added == []
+
+
+def test_load_llm_skips_stop_token_on_unk_mapping(monkeypatch):
+    # A tokenizer that maps unknown tokens to unk instead of None must not get unk
+    # registered as EOS — the round-trip check catches the lie.
+    class _UnkTok(_StopTok):
+        def convert_tokens_to_ids(self, t):
+            return 0  # everything "resolves"
+
+        def convert_ids_to_tokens(self, i):
+            return "<unk>"
+
+    tok = _UnkTok({})
+    _load_llm_with_tokenizer(monkeypatch, tok)
+    assert tok.added == []

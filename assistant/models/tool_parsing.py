@@ -44,8 +44,10 @@ _PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
 # UNVERIFIED against real gpt-oss output — the model isn't downloaded yet, and how mlx-lm's
 # tokenizer renders the harmony control tokens (<|message|>/<|call|>) after decode must be
 # confirmed against a live capture before this is trusted (see _HARMONY note in parse_tool_calls).
+# The terminator is ``<|call|>`` OR end-of-text: once <|call|> is registered as a stop
+# token (N83) the decoded text ends right BEFORE it, so the payload arrives unterminated.
 _HARMONY_CALL_RE = re.compile(
-    r"to=functions\.([\w.-]+).*?<\|message\|>\s*(\{.*?\})\s*<\|call\|>", re.DOTALL
+    r"to=functions\.([\w.-]+).*?<\|message\|>\s*(\{.*?\})\s*(?:<\|call\|>|$)", re.DOTALL
 )
 
 # Gemma 4 native syntax, taught by its chat template:
@@ -309,10 +311,10 @@ def parse_tool_calls(
         if calls:
             return calls
 
-    # Harmony (gpt-oss): `to=functions.NAME … <|message|>{json}<|call|>`. Distinctive enough to
-    # trust without a wrapper. NOTE: pattern is written to the documented harmony spec but not yet
-    # verified against a live gpt-oss capture — confirm and adjust once the model is downloaded.
-    if "to=functions." in text and "<|call|>" in text:
+    # Harmony (gpt-oss): `to=functions.NAME … <|message|>{json}` ending in <|call|> or, once
+    # <|call|> is a stop token (N83), at end-of-text. Verified against live gpt-oss-120b
+    # captures (N82). Distinctive enough to trust without a wrapper.
+    if "to=functions." in text and "<|message|>" in text:
         harmony = [
             _coerce_call({"name": name, "arguments": args})
             for name, args in (
