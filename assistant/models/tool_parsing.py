@@ -38,6 +38,14 @@ _HERMES_OPEN = "<tool_call>"
 _FUNCTION_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
 _PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
 
+# Plain-<function> hybrid (VibeThinker-3B, N96): an XML-ish wrapper around a Hermes-style
+# JSON body — ``<function>\n{"name": …, "arguments": {…}}\n</function>``. Falls in the crack
+# between the Hermes branch (needs a <tool_call> wrapper), _FUNCTION_RE (needs ``=NAME`` in
+# the tag), and the bare-JSON fallback (the text starts with '<'). Verified against live
+# captures: 20/20 sweep runs emitted exactly this shape.
+_PLAIN_FUNCTION_OPEN = "<function>"
+_PLAIN_FUNCTION_RE = re.compile(r"<function>\s*(.*?)\s*</function>", re.DOTALL)
+
 # Harmony (OpenAI gpt-oss): a tool call rides the "commentary" channel as
 #   ...to=functions.NAME <|constrain|>json<|message|>{...json args...}<|call|>
 # The recipient carries the tool name; the JSON payload follows <|message|> up to <|call|>.
@@ -92,8 +100,18 @@ _GEMMA_CALL_RE = re.compile(r"call:([\w.-]+)\s*\{")
 # buffering a tool call. Bare JSON has no marker (handled by a leading-brace check).
 # ``<function=`` covers Qwen3-Coder's wrapper-less XML form: without it the raw XML
 # streams to the client as visible text even though the call parses at end-of-turn.
+# ``<function>`` (no ``=``) is the plain-JSON hybrid's opener (N96) — same reasoning; for
+# emitters that rehearse the block inside <think>, suppression may start mid-reasoning,
+# trading a truncated think display for not leaking raw call markup.
 # A false positive is safe — unparseable buffered text is flushed back at the end.
-TOOL_MARKERS = (_HERMES_OPEN, _PYTHON_TAG, _MISTRAL_TAG, "<function=", _GEMMA_OPEN)
+TOOL_MARKERS = (
+    _HERMES_OPEN,
+    _PYTHON_TAG,
+    _MISTRAL_TAG,
+    "<function=",
+    _PLAIN_FUNCTION_OPEN,
+    _GEMMA_OPEN,
+)
 
 
 @dataclass
@@ -340,6 +358,23 @@ def parse_tool_calls(
         if calls:
             return calls
 
+    # Plain ``<function>`` wrapper with a JSON body (VibeThinker-3B, N96) — XML-ish shell,
+    # Hermes filling; distinctive enough to trust without known_names (_coerce_call still
+    # rejects anything that isn't name+arguments shaped). Think-heavy emitters of this
+    # dialect REHEARSE the literal blocks inside <think> — it's plain text to their
+    # tokenizer — so only post-reasoning text is scanned: the full buffer would double
+    # every call, and an unterminated <think> (ran out of budget mid-reasoning) must
+    # yield none, because the model never actually decided. A missing closer on a real
+    # block still parses, like the Hermes truncation branch above.
+    if _PLAIN_FUNCTION_OPEN in text:
+        visible = _strip_think_blocks(text)
+        if _PLAIN_FUNCTION_OPEN in visible:
+            blocks = _PLAIN_FUNCTION_RE.findall(visible)
+            source = "\n".join(blocks) if blocks else visible.split(_PLAIN_FUNCTION_OPEN, 1)[1]
+            calls = _coerce_all(_iter_json_values(source), restrict=None)
+            if calls:
+                return calls
+
     # Harmony (gpt-oss): `to=functions.NAME … <|message|>{json}` ending in <|call|> or, once
     # <|call|> is a stop token (N83), at end-of-text. Verified against live gpt-oss-120b
     # captures (N82). Distinctive enough to trust without a wrapper.
@@ -359,6 +394,21 @@ def parse_tool_calls(
     if stripped[:1] in "{[" and known_names:
         return _coerce_all(_iter_json_values(stripped), restrict=known_names)
     return []
+
+
+def _strip_think_blocks(text: str) -> str:
+    """Text with ``<think>…</think>`` regions removed. An unterminated ``<think>`` drops
+    everything after it: reasoning that never concluded must not contribute tool calls."""
+    out: list[str] = []
+    rest = text
+    while True:
+        head, sep, tail = rest.partition("<think>")
+        out.append(head)
+        if not sep:
+            return "".join(out)
+        _scratch, sep2, rest = tail.partition("</think>")
+        if not sep2:
+            return "".join(out)
 
 
 def _first_json(s: str):

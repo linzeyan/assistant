@@ -258,3 +258,70 @@ def test_harmony_call_without_terminator_parses():
     assert len(calls) == 1
     assert calls[0].name == "web_search"
     assert calls[0].arguments == {"query": "latest python"}
+
+
+def test_plain_function_json_blocks_parse():
+    # VibeThinker-3B (N96): an XML-ish <function> shell around a Hermes JSON body — falls
+    # in the crack between the =NAME XML branch and the bare-JSON fallback (text starts
+    # with '<'), so 20/20 sweep runs scored "no tool call emitted" while calling tools.
+    text = (
+        "<function>\n"
+        '{"name": "web_search", "arguments": {"query": "latest Python", "max_results": 5}}\n'
+        "</function>\n\n<function>\n"
+        '{"name": "fetch_url", "arguments": {"url": "https://python.org", "max_chars": 6000}}\n'
+        "</function>"
+    )
+    calls = parse_tool_calls(text)
+    assert [c.name for c in calls] == ["web_search", "fetch_url"]
+    assert calls[0].arguments["query"] == "latest Python"
+    assert len({c.id for c in calls}) == 2
+
+
+def test_plain_function_rehearsal_inside_think_not_doubled():
+    # This dialect's emitters rehearse the literal blocks inside <think> (observed in the
+    # live captures) — only the post-reasoning block may produce a call, or every call
+    # would double and the rehearsal would run alongside the real one.
+    text = (
+        '<think>I should call: <function>\n{"name": "web_search", "arguments": '
+        '{"query": "x"}}\n</function> yes.</think>\n'
+        '<function>\n{"name": "web_search", "arguments": {"query": "x"}}\n</function>'
+    )
+    calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "web_search"
+
+
+def test_plain_function_only_inside_unterminated_think_is_no_call():
+    # A model that ran out of budget mid-reasoning rehearsed a call but never decided —
+    # executing scratch work would act on a decision the model never made.
+    text = (
+        '<think>maybe <function>\n{"name": "web_search", "arguments": {"query": "x"}}\n'
+        "</function> or perhaps"
+    )
+    assert parse_tool_calls(text) == []
+
+
+def test_plain_function_truncated_closer_still_parses():
+    # Same tolerance as the Hermes opened-but-never-closed branch: a truncated closer
+    # must not discard an otherwise complete call.
+    calls = parse_tool_calls('<function>\n{"name": "web_search", "arguments": {"query": "x"}}')
+    assert [c.name for c in calls] == ["web_search"]
+
+
+def test_plain_function_garbage_body_is_not_a_call():
+    assert parse_tool_calls("<function>not json at all</function>") == []
+
+
+def test_plain_function_opener_is_a_stream_marker():
+    # Without the marker the raw <function> JSON streams to the client as visible text
+    # even though the call parses at end-of-turn (same reasoning as ``<function=``).
+    assert earliest_marker("prose <function>") == 6
+
+
+def test_plain_function_does_not_shadow_named_xml_form():
+    # ``<function=NAME>`` (Qwen nested-XML) must keep hitting its own branch — the two
+    # openers are disjoint literals, and this pins that.
+    text = "<function=web_search><parameter=query>taipei</parameter></function>"
+    calls = parse_tool_calls(text)
+    assert [c.name for c in calls] == ["web_search"]
+    assert calls[0].arguments == {"query": "taipei"}
