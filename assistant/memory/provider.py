@@ -20,6 +20,9 @@ class MemoryProvider(ABC):
     @abstractmethod
     async def all(self) -> list[dict]: ...
 
+    @abstractmethod
+    async def delete(self, entry_id: str) -> bool: ...
+
     async def prefetch(self, query: str) -> str:
         """Return a formatted block of relevant memories to inject before an LLM
         call, or '' if nothing is relevant. Default: top matches as a bullet list."""

@@ -30,6 +30,15 @@ def _public(entry: dict) -> dict:
     return {k: v for k, v in entry.items() if k != "embedding"}
 
 
+# Cosine floor for semantic recall, measured against the default embedder
+# (bge-small-en-v1.5): related pairs score 0.62-0.76 in English but only ~0.51 in
+# CJK (the model is English-only), while unrelated pairs span 0.27-0.59. 0.5 keeps
+# every measured true hit — no recall regression vs the old unfiltered top-k —
+# while dropping the bulk of English-query noise; raising it further has to wait
+# for a multilingual embedder.
+_MIN_COSINE = 0.5
+
+
 def _cosine(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
@@ -89,6 +98,16 @@ class FileMemoryProvider(MemoryProvider):
         if self._semantic_enabled():
             hits = await self._semantic_search(query, limit)
             if hits is not None:
+                # Union in exact-term matches: they bridge what the embedder misses
+                # (identifiers, CJK under the English-only default model).
+                if len(hits) < limit:
+                    seen = {h["id"] for h in hits}
+                    extra = [
+                        h
+                        for h in self._keyword_search(query, limit)
+                        if h["id"] not in seen
+                    ]
+                    hits += extra[: limit - len(hits)]
                 return hits
         return self._keyword_search(query, limit)
 
@@ -100,10 +119,13 @@ class FileMemoryProvider(MemoryProvider):
             qvec = (await self._embedder.embed([query]))[0]
         except Exception:
             return None
-        scored = sorted(
-            entries, key=lambda e: _cosine(qvec, e["embedding"]), reverse=True
-        )
-        return [_public(e) for e in scored[:limit]]
+        scored = [(_cosine(qvec, e["embedding"]), e) for e in entries]
+        # Below-floor entries are noise, not context: injecting them every turn is
+        # how memory becomes a garbage dump. Ties go to the newer entry so a
+        # superseding fact outranks the stale one it replaces.
+        relevant = [(s, e) for s, e in scored if s >= _MIN_COSINE]
+        relevant.sort(key=lambda t: (t[0], t[1].get("created_at", "")), reverse=True)
+        return [_public(e) for _, e in relevant[:limit]]
 
     def _keyword_search(self, query: str, limit: int) -> list[dict]:
         terms = query.lower().split()

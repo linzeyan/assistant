@@ -80,7 +80,9 @@ might matter later, write them to a file and print its path.
 Self-improvement:
 - After solving a non-trivial, reusable task, consider saving the procedure as a \
 skill via skill_manage(action="create").
-- When the user states a durable preference or fact, save it with memory_write."""
+- When the user states a durable preference or fact, save it with memory_write. If it \
+supersedes a stored memory, remove the stale entry with memory_forget (memory_search \
+shows each entry's id) so old and new facts don't contradict each other later."""
 
 
 def build_system_prompt(skills_index: str) -> str:

@@ -50,4 +50,27 @@ async def memory_search(args: dict, ctx: ToolContext) -> ToolResult:
     hits = await ctx.memory.search(args["query"], limit=int(args.get("limit", 5)))
     if not hits:
         return ToolResult(True, "(no relevant memories)")
-    return ToolResult(True, "\n".join(f"- {h['content']}" for h in hits))
+    # The id lets the model retire a stale entry via memory_forget.
+    return ToolResult(True, "\n".join(f"- [{h['id']}] {h['content']}" for h in hits))
+
+
+@registry.tool(
+    name="memory_forget",
+    description=(
+        "Delete an outdated or superseded memory entry by id. Use when the user "
+        "states something that replaces or contradicts a stored memory — find the "
+        "old entry's id with memory_search first."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {"id": {"type": "string"}},
+        "required": ["id"],
+    },
+    needs_approval=True,
+)
+async def memory_forget(args: dict, ctx: ToolContext) -> ToolResult:
+    if ctx.memory is None:
+        return ToolResult(False, "memory is unavailable")
+    if await ctx.memory.delete(args["id"]):
+        return ToolResult(True, f"forgot memory {args['id']}")
+    return ToolResult(False, f"no memory with id {args['id']}")

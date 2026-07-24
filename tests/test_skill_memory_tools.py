@@ -67,3 +67,22 @@ async def test_tools_degrade_without_context(tmp_path):
     bare = ToolContext(cwd=tmp_path)  # no skills / memory attached
     assert (await reg.get("skills_list").handler({}, bare)).ok is False
     assert (await reg.get("memory_write").handler({"content": "x"}, bare)).ok is False
+    assert (await reg.get("memory_forget").handler({"id": "x"}, bare)).ok is False
+
+
+async def test_memory_forget_retires_stale_entry(tmp_path):
+    # The model must be able to resolve a contradiction ("I switched to pnpm") by
+    # deleting the superseded fact — otherwise old and new memories are recalled
+    # together forever. Deleting user memory is destructive, hence approval-gated.
+    reg = build_registry()
+    assert reg.get("memory_forget").needs_approval is True
+    ctx, _ = _ctx(tmp_path)
+    await reg.get("memory_write").handler({"content": "uses npm"}, ctx)
+    s = await reg.get("memory_search").handler({"query": "npm"}, ctx)
+    entry_id = s.content.split("[", 1)[1].split("]", 1)[0]  # ids ride the results
+    res = await reg.get("memory_forget").handler({"id": entry_id}, ctx)
+    assert res.ok
+    gone = await reg.get("memory_search").handler({"query": "npm"}, ctx)
+    assert "npm" not in gone.content
+    # unknown id -> a clear error, not a silent success
+    assert (await reg.get("memory_forget").handler({"id": entry_id}, ctx)).ok is False
