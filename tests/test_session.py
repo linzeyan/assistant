@@ -24,6 +24,16 @@ def test_checkpoint_persists_across_restart(tmp_path):
     assert [m["content"] for m in reloaded.messages] == ["remember me", "ok"]
 
 
+def test_checkpoint_persists_the_plan(tmp_path):
+    # N102: an unfinished plan must survive a backend restart with the session — otherwise a
+    # multi-turn task loses its checklist exactly when resuming matters most.
+    store = SessionStore(tmp_path)
+    s = store.get_or_create(model="m")
+    s.plan = [{"title": "fix the bug", "status": "in_progress"}]
+    store.checkpoint(s)
+    assert SessionStore(tmp_path).get(s.id).plan == s.plan
+
+
 def test_checkpoint_is_atomic_no_tmp_left(tmp_path):
     store = SessionStore(tmp_path)
     s = store.create(model="m")

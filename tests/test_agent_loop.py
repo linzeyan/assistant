@@ -577,6 +577,59 @@ async def test_update_plan_emits_plan_event_with_normalized_steps(tmp_path):
     assert "read the file" not in tool_msgs[-1]["content"]
 
 
+class RecordingLLM(FakeLLM):
+    """FakeLLM that also captures the exact messages each call received."""
+
+    def __init__(self, turns):
+        super().__init__(turns)
+        self.seen: list[list[dict]] = []
+
+    def stream_chat(self, messages, model, tools=None, **params):
+        self.seen.append(messages)
+        return super().stream_chat(messages, model, tools=tools, **params)
+
+
+async def test_unfinished_plan_rides_the_next_turn(tmp_path):
+    # WHY (N102): the checklist is deliberately kept out of history (SA.3), which made it
+    # turn-local — the model forgot its own plan on the next turn and multi-turn tasks restarted
+    # from scratch. An UNFINISHED plan must persist on the session and ride the next turn's user
+    # message as a send-time reference block, leaving stored history clean.
+    llm = RecordingLLM([
+        [{"type": "tool_calls", "tool_calls": [{
+            "id": "p1", "name": "update_plan",
+            "arguments": {"steps": [
+                {"title": "read the file", "status": "completed"},
+                {"title": "fix the bug", "status": "in_progress"},
+            ]},
+        }]}],
+        [{"type": "text", "content": "pausing here"}],
+        [{"type": "text", "content": "turn two"}],
+    ])
+    session = Session(id="plan-carry")
+    loop = _loop(llm, tmp_path, approval_required=False)
+    await _collect(loop.run(session, "start the task", "m"))
+    assert session.plan and session.plan[1] == {"title": "fix the bug", "status": "in_progress"}
+
+    await _collect(loop.run(session, "continue", "m"))
+    sent_user = [m for m in llm.seen[-1] if m.get("role") == "user"][-1]["content"]
+    assert "<plan reference-only>" in sent_user and "fix the bug" in sent_user
+    # Send-time only: the stored conversation stays clean of the block.
+    assert all(
+        "<plan reference-only>" not in (m.get("content") or "") for m in session.messages
+    )
+
+
+async def test_finished_plan_stops_riding(tmp_path):
+    # A completed checklist is done context, not working context — injecting it forever would
+    # be exactly the stale-plan bloat SA.3 avoided.
+    llm = RecordingLLM([[{"type": "text", "content": "hi"}]])
+    session = Session(id="plan-done")
+    session.plan = [{"title": "all wrapped", "status": "completed"}]
+    await _collect(_loop(llm, tmp_path, approval_required=False).run(session, "next", "m"))
+    sent_user = [m for m in llm.seen[-1] if m.get("role") == "user"][-1]["content"]
+    assert "<plan reference-only>" not in sent_user
+
+
 async def test_turn_timeout_aborts_between_iterations(tmp_path):
     # WHY (B1): a runaway tool-call loop must self-abort on the wall-clock budget — between
     # iterations, with a loud error — rather than running to the iteration ceiling or unbounded.

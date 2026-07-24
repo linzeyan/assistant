@@ -59,6 +59,11 @@ class Session:
     # replaced, so older turns can be relieved from the live context window without losing
     # the detail (recoverable from disk). Append-only; the live `messages` stays compact.
     compactions: list[dict] = field(default_factory=list)
+    # Last update_plan checklist (normalized steps). Kept OUT of messages (the ack is all history
+    # sees, SA.3); persisted here so an unfinished plan can ride the next turn's user message as a
+    # reference block — without it the model forgets its own plan between turns and a multi-turn
+    # task restarts from scratch.
+    plan: list[dict] | None = None
     schema_version: int = SCHEMA_VERSION
     created_at: float = field(default_factory=_now)
     last_accessed_at: float = field(default_factory=_now)
@@ -126,6 +131,7 @@ class Session:
             "system_fingerprint": self.system_fingerprint,
             "parent_session_id": self.parent_session_id,
             "compactions": self.compactions,
+            "plan": self.plan,
             "schema_version": self.schema_version,
             "created_at": self.created_at,
             "last_accessed_at": self.last_accessed_at,
@@ -142,6 +148,7 @@ class Session:
             system_fingerprint=data.get("system_fingerprint"),
             parent_session_id=data.get("parent_session_id"),
             compactions=data.get("compactions") or [],
+            plan=data.get("plan"),
             schema_version=data.get("schema_version", SCHEMA_VERSION),
             created_at=data.get("created_at") or _now(),
             last_accessed_at=data.get("last_accessed_at") or _now(),

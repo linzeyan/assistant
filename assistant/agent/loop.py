@@ -24,6 +24,7 @@ from .prompt import (
     build_system_prompt,
     wrap_datetime_context,
     wrap_memory_context,
+    wrap_plan_context,
     wrap_referenced_paths,
     wrap_workspace_context,
 )
@@ -187,9 +188,18 @@ class AgentLoop:
         # cacheable system prefix, S3). The date is stamped once per turn so a local model —
         # which has no clock — stops hallucinating "today" from its training cutoff.
         referenced = _referenced_paths(user_text, ctx.cwd)
+        # A finished plan stops riding; the model replaces the carried plan wholesale on its
+        # next update_plan call. Snapshotted at turn start — mid-turn updates reach the model
+        # through the tool acks, not this block.
+        carried_plan = (
+            session.plan
+            if session.plan and any(s.get("status") != "completed" for s in session.plan)
+            else None
+        )
         context_blocks = [
             wrap_datetime_context(datetime.now().astimezone()),
             wrap_workspace_context(ctx.cwd),
+            wrap_plan_context(carried_plan) if carried_plan else "",
             wrap_memory_context(memory_block) if memory_block else "",
             # An explicit "看下 <path>" is the strongest read-me signal; a weak model still guesses
             # the file's contents without this in-context nudge (see _referenced_paths).
@@ -453,12 +463,15 @@ class AgentLoop:
                     # re-fed every iteration (history bloat / wasted context on small models).
                     if tc["name"] == "update_plan" and result.ok:
                         try:
-                            yield {
-                                "type": "plan",
-                                "steps": normalize_steps(tc["arguments"].get("steps")),
-                            }
+                            plan_steps = normalize_steps(tc["arguments"].get("steps"))
                         except ValueError:
                             pass  # malformed args already surfaced as the tool's error result
+                        else:
+                            # Durable copy (still outside messages): an unfinished plan rides
+                            # the NEXT turn as a reference block, so the model keeps its own
+                            # checklist across turns instead of restarting the task.
+                            session.plan = plan_steps
+                            yield {"type": "plan", "steps": plan_steps}
                 if trace is not None:
                     trace.steps.append(step)
 

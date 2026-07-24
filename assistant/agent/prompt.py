@@ -14,6 +14,14 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from .tokens import cut_at_tokens, estimate_tokens
+
+# The skills index is discovery metadata, not required context: skill_manage lets the agent grow
+# the library unboundedly, and an unbounded catalog would slowly eat the prompt (and the KV-cache
+# budget) for every turn. Over budget we keep a deterministic prefix (index_text sorts by name, so
+# the cut is stable across turns — the prefix stays cacheable) and point at skills_list for the rest.
+_SKILLS_INDEX_TOKEN_BUDGET = 2000
+
 _BASE = """You are a local-first AI coding assistant running on the user's Mac.
 
 You have tools to read/write/edit files, run shell commands, search code, search the \
@@ -86,6 +94,11 @@ shows each entry's id) so old and new facts don't contradict each other later.""
 
 
 def build_system_prompt(skills_index: str) -> str:
+    if estimate_tokens(skills_index) > _SKILLS_INDEX_TOKEN_BUDGET:
+        skills_index = (
+            cut_at_tokens(skills_index, _SKILLS_INDEX_TOKEN_BUDGET)
+            + "\n(index truncated — call skills_list for the full catalog)"
+        )
     parts = [
         _BASE,
         "",
@@ -129,6 +142,26 @@ def wrap_referenced_paths(paths: list[str]) -> str:
         "Open them with read_file (or bash cat/ls) BEFORE answering about, editing, or writing "
         "instructions for them — do not guess their contents.\n"
         "</referenced-paths>"
+    )
+
+
+def wrap_plan_context(steps: list[dict]) -> str:
+    """An unfinished update_plan checklist carried over from an earlier turn, riding the *current
+    user turn* (never the cacheable prefix, S3). The plan is deliberately kept out of history
+    (SA.3: only the short ack is stored), which made it turn-local — the model forgot its own plan
+    on the next turn and multi-turn tasks restarted from scratch. Bounded: a checklist is short by
+    design, but a runaway list must not flood the turn."""
+    shown = steps[:30]
+    lines = "\n".join(f"- [{s['status']}] {s['title']}" for s in shown)
+    if len(steps) > len(shown):
+        lines += f"\n… (+{len(steps) - len(shown)} more steps)"
+    return (
+        "<plan reference-only>\n"
+        "Unfinished plan from earlier in this conversation:\n"
+        f"{lines}\n"
+        "If this turn continues that task, keep working the plan and update statuses via "
+        "update_plan; if the task changed, send a full revised list.\n"
+        "</plan>"
     )
 
 

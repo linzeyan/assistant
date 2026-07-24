@@ -11,8 +11,10 @@ from assistant.agent.prompt import (
     build_system_prompt,
     wrap_datetime_context,
     wrap_memory_context,
+    wrap_plan_context,
     wrap_referenced_paths,
 )
+from assistant.agent.tokens import estimate_tokens
 
 
 def test_datetime_context_includes_date_and_weekday():
@@ -74,6 +76,30 @@ def test_system_prompt_has_code_mode_batch_policy():
     assert "ONE script" in p
     assert "distilled" in p
     assert "heredoc" in p  # python3 inline via bash is the sanctioned escape hatch
+
+
+def test_skills_index_is_budget_capped():
+    # N102: skill_manage grows the library unboundedly — the catalog must not slowly eat the
+    # prompt. Over budget we keep a deterministic prefix (stable across turns, so the cacheable
+    # prefix survives) and point at skills_list for the rest; a small index passes untouched.
+    huge = "\n".join(f"- skill-{i:04d}: does thing number {i}" for i in range(2000))
+    p = build_system_prompt(huge)
+    assert "index truncated" in p and "skills_list" in p
+    assert estimate_tokens(p) < 3500  # raw index alone is ~17k tokens
+
+    small = build_system_prompt("- one: does a thing")
+    assert "- one: does a thing" in small and "index truncated" not in small
+
+
+def test_plan_context_block_lists_steps_and_is_bounded():
+    # N102: an unfinished plan rides the next user turn (never the S3 prefix) so the model
+    # keeps its own checklist across turns; a runaway list must not flood the turn.
+    steps = [{"title": f"step {i}", "status": "pending"} for i in range(40)]
+    block = wrap_plan_context(steps)
+    assert block.startswith("<plan reference-only>")
+    assert "- [pending] step 0" in block and "step 29" in block
+    assert "step 30" not in block and "+10 more" in block
+    assert "update_plan" in block  # tells the model how to continue/revise it
 
 
 def test_referenced_paths_block_is_reference_only_and_lists_paths():

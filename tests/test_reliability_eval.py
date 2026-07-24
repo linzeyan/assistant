@@ -51,6 +51,41 @@ def test_tool_error_stays_fatal_when_nothing_ever_worked():
     assert R.classify_turn(trace) == R.TOOL_ERROR
 
 
+def _row(prompt: str, delivered: bool) -> dict:
+    """A capture-shaped row (what measure --append-corpus writes) for one run of a prompt."""
+    calls = [{"name": "web_search", "arguments": {}}] if delivered else []
+    return {
+        "user_text": prompt,
+        "outcome": "answered",
+        "steps": [{"parsed_calls": calls, "tool_results": []}],
+    }
+
+
+def test_compare_exposes_the_hidden_trade():
+    # WHY (AHE transition matrix): both sweeps deliver 2/4 — the headline says "unchanged" —
+    # but prompt A was fixed and prompt B broken. The per-prompt matrix must expose exactly
+    # that, with the regression surfaced first.
+    baseline = [_row("A", False)] * 2 + [_row("B", True)] * 2
+    candidate = [_row("A", True)] * 2 + [_row("B", False)] * 2
+    rows = R.compare_by_prompt(baseline, candidate)
+    assert [(r["prompt"], r["transition"]) for r in rows] == [
+        ("B", R.PASS_TO_FAIL),  # regression first — it's the loud one
+        ("A", R.FAIL_TO_PASS),
+    ]
+    report = R.format_comparison(rows)
+    assert "pass_to_fail" in report and "0/2 → 2/2" in report
+    assert "1 prompt(s) regressed" in report
+
+
+def test_compare_same_side_movement_and_missing_prompts():
+    baseline = [_row("A", True), _row("A", False), _row("C", True)]
+    candidate = [_row("A", True), _row("A", True)]  # A improves within pass; C vanished
+    by = {r["prompt"]: r["transition"] for r in R.compare_by_prompt(baseline, candidate)}
+    assert by == {"A": R.IMPROVED, "C": R.BASELINE_ONLY}
+    # No regressions -> the report must say so instead of warning.
+    assert "no per-prompt regressions" in R.format_comparison(R.compare_by_prompt(baseline, candidate))
+
+
 def test_recovered_counts_as_delivered_but_stays_visible():
     # Both must be true at once: the headline rate reflects what the user got, AND a run carried
     # by recoveries is distinguishable from a clean one.

@@ -109,9 +109,28 @@ async def _measure(args: argparse.Namespace, prompts: list[str]) -> int:
         return 1
     summary = reliability.summarize(buckets)
     print(reliability.format_report(summary, model=args.model, runs=args.runs))
+    if args.compare:
+        # AHE-style deploy verification: the headline rate can stay flat while one prompt was
+        # fixed and another broken — the per-prompt matrix makes that trade visible.
+        baseline = _load_rows(Path(args.compare))
+        print()
+        print(reliability.format_comparison(reliability.compare_by_prompt(baseline, captures)))
     if args.append_corpus:
         print(f"\nappended {len(captures)} captures to {args.append_corpus}", file=sys.stderr)
     return 0
+
+
+def _load_rows(path: Path) -> list[dict]:
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # tolerate a corrupt line; the rest of the baseline still compares
+    return rows
 
 
 async def _autodetect_model(client: httpx.AsyncClient) -> str | None:
@@ -178,6 +197,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-n", "--runs", type=int, default=10, help="runs per prompt (default 10)")
     p.add_argument("--prompts", default=None, help="file with one prompt per line (default: built-in set)")
     p.add_argument("--append-corpus", default=None, help="append raw captures to this JSONL")
+    p.add_argument(
+        "--compare", default=None,
+        help="baseline captures JSONL (a previous --append-corpus file from a comparable sweep); "
+        "prints a per-prompt transition matrix so a fix that breaks another prompt can't hide "
+        "inside an unchanged headline rate",
+    )
     p.add_argument("--timeout", type=float, default=600.0, help="per-turn HTTP timeout seconds")
     p.add_argument(
         "--turn-deadline", type=float, default=1800.0,

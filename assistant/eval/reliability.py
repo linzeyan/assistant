@@ -149,6 +149,95 @@ def format_report(summary: dict, *, model: str | None = None, runs: int | None =
     return "\n".join(lines)
 
 
+# Per-prompt transition matrix between two capture sets (the rows ``measure --append-corpus``
+# writes). Aggregate rates hide compensating changes — a fix that repairs prompt A while breaking
+# prompt B can leave the headline number unchanged; per-prompt transitions can't. A prompt "passes"
+# a sweep when at least half its runs delivered (stochastic models make a single run too noisy to
+# be a verdict; the raw x/n counts stay in the output so the margin is visible either way).
+
+FAIL_TO_PASS = "fail_to_pass"
+PASS_TO_FAIL = "pass_to_fail"  # the regression signal — surfaced first, loudly
+IMPROVED = "improved"  # same side of the pass line, delivered rate went up
+REGRESSED = "regressed"  # same side, rate went down
+UNCHANGED = "unchanged"
+BASELINE_ONLY = "baseline_only"  # prompt absent from one side — compared sweeps differ
+CANDIDATE_ONLY = "candidate_only"
+
+_TRANSITION_ORDER = (
+    PASS_TO_FAIL, REGRESSED, FAIL_TO_PASS, IMPROVED, UNCHANGED, BASELINE_ONLY, CANDIDATE_ONLY,
+)
+
+
+def _delivered_by_prompt(rows: list[dict], *, expects_tool: bool) -> dict[str, tuple[int, int]]:
+    """prompt text -> (delivered, total) over capture rows (which carry the same outcome/steps
+    fields ``classify_turn`` reads)."""
+    stats: dict[str, tuple[int, int]] = {}
+    for row in rows:
+        prompt = row.get("user_text") or "(unknown prompt)"
+        d, t = stats.get(prompt, (0, 0))
+        bucket = classify_turn(row, expects_tool=expects_tool)
+        stats[prompt] = (d + (1 if bucket in DELIVERED else 0), t + 1)
+    return stats
+
+
+def compare_by_prompt(
+    baseline: list[dict], candidate: list[dict], *, expects_tool: bool = True
+) -> list[dict]:
+    """Classify every prompt's transition from a baseline sweep to a candidate sweep.
+
+    Returns display-ordered rows ``{prompt, baseline: (d, n) | None, candidate: (d, n) | None,
+    transition}`` with regressions first."""
+    base = _delivered_by_prompt(baseline, expects_tool=expects_tool)
+    cand = _delivered_by_prompt(candidate, expects_tool=expects_tool)
+    rows = []
+    for prompt in base.keys() | cand.keys():
+        b, c = base.get(prompt), cand.get(prompt)
+        if b is None:
+            transition = CANDIDATE_ONLY
+        elif c is None:
+            transition = BASELINE_ONLY
+        else:
+            b_rate, c_rate = b[0] / b[1], c[0] / c[1]
+            b_pass, c_pass = b_rate >= 0.5, c_rate >= 0.5
+            if b_pass and not c_pass:
+                transition = PASS_TO_FAIL
+            elif not b_pass and c_pass:
+                transition = FAIL_TO_PASS
+            elif c_rate > b_rate:
+                transition = IMPROVED
+            elif c_rate < b_rate:
+                transition = REGRESSED
+            else:
+                transition = UNCHANGED
+        rows.append(
+            {"prompt": prompt, "baseline": b, "candidate": c, "transition": transition}
+        )
+    rows.sort(key=lambda r: (_TRANSITION_ORDER.index(r["transition"]), r["prompt"]))
+    return rows
+
+
+def format_comparison(rows: list[dict]) -> str:
+    """Render ``compare_by_prompt`` as a compact table, regressions on top."""
+    if not rows:
+        return "no prompts to compare."
+    head = "per-prompt transitions (baseline → candidate)"
+    lines = [head, "─" * len(head)]
+    for r in rows:
+        b, c = r["baseline"], r["candidate"]
+        left = f"{b[0]}/{b[1]}" if b else "—"
+        right = f"{c[0]}/{c[1]}" if c else "—"
+        prompt = r["prompt"] if len(r["prompt"]) <= 60 else r["prompt"][:57] + "…"
+        lines.append(f"  {r['transition']:<14} {left:>5} → {right:<5}  {prompt}")
+    regressions = sum(r["transition"] in (PASS_TO_FAIL, REGRESSED) for r in rows)
+    lines.append("")
+    lines.append(
+        f"⚠ {regressions} prompt(s) regressed — inspect before trusting the headline rate."
+        if regressions
+        else "no per-prompt regressions."
+    )
+    return "\n".join(lines)
+
+
 # Default probe prompts: each is meant to *require* a tool, so an ``answered`` turn that never called
 # one is a real death-mode-1 miss. These exercise the web tools (web_search / fetch_url), which work
 # API-side without any workspace. Filesystem/coding prompts are intentionally NOT here: an
