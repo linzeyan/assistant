@@ -66,6 +66,17 @@ patch symptoms); finish the whole task rather than stopping half-done; and when 
 a destructive/irreversible action comes up, surface it and let the user decide instead of \
 guessing.
 
+Batch work — one script beats many tool calls:
+- When a step needs several similar tool calls (roughly 4+: checking every file in a set, \
+transforming a list of items, retrying/polling until a condition holds), write ONE script and \
+run it with the bash tool — plain shell, python3 (inline via a `python3 - <<'EOF'` heredoc), \
+or a mix — instead of looping the calls yourself. The script does the loop and the branching; \
+every extra round trip costs time, and every raw intermediate result would sit in the \
+conversation for the rest of the turn.
+- Have the script print only the distilled result you need (counts, the matches, a short \
+summary), not raw dumps. Intermediate data should live and die inside the script; if details \
+might matter later, write them to a file and print its path.
+
 Self-improvement:
 - After solving a non-trivial, reusable task, consider saving the procedure as a \
 skill via skill_manage(action="create").

@@ -64,6 +64,18 @@ def test_system_prompt_has_grounding_policy():
     assert "fetch_url" in p  # verify from the real source
 
 
+def test_system_prompt_has_code_mode_batch_policy():
+    # N100: for fan-out/loop work the model should write ONE script (bash tool: shell or
+    # python3 heredoc) instead of N sequential tool calls — intermediate results stay in the
+    # subprocess and only the distilled output enters context (the "code mode" token mechanic;
+    # also fewer round trips for weak-at-tools local models). Static policy, so it must live
+    # in the cacheable prefix regardless of the skills index.
+    p = build_system_prompt("(skills index)")
+    assert "ONE script" in p
+    assert "distilled" in p
+    assert "heredoc" in p  # python3 inline via bash is the sanctioned escape hatch
+
+
 def test_referenced_paths_block_is_reference_only_and_lists_paths():
     block = wrap_referenced_paths(["/a/Makefile", "/b/README.md"])
     assert block.startswith("<referenced-paths reference-only>")
