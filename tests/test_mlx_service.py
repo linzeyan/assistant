@@ -406,7 +406,7 @@ def test_vlm_chat_engine_streams_text(monkeypatch):
     # VlmChatEngine renders the prompt via the processor's chat template and streams
     # text out of mlx-vlm. Verify the wiring with a fake processor + stream_generate,
     # so no real VLM is loaded. Skips where mlx-vlm isn't installed (e.g. CI).
-    pytest.importorskip("mlx_vlm")
+    pytest.importorskip("mlx_vlm", exc_type=ImportError)
     import mlx_vlm
 
     from assistant.models.mlx_engine import VlmChatEngine

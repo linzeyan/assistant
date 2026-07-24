@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from assistant.models.mlx_engine import _sampler_kwargs
 from assistant.models.per_model_store import PerModelStore
 
@@ -82,5 +84,10 @@ def test_sampler_kwargs_empty_when_no_overrides():
 
 
 def test_sampler_kwargs_builds_sampler_when_set():
+    # Needs a REAL mlx_lm — the point is that the kwargs wire into make_sampler. On a
+    # machine without a working mlx stack (CI installs dev deps only; a source venv can
+    # hold a transformers/huggingface-hub pin conflict that breaks the import chain),
+    # skip visibly instead of failing forever.
+    pytest.importorskip("mlx_lm", exc_type=ImportError)
     out = _sampler_kwargs(0.7, 0.9, 40)
     assert "sampler" in out and callable(out["sampler"])

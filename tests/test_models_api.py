@@ -6,6 +6,7 @@ import json
 
 from assistant.config import Settings
 from assistant.main import create_app
+from assistant.models.mlx_service import MlxModelService
 from fastapi.testclient import TestClient
 
 
@@ -31,7 +32,12 @@ def test_unload_route_accepts_slashed_model_id(tmp_path):
     assert r.status_code != 404, r.text
 
 
-def test_delete_removes_local_model_from_disk(tmp_path):
+def test_delete_removes_local_model_from_disk(tmp_path, monkeypatch):
+    # The catalog fails soft to [] when mlx_lm isn't installed (the available() gate), so
+    # on CI — dev deps only, no mlx — the list comes back empty and the delete can't be
+    # exercised. This test is about route/catalog/file behavior, not the engine: force
+    # availability on so it runs the same everywhere.
+    monkeypatch.setattr(MlxModelService, "available", lambda self: True)
     model = _make_model(tmp_path / "qwen3-8b")
     with TestClient(create_app(Settings(models_dir=tmp_path))) as client:
         before = {m["id"] for m in client.get("/models").json()["models"]}
@@ -49,9 +55,12 @@ def test_delete_unknown_model_is_400_not_500(tmp_path):
     assert r.status_code == 400, r.text
 
 
-def test_models_list_flags_weak_at_tools(tmp_path):
+def test_models_list_flags_weak_at_tools(tmp_path, monkeypatch):
     # The GUI picker renders ⚠️ from this per-model flag (one source of truth with Telegram's
     # /models picker). A thinking model is flagged; its Coder sibling is not.
+    # Availability forced on for the same reason as the delete test above: the flag logic
+    # is pure name heuristics and must be testable without an mlx install.
+    monkeypatch.setattr(MlxModelService, "available", lambda self: True)
     _make_model(tmp_path / "Qwen3-30B-A3B-8bit")
     _make_model(tmp_path / "Qwen3-Coder-30B-A3B-Instruct-8bit")
     with TestClient(create_app(Settings(models_dir=tmp_path))) as client:
