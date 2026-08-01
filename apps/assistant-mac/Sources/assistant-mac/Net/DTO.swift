@@ -34,9 +34,14 @@ struct ModelDTO: Decodable, Identifiable, Hashable {
     /// Weak at agentic tool calls (reasoning/thinking models) — rendered as ⚠️ in the picker so
     /// the user doesn't pick one for coding. Optional so an older backend without the field decodes.
     let weakAtTools: Bool?
+    /// Whether this model may appear in a CHAT picker (backend-computed, one definition shared
+    /// with the Telegram picker). Image / video / embedding / ASR models are listed on the
+    /// Models screen but are not chattable — picking one used to crash the turn at load time.
+    /// Optional so an older backend without the field decodes (nil = treat as chattable).
+    let chattable: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case id, type, loaded, source
+        case id, type, loaded, source, chattable
         case sizeBytes = "size_bytes"
         case weakAtTools = "weak_at_tools"
     }

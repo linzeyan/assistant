@@ -67,3 +67,29 @@ def test_models_list_flags_weak_at_tools(tmp_path, monkeypatch):
         models = {m["id"]: m for m in client.get("/models").json()["models"]}
     assert models["Qwen3-30B-A3B-8bit"]["weak_at_tools"] is True
     assert models["Qwen3-Coder-30B-A3B-Instruct-8bit"]["weak_at_tools"] is False
+
+
+def test_models_route_filters_unloadable_and_flags_chattable(tmp_path, monkeypatch):
+    # N103: /models must list only what an MLX engine can load, and each entry must carry the
+    # backend's own `chattable` verdict so the GUI picker and the Telegram picker filter from ONE
+    # definition instead of each keeping a type list that drifts (the GUI's let video in).
+    monkeypatch.setattr(MlxModelService, "available", lambda self: True)
+    _make_model(tmp_path / "chat-model")
+    # An ASR checkpoint: listed (Models screen shows it) but never selectable as a chat model.
+    asr = tmp_path / "Breeze-ASR-26-mlx"
+    asr.mkdir()
+    asr_cfg = {"model_type": "whisper", "architectures": ["WhisperForConditionalGeneration"]}
+    (asr / "config.json").write_text(json.dumps(asr_cfg))
+    (asr / "model.safetensors").write_bytes(b"\x00")
+    # A mid-training dump: no engine loads it, so it must not be listed at all.
+    trained = _make_model(tmp_path / "half-trained")
+    (trained / "optimizer.bin").write_bytes(b"\x00")
+
+    with TestClient(create_app(Settings(models_dir=tmp_path))) as client:
+        body = client.get("/models").json()
+    by_id = {m["id"]: m for m in body["models"]}
+
+    assert "half-trained" not in by_id  # unloadable -> not offered anywhere
+    assert by_id["chat-model"]["chattable"] is True
+    assert by_id["Breeze-ASR-26-mlx"]["type"] == "audio"
+    assert by_id["Breeze-ASR-26-mlx"]["chattable"] is False

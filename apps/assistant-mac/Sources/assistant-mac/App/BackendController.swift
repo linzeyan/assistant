@@ -18,6 +18,11 @@ final class BackendController: ObservableObject {
     }
     @Published var status: StatusDTO?
     @Published var models: [ModelDTO] = []
+
+    /// The subset of `models` usable as a chat model. The Models screen shows everything on
+    /// disk; the chat picker must offer only what can actually serve a turn, so image / video /
+    /// embedding / ASR checkpoints stay out of it. `chattable == nil` (older backend) fails open.
+    var chatModels: [ModelDTO] { models.filter { $0.chattable != false } }
     /// HTTP backend responds (we can talk to the server at all). Distinct from
     /// `modelBackendReady` — a backend with no model engine (e.g. mlx-lm not installed
     /// yet) is still *reachable*; conflating the two made a healthy server read as offline.
@@ -302,15 +307,19 @@ final class BackendController: ObservableObject {
             if let backendDefault = (try? await client.defaultModel())?.model, !backendDefault.isEmpty {
                 defaultModel = backendDefault
             }
-            if selectedModel == nil || !models.contains(where: { $0.id == selectedModel }) {
+            // Auto-selection walks chatModels, never the full catalogue: falling back to
+            // `models.first` could seat an image or ASR checkpoint as the chat model, which then
+            // fails at load time on the first turn.
+            let selectable = chatModels
+            if selectedModel == nil || !selectable.contains(where: { $0.id == selectedModel }) {
                 // Prefer the user's persisted default (if still present), then a loaded
                 // model, then the first listed.
                 let validDefault = defaultModel.flatMap { d in
-                    models.first(where: { $0.id == d })?.id
+                    selectable.first(where: { $0.id == d })?.id
                 }
                 selectedModel = validDefault
-                    ?? models.first(where: { $0.loaded })?.id
-                    ?? models.first?.id
+                    ?? selectable.first(where: { $0.loaded })?.id
+                    ?? selectable.first?.id
             }
             lastError = nil
         } catch is CancellationError {

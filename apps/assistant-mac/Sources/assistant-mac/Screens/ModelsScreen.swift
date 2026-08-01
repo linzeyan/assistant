@@ -13,26 +13,30 @@ struct ModelsScreen: View {
     // chevron (oMLX-style), which also matches the row's other affordances.
     @State private var expandedSettings: Set<String> = []
 
-    /// Models tab sub-filters by capability. "Chat" is the catch-all for anything loadable in
-    /// the Chat picker (llm/vlm + unknown types that fail-open to chat).
+    /// Models tab sub-filters by capability. "Chat" mirrors the Chat picker exactly (the
+    /// backend's `chattable` verdict); the other tabs are the non-chat kinds the backend
+    /// classifies — image / video / audio (ASR) / embedding.
     private enum ModelKindTab: String, CaseIterable, Identifiable {
-        case all = "All", chat = "Chat", image = "Image", video = "Video", embedding = "Embedding"
+        case all = "All", chat = "Chat", image = "Image", video = "Video"
+        case audio = "Audio", embedding = "Embedding"
         var id: String { rawValue }
     }
 
     private var filteredModels: [ModelDTO] {
-        controller.models.filter { matches(kindTab, $0.type) }
+        controller.models.filter { matches(kindTab, $0) }
     }
 
-    private func matches(_ tab: ModelKindTab, _ type: String?) -> Bool {
+    private func matches(_ tab: ModelKindTab, _ model: ModelDTO) -> Bool {
         switch tab {
         case .all: return true
-        case .image: return type == "image"
-        case .video: return type == "video"
-        case .embedding: return type == "embedding"
-        // Fail-open: nil/unknown types land under Chat (they're chat-loadable), matching
-        // isChatLoadable's "anything but embedding" philosophy.
-        case .chat: return !["image", "video", "embedding"].contains(type ?? "")
+        case .image: return model.type == "image"
+        case .video: return model.type == "video"
+        case .audio: return model.type == "audio"
+        case .embedding: return model.type == "embedding"
+        // The Chat tab is exactly what the Chat picker offers — the backend's own `chattable`
+        // verdict, not a locally-maintained type list that drifts from it (this tab used to say
+        // "anything but embedding", which let video and ASR checkpoints in).
+        case .chat: return isChatLoadable(model)
         }
     }
 
@@ -140,7 +144,7 @@ struct ModelsScreen: View {
                                     }
                                 }
                             }
-                            .disabled(!isChatLoadable(model.type) && !model.loaded)
+                            .disabled(!isChatLoadable(model) && !model.loaded)
                         }
                         // "Default" persists the model the Chat tab starts on, and switches
                         // the current session to it too. The reverse never happens: the Chat
@@ -149,10 +153,10 @@ struct ModelsScreen: View {
                         Button("Default") {
                             Task { await controller.setDefaultModel(model.id) }
                         }
-                        .disabled(!isChatLoadable(model.type) || model.id == controller.defaultModel)
+                        .disabled(!isChatLoadable(model) || model.id == controller.defaultModel)
                         // Expand the per-model generation settings (oMLX-style chevron). Chat
                         // models only — sampler settings don't apply to image/video/embedding.
-                        if isChatLoadable(model.type) {
+                        if isChatLoadable(model) {
                             Button {
                                 if expandedSettings.contains(model.id) {
                                     expandedSettings.remove(model.id)
@@ -176,7 +180,7 @@ struct ModelsScreen: View {
                             ? "Cached models are shared — remove with hf cache tools"
                             : "Delete this model from disk")
                     }
-                    if isChatLoadable(model.type) && expandedSettings.contains(model.id) {
+                    if isChatLoadable(model) && expandedSettings.contains(model.id) {
                         ModelSettingsView(modelID: model.id).padding(.top, 4)
                     }
                   }
@@ -208,9 +212,10 @@ struct ModelsScreen: View {
     /// Embedding / text-encoder models aren't generative, so Load/Use are disabled for
     /// them. Unknown types (e.g. an omlx model_type) are allowed — the backend stays the
     /// source of truth and reports any real error.
-    private func isChatLoadable(_ type: String?) -> Bool {
-        guard let type else { return true }
-        return type != "embedding"
+    /// Whether this model can be loaded as a chat model — the backend's verdict, shared with the
+    /// Chat picker and the Telegram picker. nil (older backend) fails open.
+    private func isChatLoadable(_ model: ModelDTO) -> Bool {
+        model.chattable != false
     }
 
     /// Kind + on-disk size, e.g. "llm · 31.7 GB". Provenance is appended only for cached
@@ -219,7 +224,7 @@ struct ModelsScreen: View {
     private func subtitle(_ model: ModelDTO) -> String {
         var parts: [String] = []
         if let type = model.type {
-            parts.append(isChatLoadable(type) ? type : "\(type) · not a chat model")
+            parts.append(isChatLoadable(model) ? type : "\(type) · not a chat model")
         }
         if let bytes = model.sizeBytes, bytes > 0 {
             parts.append(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))

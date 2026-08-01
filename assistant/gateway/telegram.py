@@ -18,10 +18,11 @@ import logging
 import re
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 from assistant.gateway.approval import TelegramApprover
-from assistant.model_traits import weak_at_tools
+from assistant.model_traits import CHATTABLE_KINDS, weak_at_tools
 
 try:
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -39,9 +40,11 @@ except ImportError:
 
 log = logging.getLogger("assistant.telegram")
 
-# Kinds usable as a chat model (mirror mlx_service._CHATTABLE_KINDS) — keeps pick_model
-# from auto-selecting a video / embedding model that can't serve a chat turn.
-_CHATTABLE_KINDS = ("llm", "vlm")
+# Kinds usable as a chat model — the shared definition in model_traits, not a local copy, so the
+# gateway picker can never drift from the GUI picker or the service's load gate (it used to
+# mirror mlx_service by hand). Keeps pick_model from auto-selecting a video / embedding / ASR
+# model that can't serve a chat turn.
+_CHATTABLE_KINDS = CHATTABLE_KINDS
 
 # The weak-at-tools heuristic lives in model_traits (shared with the /models API + GUI picker),
 # so the ⚠️ flag is identical everywhere. Aliased to the module-private name the picker uses.
@@ -298,6 +301,11 @@ class TelegramGateway:
         # the server default when unset.
         self._default_workspace = str(default_workspace) if default_workspace else None
         self._workspace: dict[int, str] = {}
+        # Per-chat CURRENT conversation id. A chat used to be pinned to one eternal session
+        # (`tg:<chat>`), so there was no way to start a fresh topic or go back to an earlier
+        # one from Telegram — /new and /sessions manage this pointer. The legacy id stays the
+        # default so existing chats keep their history.
+        self._session_ids: dict[int, str] = {}
         # Per-chat turn lock: with concurrent_updates(True) two quick messages would otherwise
         # run turns on the same session at once and race its history. See _run_turn.
         self._turn_locks: dict[int, asyncio.Lock] = {}
@@ -321,6 +329,8 @@ class TelegramGateway:
         app.add_handler(CommandHandler("whoami", self._on_whoami))
         app.add_handler(CommandHandler("stop", self._on_stop))
         app.add_handler(CommandHandler("models", self._on_models))
+        app.add_handler(CommandHandler("new", self._on_new))
+        app.add_handler(CommandHandler("sessions", self._on_sessions))
         app.add_handler(CommandHandler("cd", self._on_cd))
         app.add_handler(CommandHandler("download", self._on_download))
         app.add_handler(CommandHandler("video", self._on_video))
@@ -414,6 +424,8 @@ class TelegramGateway:
             f"📍 Now: model <b>{m}</b> · dir <code>{d}</code>\n\n"
             "<b>💬 Chat</b>\n"
             "Just send a message. Send a 🎤 voice note to get a spoken reply.\n"
+            "/new — start a fresh conversation (the current one is kept)\n"
+            "/sessions — list this chat’s saved conversations and switch back to one\n"
             "/models — switch the chat model (⚠️ = weak at tool calls; pick a *-Coder for "
             "coding/agent tasks)\n"
             "/download — fetch a model from HuggingFace, e.g. <code>/download "
@@ -928,6 +940,71 @@ class TelegramGateway:
         self._workspace[chat_id] = str(path.resolve())
         await update.message.reply_text(f"📂 Working directory set to {self._workspace[chat_id]}")
 
+    # --- conversations (per-chat sessions) ---
+
+    def _session_id(self, chat_id: int) -> str:
+        # Legacy default: a chat that never used /new keeps its original `tg:<chat>` session,
+        # so upgrading the backend doesn't orphan an ongoing conversation.
+        return self._session_ids.get(chat_id) or f"tg:{chat_id}"
+
+    def _owns_session(self, chat_id: int, session_id: str) -> bool:
+        # Exact legacy id, or a `tg:<chat>:<uuid>` conversation started with /new. Matching the
+        # trailing ":" matters — without it chat 12 would claim chat 123's conversations.
+        return session_id == f"tg:{chat_id}" or session_id.startswith(f"tg:{chat_id}:")
+
+    def _chat_sessions(self, chat_id: int) -> list[dict]:
+        """This chat's conversations, most-recently-used first (SessionStore's own order)."""
+        return [
+            s for s in self._sessions.list_sessions() if self._owns_session(chat_id, s["id"])
+        ]
+
+    async def _on_new(self, update: "Update", context) -> None:
+        if not await self._ensure_allowed(update):
+            return
+        chat_id = update.effective_chat.id
+        # Point at a fresh id without materialising a Session: an empty conversation would
+        # otherwise clutter /sessions if the user never sends anything. The first turn creates it.
+        self._session_ids[chat_id] = f"tg:{chat_id}:{uuid.uuid4().hex[:8]}"
+        await update.message.reply_text(
+            "🆕 Started a new conversation. The earlier one is kept — /sessions to go back."
+        )
+
+    async def _on_sessions(self, update: "Update", context) -> None:
+        if not await self._ensure_allowed(update):
+            return
+        chat_id = update.effective_chat.id
+        sessions = self._chat_sessions(chat_id)
+        if not sessions:
+            await update.message.reply_text(
+                "No saved conversations yet — send a message to start one."
+            )
+            return
+        current = self._session_id(chat_id)
+        # Same index-keyed callback_data trick as /models: session ids blow past the 64-byte cap.
+        rows = [
+            [InlineKeyboardButton(
+                f"{'● ' if s['id'] == current else '○ '}{s['title'] or 'Untitled'}"[:60],
+                callback_data=f"sess:{i}")]
+            for i, s in enumerate(sessions[:10])  # newest 10: a keyboard must stay tappable
+        ]
+        note = "Pick a conversation to continue:"
+        if len(sessions) > 10:
+            note += f"\n(showing the 10 most recent of {len(sessions)})"
+        await update.message.reply_text(note, reply_markup=InlineKeyboardMarkup(rows))
+
+    async def _apply_session_choice(self, query) -> None:
+        _, _, idx = (query.data or "").partition(":")
+        chat_id = query.message.chat.id
+        sessions = self._chat_sessions(chat_id)
+        try:
+            chosen = sessions[int(idx)]
+        except (ValueError, IndexError):
+            await query.edit_message_text("That conversation is no longer available.")
+            return
+        self._session_ids[chat_id] = chosen["id"]
+        with contextlib.suppress(Exception):
+            await query.edit_message_text(f"💬 Continuing “{chosen['title'] or 'Untitled'}”")
+
     def _chat_lock(self, chat_id: int) -> asyncio.Lock:
         lock = self._turn_locks.get(chat_id)
         if lock is None:
@@ -948,7 +1025,7 @@ class TelegramGateway:
                 await update.message.reply_text("No model is available. Load one first.")
                 return
 
-            session = self._sessions.get_or_create(f"tg:{chat_id}", model=model)
+            session = self._sessions.get_or_create(self._session_id(chat_id), model=model)
             placeholder = await update.message.reply_text("…")
             editor = _StreamEditor(context.bot, chat_id, placeholder.message_id)
             approver = TelegramApprover(
@@ -983,6 +1060,11 @@ class TelegramGateway:
                 return
             finally:
                 self._active_turns.pop(chat_id, None)
+                # Persist the conversation like the HTTP path does after every turn — without
+                # this a Telegram chat lived only in memory and a backend restart silently
+                # dropped its whole history. In `finally` so a /stop-cancelled or failed turn
+                # still keeps what was said; checkpoint is atomic and best-effort.
+                self._sessions.checkpoint(session)
             if voice_reply:
                 await self._send_voice_reply(
                     context.bot, chat_id, "".join(answer_parts).strip()
@@ -1067,6 +1149,9 @@ class TelegramGateway:
         data = query.data or ""
         if data.startswith("model:"):  # a /models picker tap, not an approval
             await self._apply_model_choice(query)
+            return
+        if data.startswith("sess:"):  # a /sessions picker tap
+            await self._apply_session_choice(query)
             return
         if data.startswith("vchk:"):  # a /video picker tap
             await self._apply_video_choice(query)

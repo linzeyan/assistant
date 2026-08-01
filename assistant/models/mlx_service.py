@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import logging
 import shutil
 import threading
 from dataclasses import replace
@@ -26,7 +27,9 @@ from pathlib import Path
 
 from assistant.agent.fusion import FUSION_MODEL_ID
 
-from .mlx_discovery import DiscoveredModel, discover_models
+from assistant.model_traits import CHATTABLE_KINDS
+
+from .mlx_discovery import DiscoveredModel, discover_models, is_mlx_loadable
 from .mlx_engine import MlxEnginePool, _estimate_model_bytes, _total_ram_bytes
 from .service import ModelService
 from .status import BackendState, BackendStatus
@@ -39,6 +42,8 @@ from .tool_parsing import (
     parse_tool_calls,
 )
 from .types import ModelInfo
+
+log = logging.getLogger(__name__)
 
 # Fraction of physical RAM the pool may commit to model weights before refusing a load. The slack
 # leaves room for the OS, the KV cache and activations (which the on-disk estimate omits).
@@ -195,10 +200,9 @@ class MlxModelService(ModelService):
                 entry = replace(entry, kind=override)
         return entry
 
-    # Kinds usable as a chat model: text LLMs (mlx-lm) and vision-language / omni
-    # checkpoints (mlx-vlm, text-only chat). Embeddings / cached diffusion text-encoders
-    # aren't generative, so they'd crash the loader — refuse them with a clear message.
-    _CHATTABLE_KINDS = frozenset({"llm", "vlm"})
+    # Kinds usable as a chat model — the shared definition (model_traits.CHATTABLE_KINDS), so the
+    # load gate, the GUI picker and the Telegram picker can never drift apart.
+    _CHATTABLE_KINDS = CHATTABLE_KINDS
 
     @classmethod
     def _require_chat_model(cls, entry: DiscoveredModel) -> None:
@@ -219,12 +223,25 @@ class MlxModelService(ModelService):
             ov = self._per_model.kind_override(m.id) if self._per_model is not None else None
             return ov or m.kind
 
+        # Only checkpoints an MLX engine can actually load are offered. The catalog itself keeps
+        # every discovered dir (so delete-by-id still reaches a phantom entry); this filter is
+        # about what the pickers are allowed to show — selecting an unloadable model is the
+        # crash N27/N32 documented.
+        listable = [m for m in self._catalog.values() if is_mlx_loadable(m)]
+        skipped = [m.id for m in self._catalog.values() if not is_mlx_loadable(m)]
+        if skipped:
+            # Loud, not silent: a model vanishing from the list must be explainable without
+            # reading this code (these dirs still occupy disk and are still deletable by id).
+            log.info(
+                "skipping %d non-MLX-loadable model dir(s): %s",
+                len(skipped), ", ".join(sorted(skipped)),
+            )
         models = [
             ModelInfo(
                 id=m.id, type=_eff_kind(m), loaded=m.id in loaded,
                 source=m.source, size_bytes=m.size_bytes,
             )
-            for m in self._catalog.values()
+            for m in listable
         ]
         # Surface Fusion as a selectable virtual model (panel+judge) when configured.
         if self._fusion is not None and self._fusion.enabled:

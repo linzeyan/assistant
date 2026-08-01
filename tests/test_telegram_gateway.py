@@ -1030,3 +1030,44 @@ def test_download_progress_line_without_size_shows_bytes_only():
         "downloaded_bytes": 5_000_000, "eta_seconds": None, "error": None,
     })
     assert "█" not in line and "MB" in line
+
+
+# --- conversations: /new + /sessions (N103) ---
+
+
+def test_session_id_defaults_to_legacy_per_chat_id():
+    # A chat that never used /new must keep its original `tg:<chat>` session — upgrading the
+    # backend can't orphan an ongoing conversation.
+    gw = _gateway()
+    assert gw._session_id(42) == "tg:42"
+
+
+def test_new_conversation_switches_id_without_losing_the_old_one():
+    gw = _gateway()
+    first = gw._session_id(42)
+    gw._session_ids[42] = "tg:42:abc12345"  # what _on_new installs
+    assert gw._session_id(42) != first
+    # Both ids still belong to this chat, so /sessions can offer the earlier one back.
+    assert gw._owns_session(42, first) and gw._owns_session(42, "tg:42:abc12345")
+
+
+def test_owns_session_does_not_leak_between_chats():
+    # The trailing ":" matters: without it chat 4 would claim chat 42's conversations.
+    gw = _gateway()
+    assert gw._owns_session(4, "tg:4") and gw._owns_session(4, "tg:4:xyz")
+    assert not gw._owns_session(4, "tg:42")
+    assert not gw._owns_session(4, "tg:42:xyz")
+    assert not gw._owns_session(4, "gui-session-id")
+
+
+def test_chat_sessions_lists_only_this_chats_conversations(tmp_path):
+    from assistant.agent.session import SessionStore
+
+    store = SessionStore(tmp_path)
+    for sid in ("tg:7", "tg:7:aaa", "tg:70:bbb", "desktop-1"):
+        s = store.get_or_create(sid, model="m")
+        s.add_user("hi")
+        store.checkpoint(s)
+    gw = _gateway()
+    gw._sessions = store
+    assert {s["id"] for s in gw._chat_sessions(7)} == {"tg:7", "tg:7:aaa"}

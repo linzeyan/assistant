@@ -100,6 +100,11 @@ _ENCODER_TYPES = {
 # Diffusion video model_type tags (Wan family: sound/text/image-to-video). These are
 # generative video, not chat — see classify_kind for why misclassifying them matters.
 _VIDEO_TYPES = {"s2v", "ti2v", "t2v", "i2v"}
+# Speech models (Whisper family / ASR fine-tunes such as Breeze-ASR). They declare a
+# `WhisperForConditionalGeneration` arch, so without this they fail open to "llm" and land in the
+# CHAT picker — where mlx-lm cannot load them at all (the same class of bug as the Wan video
+# models, N27). They belong to the audio backend (transcribe_audio), not the chat list.
+_AUDIO_TYPES = {"whisper", "wav2vec2", "hubert", "parakeet"}
 # Diffusion image-pipeline class/arch markers (FLUX, Qwen-Image via mflux). A diffusers
 # pipeline declares its class in model_index.json (_class_name "FluxPipeline" / "QwenImage…").
 _IMAGE_CLASS_MARKERS = ("flux", "qwenimage", "qwen_image", "stablediffusion")
@@ -172,6 +177,10 @@ def classify_kind(d: Path) -> str:
     # /video picker's is_video_checkpoint filter excludes it too.
     if (d / "vae.safetensors").is_file():
         return "video"
+    # Speech/ASR before the vision + LLM rules: Whisper's arch ends in "…ForConditionalGeneration"
+    # and carries no vision_config, so it would otherwise fall straight through to "llm".
+    if mtype in _AUDIO_TYPES or any(t in arch for t in _AUDIO_TYPES):
+        return "audio"
     # Vision-language first: a VL config also carries a causal-LM head, so it would
     # otherwise read as a plain LLM. ``vision_config`` is the strongest signal.
     if (
@@ -227,6 +236,39 @@ def is_video_checkpoint(d: Path) -> bool:
     if not (d / "vae.safetensors").is_file() or not (d / "t5_encoder.safetensors").is_file():
         return False
     return (d / "model.safetensors").is_file() or (d / "low_noise_model.safetensors").is_file()
+
+
+# Artifacts only a *training* checkpoint carries. A dir holding these is a mid-training dump
+# (observed: Breeze-ASR-25 ships optimizer.bin + scheduler.bin + a raw .pt beside the weights),
+# not a distributable model — no MLX engine loads one.
+_TRAINING_ARTIFACTS = {"optimizer.bin", "scheduler.bin", "trainer_state.json", "rng_state.pth"}
+
+
+def is_mlx_loadable(model: DiscoveredModel) -> bool:
+    """True if some MLX engine can actually load this checkpoint.
+
+    Discovery is deliberately permissive (any dir with a config + weights) so nothing on disk is
+    invisible, but a model that no engine can load is a phantom entry in the picker: selecting it
+    fails at load time, which is exactly the failure N27/N32 produced. The checks are structural,
+    never name-based — an ``mlx-community/`` prefix is not evidence, and a plain HuggingFace repo
+    that mlx-lm loads fine must not be excluded for lacking one:
+
+    * training checkpoints (optimizer/scheduler state) — not a distributable model;
+    * video dirs that aren't converted-MLX layout — ``is_video_checkpoint`` already gates the
+      /video picker on this; the same dirs shouldn't appear as models either (raw HF Wan
+      downloads, and chat-arch checkpoints carrying a diffusion VAE such as Lance-3B-Video,
+      which loads in neither engine);
+    * anything with no safetensors at all — every MLX loader reads safetensors.
+    """
+    names = set()
+    for f in model.path.rglob("*"):
+        if f.is_file():
+            names.add(f.name)
+    if names & _TRAINING_ARTIFACTS:
+        return False
+    if model.kind == "video" and not is_video_checkpoint(model.path):
+        return False
+    return any(n.endswith(".safetensors") for n in names)
 
 
 def discover_video_checkpoints(dirs: list[Path]) -> list[DiscoveredModel]:

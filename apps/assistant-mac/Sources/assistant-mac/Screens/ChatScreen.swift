@@ -44,10 +44,12 @@ struct ChatScreen: View {
                 get: { controller.selectedModel ?? "" },
                 set: { controller.selectedModel = $0 }
             )) {
-                if controller.models.isEmpty {
+                if controller.chatModels.isEmpty {
                     Text("no models").tag("")
                 }
-                ForEach(controller.models) { model in
+                // chatModels, not models: image / video / embedding / ASR checkpoints are
+                // listed on the Models screen but can't serve a chat turn.
+                ForEach(controller.chatModels) { model in
                     // ⚠️ marks models weak at tool calls (parity with the Telegram /models picker),
                     // so the user doesn't pick a thinking model for coding.
                     Text(model.weakAtTools == true ? "⚠️ \(model.id)" : model.id).tag(model.id)

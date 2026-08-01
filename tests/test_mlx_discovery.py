@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 
 from assistant.models.mlx_discovery import (
+    DiscoveredModel,
     classify_kind,
+    is_mlx_loadable,
     discover_hf_cache,
     discover_image_checkpoints,
     discover_local,
@@ -290,3 +292,56 @@ def test_discover_video_checkpoints_dedupes_across_dirs(tmp_path):
     _make_video_ckpt(tmp_path / "b" / "Wan-mlx")  # same id in a second dir
     found = discover_video_checkpoints([tmp_path / "a", tmp_path / "b"])
     assert [m.id for m in found] == ["Wan-mlx"]  # first dir wins, no duplicate
+
+
+def test_classify_kind_whisper_is_audio_not_chat(tmp_path):
+    # N103: Breeze-ASR ships `WhisperForConditionalGeneration` with no vision_config, so it used
+    # to fail open to "llm" and appear in the CHAT picker — where mlx-lm cannot load it at all
+    # (the Wan-video bug of N27, in a different family). It belongs to the audio backend.
+    d = tmp_path / "Breeze-ASR-26-mlx"
+    d.mkdir()
+    (d / "config.json").write_text(
+        json.dumps({"model_type": "whisper", "architectures": ["WhisperForConditionalGeneration"]})
+    )
+    (d / "model.safetensors").write_bytes(b"\x00")
+    assert classify_kind(d) == "audio"
+
+
+def _discovered(path, kind="llm"):
+    return DiscoveredModel(id=path.name, path=path, source="local", kind=kind, size_bytes=1)
+
+
+def test_is_mlx_loadable_rejects_training_checkpoint(tmp_path):
+    # A mid-training dump (observed: Breeze-ASR-25 carries optimizer.bin + scheduler.bin beside
+    # real weights) is not a distributable model — no engine loads one, so it must not be listed.
+    d = _make_model(tmp_path / "half-trained")
+    (d / "optimizer.bin").write_bytes(b"\x00")
+    assert is_mlx_loadable(_discovered(d)) is False
+
+
+def test_is_mlx_loadable_rejects_unconvertible_video_dir(tmp_path):
+    # Raw HF Wan downloads and chat-arch checkpoints carrying a diffusion VAE (Lance-3B-Video,
+    # N32) load in NEITHER engine: mlx-video needs the converted layout, mlx-lm/vlm choke on the
+    # weights. Listing them is the phantom-model failure this filter exists to stop.
+    raw = tmp_path / "Wan2.2-TI2V-5B"
+    raw.mkdir()
+    (raw / "config.json").write_text(json.dumps({"model_type": "ti2v"}))
+    (raw / "diffusion_pytorch_model-00001-of-00003.safetensors").write_bytes(b"\x00")
+    assert is_mlx_loadable(_discovered(raw, kind="video")) is False
+
+
+def test_is_mlx_loadable_keeps_plain_and_converted_models(tmp_path):
+    # Structural, never name-based: a plain HuggingFace-named repo that mlx-lm loads fine must
+    # stay listed — an "mlx-community/" prefix is not what makes a model loadable.
+    plain = _make_model(tmp_path / "some-org--Qwen3-8B")
+    assert is_mlx_loadable(_discovered(plain)) is True
+    converted = _make_video_ckpt(tmp_path / "Wan2.2-TI2V-5B-mlx")
+    assert is_mlx_loadable(_discovered(converted, kind="video")) is True
+
+
+def test_is_mlx_loadable_rejects_pytorch_only_weights(tmp_path):
+    d = tmp_path / "torch-only"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"architectures": ["LlamaForCausalLM"]}))
+    (d / "pytorch_model.bin").write_bytes(b"\x00")  # every MLX loader reads safetensors
+    assert is_mlx_loadable(_discovered(d)) is False

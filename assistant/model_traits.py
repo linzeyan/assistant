@@ -21,3 +21,24 @@ def weak_at_tools(model_id: str) -> bool:
     """True for models that tend to narrate tool use instead of actually calling tools."""
     low = model_id.lower()
     return any(m in low for m in WEAK_TOOL_MARKERS)
+
+
+# Kinds a model must have to serve as a CHAT model: text LLMs (mlx-lm) and vision-language /
+# omni checkpoints (mlx-vlm, text-only chat). Everything else — diffusion image/video pipelines,
+# embedding encoders, Whisper ASR — is either not generative or not conversational, and picking
+# one dies at load time (N27: a Wan video model in the chat picker crashed every turn with "No
+# safetensors"). This is the ONE definition: the GUI picker, the Telegram /models picker and the
+# service's load gate all read it instead of each keeping their own list.
+CHATTABLE_KINDS = frozenset({"llm", "vlm"})
+
+
+def chattable(kind: str | None) -> bool:
+    """Whether a model of this kind can be used as a chat model.
+
+    Fail-open on an unknown/absent kind: classification itself fails open to "llm" (an
+    unrecognised architecture is assumed chattable rather than hidden), and a backend that
+    reports no type at all must not have its whole catalogue filtered away.
+    """
+    if not kind:
+        return True
+    return kind in CHATTABLE_KINDS
