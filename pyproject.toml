@@ -5,6 +5,12 @@ description = "Local-first AI assistant backend for macOS Apple Silicon (omlx mo
 requires-python = ">=3.11"
 # Upper bounds are deliberate: hermes-agent's litellm supply-chain incident is the
 # cautionary tale for unbounded deps. Pin majors, bump intentionally.
+#
+# These bounds are the ONLY thing standing between an upstream release and a user's
+# machine: every install path (`make install`, the .app's bootstrap.sh, the in-app managed
+# -tools installer) resolves fresh against them. uv.lock is NOT an install input — nothing
+# reads it. It exists so Dependabot / GitHub's dependency graph can see the ~160 transitive
+# packages that pyproject alone doesn't name, and `make deps-check` keeps it honest.
 dependencies = [
     "fastapi>=0.115,<1.0",
     "uvicorn[standard]>=0.30,<1.0",

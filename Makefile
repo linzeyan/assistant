@@ -16,9 +16,11 @@ PY      := $(VENV)/bin/python
 APP_DIR := apps/assistant-mac
 DIST    := dist
 APP     := Assistant
+# Interpreter the shipped .app resolves against — keep in sync with bootstrap.sh's default.
+PYVER   := 3.12
 
 .DEFAULT_GOAL := help
-.PHONY: help install setup setup-mlx setup-images setup-embeddings setup-vlm setup-audio setup-video test run backend app-build app-test app-run app-package app-notarize omlx clean
+.PHONY: help install setup setup-mlx setup-images setup-embeddings setup-vlm setup-audio setup-video test lock-check deps-check run backend app-build app-test app-run app-package app-notarize omlx clean
 
 help:  ## show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -58,6 +60,26 @@ setup-video:  ## dev + mlx-video (text-to-video: Wan / LTX)
 
 test:  ## run the python test suite (mocks omlx; no install required)
 	$(PY) -m pytest -q
+
+lock-check:  ## fail if uv.lock has drifted from pyproject (the lock is not an install input)
+	$(UV) lock --check
+
+# What users actually run is `uv pip install assistant.whl[all]` (bootstrap.sh) — a FRESH
+# resolve on their machine, not an install of uv.lock. So the thing worth gating in CI is
+# "does that resolve still work", not "is the lock reproducible": the deploy breakages we
+# hit (N16 hub 2.0, N33 numba backtracking to an unbuildable llvmlite) were both invisible
+# to `make setup`, which only installs [dev]. Resolve into a throwaway venv so nothing
+# already installed can satisfy a constraint and hide the conflict.
+#
+# PYVER is a knob because Settings > Backend runtime is a free-text field: anything from
+# requires-python's floor upwards is a shape a user can actually run. CI sweeps that range.
+deps-check: lock-check  ## verify the shipped [all] install still resolves (override PYVER=3.13)
+	$(UV) build --wheel --out-dir $(DIST)
+	rm -rf $(DIST)/.deps-venv
+	$(UV) venv --python $(PYVER) $(DIST)/.deps-venv
+	$(UV) pip install --python $(DIST)/.deps-venv/bin/python --dry-run \
+	  "$$(ls -t $(DIST)/assistant-*.whl | head -1)[all]"
+	rm -rf $(DIST)/.deps-venv
 
 run:  ## start the backend (native MLX by default; degrades gracefully if absent)
 	$(VENV)/bin/assistant-server

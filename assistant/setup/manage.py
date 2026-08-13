@@ -27,14 +27,25 @@ from assistant.config import XDG_CONFIG_DIR, Settings
 from assistant.models.mlx_discovery import discover_models
 
 # Managed optional tools, mirroring pyproject's extras. `module` is import-probed;
-# `package` is what pip installs.
+# `package` is the distribution name (version lookups, and the PyPI install target).
+# Optional `spec` overrides that target for a tool PyPI can't serve under its own name.
 FEATURES: dict[str, dict[str, str]] = {
     "mlx": {"package": "mlx-lm", "module": "mlx_lm", "label": "LLM inference (mlx-lm)"},
     "images": {"package": "mflux", "module": "mflux", "label": "Image generation (mflux)"},
     "embeddings": {"package": "mlx-embeddings", "module": "mlx_embeddings", "label": "Semantic memory (mlx-embeddings)"},
     "vlm": {"package": "mlx-vlm", "module": "mlx_vlm", "label": "Read images (mlx-vlm)"},
     "audio": {"package": "mlx-audio", "module": "mlx_audio", "label": "Speech STT / TTS (mlx-audio)"},
-    "video": {"package": "mlx-video", "module": "mlx_video", "label": "Video generation (mlx-video)"},
+    "video": {
+        "package": "mlx-video",
+        "module": "mlx_video",
+        "label": "Video generation (mlx-video)",
+        # PyPI's `mlx-video` is an UNRELATED I/O library — installing it by name gives the
+        # user a working install of the wrong package. The generation lib is Blaizzy's,
+        # git-only; same pin as pyproject's [video] extra. Declaring it as a built-in source
+        # also keeps this feature off the PyPI-latest path, where the impostor's version
+        # numbers would drive a meaningless "update available" badge.
+        "spec": "git+https://github.com/Blaizzy/mlx-video.git",
+    },
 }
 
 
@@ -93,15 +104,23 @@ def _pypi_latest(package: str, *, now: float) -> str | None:
     return latest
 
 
+def install_source(feature: str, sources: dict[str, str] | None = None) -> str | None:
+    """The pip spec `feature` installs from, or None when it's a plain PyPI package.
+
+    A user's ``managed_tool_sources`` entry beats the built-in ``spec`` so config stays the
+    final word (e.g. pinning a fork of a git-only tool)."""
+    return (sources or {}).get(feature) or FEATURES[feature].get("spec")
+
+
 def _queryable_tools(settings: Settings) -> list[tuple[str, str]]:
-    """(package, module) for tools whose PyPI latest is worth checking: installed and not
-    source-overridden. Shared by the networked fetch and the non-networked cache reads so
-    all three agree on exactly which tools participate."""
+    """(package, module) for tools whose PyPI latest is worth checking: installed and
+    installed from PyPI under their own name. Shared by the networked fetch and the
+    non-networked cache reads so all three agree on exactly which tools participate."""
     sources = settings.managed_tool_sources or {}
     return [
         (meta["package"], meta["module"])
         for key, meta in FEATURES.items()
-        if key not in sources and _installed(meta["module"])
+        if install_source(key, sources) is None and _installed(meta["module"])
     ]
 
 
@@ -156,7 +175,7 @@ def check_tools(
         package = meta["package"]
         installed = _installed(meta["module"])
         version = _installed_version(package) if installed else None
-        source = sources.get(key)
+        source = install_source(key, sources)
         if source:
             # A patched/git source has no PyPI version to compare — offer a refresh
             # whenever the tool is present so the user can re-pull the latest build (N5/N11).
@@ -266,10 +285,12 @@ def install_command(
     ``ensurepip`` first, because uv-created venvs ship without pip.
 
     ``source`` overrides the install target with a pip spec (e.g. a patched mlx-lm git
-    build that supports newer model architectures than the PyPI wheel — N11). For a source
-    upgrade we force a clean reinstall (the ref is often a moving branch/PR a plain
-    ``--upgrade`` would no-op); for a plain PyPI upgrade ``--upgrade`` climbs to latest.
+    build that supports newer model architectures than the PyPI wheel — N11), falling back
+    to the feature's built-in ``spec`` (git-only tools). For a source upgrade we force a
+    clean reinstall (the ref is often a moving branch/PR a plain ``--upgrade`` would no-op);
+    for a plain PyPI upgrade ``--upgrade`` climbs to latest.
     """
+    source = source or install_source(feature)
     target = source or FEATURES[feature]["package"]
     if upgrade and source:
         flags = ["--reinstall"] if uv else ["--force-reinstall"]

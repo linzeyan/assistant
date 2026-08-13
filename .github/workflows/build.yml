@@ -20,10 +20,33 @@ jobs:
       - name: Run tests
         run: make test
 
+  # Guards the two things `make setup` can't see: uv.lock silently rotting away from
+  # pyproject (it drifted generations before anyone noticed), and the user-facing
+  # `wheel[all]` resolve breaking on an upstream release.
+  #
+  # The matrix spans requires-python's floor to the newest interpreter it admits, because
+  # Settings > Backend runtime takes a free-text version — every one of these is a venv a
+  # user can actually ask bootstrap.sh for. If the top of the range goes red, the fix is
+  # either the offending dep or an upper bound on requires-python; it is not "ignore it".
+  deps:
+    name: Dependency resolution (py${{ matrix.python }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false # one bad interpreter shouldn't hide the state of the others
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Check lock + resolve the shipped [all] install
+        run: make deps-check PYVER=${{ matrix.python }}
+
   package:
     name: Package macOS app
     runs-on: macos-14
-    needs: test
+    # A broken user-facing resolve must not produce a release artifact.
+    needs: [test, deps]
     permissions:
       contents: write # needed by the release step on tag pushes
     env:

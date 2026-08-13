@@ -9,6 +9,7 @@ from assistant.setup.manage import (
     check_tools,
     find_uv,
     install_command,
+    install_source,
     perform_install,
     preflight,
 )
@@ -81,6 +82,26 @@ def test_check_tools_surfaces_source_and_new_keys():
         assert {"version", "latest", "source", "update_available"} <= t.keys()
 
 
+def test_video_installs_from_git_not_pypi():
+    # PyPI's `mlx-video` is an unrelated I/O lib: installing by name silently gives the user
+    # the wrong package (the cause of the "video generation does nothing" class of bug). The
+    # feature must always target Blaizzy's git repo, and update by re-pulling it.
+    spec = FEATURES["video"]["spec"]
+    assert spec.startswith("git+https://github.com/Blaizzy/mlx-video")
+    cmd = install_command("video", uv="/opt/homebrew/bin/uv")
+    assert cmd[-1] == spec and "mlx-video" not in cmd[:-1]
+    update = install_command("video", uv="/opt/homebrew/bin/uv", upgrade=True)
+    assert "--reinstall" in update and "--upgrade" not in update
+
+
+def test_config_source_beats_builtin_spec():
+    # A user pinning their own fork in managed_tool_sources must still win over the built-in.
+    fork = "git+https://github.com/me/mlx-video.git@wip"
+    assert install_source("video", {"video": fork}) == fork
+    assert install_command("video", uv=None, source=fork)[-1] == fork
+    assert install_source("images") is None  # plain PyPI tools stay unsourced
+
+
 def test_check_tools_update_available_needs_newer_pypi():
     # Pretend the embeddings package has a sky-high latest; update only fires when the
     # tool is actually installed (and strictly older). Uninstalled → never an update.
@@ -121,11 +142,14 @@ def test_latest_versions_fresh_tracks_ttl(monkeypatch):
     monkeypatch.setattr(manage, "_installed", lambda _m: True)
     settings = Settings()
     now = 1_000_000.0
-    for meta in FEATURES.values():
-        manage._pypi_cache[meta["package"]] = ("9.9.9", now)
-    assert manage.cached_latest_versions(settings) == {
-        meta["package"]: "9.9.9" for meta in FEATURES.values()
+    # Git-only tools (video) never participate: PyPI has no version to compare against.
+    pypi = {
+        meta["package"] for key, meta in FEATURES.items() if install_source(key) is None
     }
+    assert pypi and "mlx-video" not in pypi
+    for package in pypi:
+        manage._pypi_cache[package] = ("9.9.9", now)
+    assert manage.cached_latest_versions(settings) == {p: "9.9.9" for p in pypi}
     assert manage.latest_versions_fresh(settings, now=now + 1) is True
     assert manage.latest_versions_fresh(settings, now=now + manage._PYPI_TTL + 1) is False
 
