@@ -90,4 +90,7 @@ class OmlxModelService(ModelService):
     def stream_chat(
         self, messages: list[dict], model: str, tools: list[dict] | None = None, **params
     ) -> AsyncIterator[dict]:
+        # Native-backend routing flag — omlx batches concurrent requests server-side already,
+        # and an unknown field must not leak into its HTTP request body.
+        params.pop("concurrent", None)
         return self._client.stream_chat(messages, model, tools=tools, **params)

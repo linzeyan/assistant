@@ -159,10 +159,13 @@ class AgentLoop:
         # turn without changing the global default. Falls back to the configured default; a non-
         # positive value is ignored so callers can't disable the backstop entirely.
         iters = max_iters if (max_iters and max_iters > 0) else self._max_iters
-        # Per-run working directory: workspace is per-conversation, so the Telegram gateway
-        # passes the chat's chosen dir here. A copy (not a mutation of the shared ctx) keeps
-        # concurrent turns isolated and leaves the desktop/HTTP default untouched.
-        ctx = self._ctx if cwd is None else replace(self._ctx, cwd=Path(cwd))
+        # Per-run context copy (never a mutation of the shared ctx, so concurrent turns stay
+        # isolated): the turn's model rides it — a tool that spawns model work (spawn_subagents)
+        # must target the conversation's own model — and Telegram's per-chat cwd overrides the
+        # desktop/HTTP default.
+        ctx = replace(self._ctx, model=model)
+        if cwd is not None:
+            ctx = replace(ctx, cwd=Path(cwd))
         # Prefix stability (S2+S3): the system prompt is STABLE (base + skills index only)
         # and is reinstalled only when its fingerprint changes, so the cacheable prefix
         # stays byte-identical turn-to-turn. Per-turn memory is kept OUT of it and instead

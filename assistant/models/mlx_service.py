@@ -89,6 +89,7 @@ class MlxModelService(ModelService):
         *,
         models_dir: Path,
         max_loaded: int = 1,
+        max_concurrent: int = 8,
         mem_ceiling_gb: float | None = None,
         include_hf_cache: bool = False,
         extra_model_dirs: list[Path] | None = None,
@@ -110,6 +111,10 @@ class MlxModelService(ModelService):
             _ram = _total_ram_bytes()
             mem_ceiling_bytes = int(_ram * _RAM_HEADROOM) if _ram else None
         self._pool = pool or MlxEnginePool(max_loaded=max_loaded, mem_ceiling_bytes=mem_ceiling_bytes)
+        # Cap for the concurrent lane (mlx_batch): how many /v1/messages requests may decode
+        # together on one model. Each concurrent stream holds its own KV cache in unified
+        # memory, so this is a memory knob as much as a throughput one; 0 disables the lane.
+        self._max_concurrent = max_concurrent
         # Optional per-model generation overrides (PerModelStore). Merged into stream params so
         # each model's saved temperature/top_p/top_k/max_tokens apply automatically at chat time.
         self._per_model = per_model
@@ -344,6 +349,10 @@ class MlxModelService(ModelService):
             for t in (tools or [])
             if isinstance(t.get("function"), dict) and t["function"].get("name")
         }
+        # Routing flag, not a generation param: /v1/messages sets it so batchable engines can
+        # decode several requests at once (Claude Code subagent fan-out). Popped here so it
+        # never reaches an engine's stream_text.
+        concurrent = bool(params.pop("concurrent", False))
         # The model's saved overrides win over the caller's defaults (e.g. a per-model
         # max_tokens overrides the loop's global cap; temperature/top_p/top_k are added).
         if self._per_model is not None:
@@ -357,7 +366,7 @@ class MlxModelService(ModelService):
                     **(params.get("chat_template_kwargs") or {}),
                     **stored_tpl,
                 }
-        return self._stream(messages, model, tools, known, **params)
+        return self._stream(messages, model, tools, known, concurrent=concurrent, **params)
 
     async def _stream(
         self,
@@ -365,6 +374,7 @@ class MlxModelService(ModelService):
         model: str,
         tools: list[dict] | None,
         known_names: set[str],
+        concurrent: bool = False,
         **params,
     ) -> AsyncIterator[dict]:
         entry = await self._entry_for(model)
@@ -390,27 +400,44 @@ class MlxModelService(ModelService):
         # Claude Code can track how full the context is. Empty for engines that don't count (VLM).
         usage: dict = {}
 
-        # Bind the engine as a default arg (the worker's own reference) and then drop
-        # both `engine` and `worker` from this async generator's frame. Otherwise the
-        # frame keeps the engine alive for the generator's whole lifetime — so a later
-        # pool.unload() pops _loaded yet gc can't reclaim the model, and its unified
-        # memory is never returned (the "Unload doesn't free memory" bug). The executor
-        # holds its own reference only until the worker finishes.
-        def worker(eng: object = engine) -> None:
-            try:
-                for text in eng.stream_text(
-                    messages, tools=tools, usage_out=usage, **params
-                ):
-                    if stop.is_set():
-                        break
-                    loop.call_soon_threadsafe(queue.put_nowait, ("token", text))
-            except Exception as exc:  # surfaced to the consumer below
-                loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, ("end", None))
+        # Concurrent lane (mlx_batch): /v1/messages requests on a batchable engine decode
+        # together in one batched step loop on the model's thread. Everything else — GUI /
+        # Telegram turns, VLM engines, non-batchable cache layouts, mlx-lm too old — takes
+        # the serial worker below. The lane speaks the same queue protocol, so the consumer
+        # state machine after this block is shared.
+        lane = None
+        if concurrent:
+            from .mlx_batch import lane_for
 
-        fut = loop.run_in_executor(executor, worker)  # None → default pool (fake-pool tests)
-        del engine, worker
+            lane = lane_for(engine, self._max_concurrent)
+        if lane is not None:
+            lane.start(loop, queue, stop, usage, executor, messages, tools=tools, **params)
+            # No per-request future: the burst outlives this request, and awaiting it in the
+            # finally below would pin a cancelled request until the whole batch drains.
+            fut = None
+            del engine, lane
+        else:
+            # Bind the engine as a default arg (the worker's own reference) and then drop
+            # both `engine` and `worker` from this async generator's frame. Otherwise the
+            # frame keeps the engine alive for the generator's whole lifetime — so a later
+            # pool.unload() pops _loaded yet gc can't reclaim the model, and its unified
+            # memory is never returned (the "Unload doesn't free memory" bug). The executor
+            # holds its own reference only until the worker finishes.
+            def worker(eng: object = engine) -> None:
+                try:
+                    for text in eng.stream_text(
+                        messages, tools=tools, usage_out=usage, **params
+                    ):
+                        if stop.is_set():
+                            break
+                        loop.call_soon_threadsafe(queue.put_nowait, ("token", text))
+                except Exception as exc:  # surfaced to the consumer below
+                    loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
+                finally:
+                    loop.call_soon_threadsafe(queue.put_nowait, ("end", None))
+
+            fut = loop.run_in_executor(executor, worker)  # None → default pool (fake-pool tests)
+            del engine, lane, worker
         # Streaming state machine: forward prose token-by-token, but suppress any
         # tool-call markup so it never reaches the user — it's re-emitted as a
         # structured tool_calls event once the turn completes. A response that opens
@@ -504,4 +531,5 @@ class MlxModelService(ModelService):
                 yield {"type": "usage", **usage}
         finally:
             stop.set()  # even if the await below is itself cancelled, the thread exits
-            await fut
+            if fut is not None:  # serial worker only; a lane burst cleans up its own riders
+                await fut

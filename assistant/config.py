@@ -94,6 +94,11 @@ class Settings(BaseSettings):
     # be determined.
     max_loaded_models: int = 0
     mem_ceiling_gb: float | None = None
+    # Max /v1/messages requests decoding TOGETHER on one model (native backend's batch lane,
+    # N104) — what lets Claude Code subagents fan out onto a single local model. Each
+    # concurrent stream holds its own KV cache in unified memory, so raise with care on
+    # small-RAM machines; 0 disables batching (requests serialize as before).
+    mlx_max_concurrent: int = 8
 
     # --- paths (XDG data dir) ---
     home_dir: Path = XDG_DATA_DIR

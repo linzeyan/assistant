@@ -499,6 +499,21 @@ class MlxEngine:
                 return full_ids[common:], self._cache
         return full_ids, self._new_prompt_cache()
 
+    def encode_prompt(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict | None = None,
+    ) -> list[int]:
+        """Rendered prompt as generation-ready token ids — the single place template rendering
+        and BOS handling meet, shared by the serial path, token counting and the batch lane
+        (``mlx_batch``), so all three see byte-identical prompts."""
+        prompt = _render_prompt(
+            self._tokenizer.apply_chat_template, messages, tools, chat_template_kwargs,
+            harmony=self._harmony,
+        )
+        return self._encode_for_generation(prompt)
+
     def count_tokens(
         self,
         messages: list[dict],
@@ -507,11 +522,7 @@ class MlxEngine:
     ) -> int:
         """Token length of the rendered prompt — powers /v1/messages/count_tokens and the usage
         Claude Code reads to track how full the context is."""
-        prompt = _render_prompt(
-            self._tokenizer.apply_chat_template, messages, tools, chat_template_kwargs,
-            harmony=self._harmony,
-        )
-        return len(self._encode_for_generation(prompt))
+        return len(self.encode_prompt(messages, tools, chat_template_kwargs))
 
     def stream_text(
         self,
@@ -529,13 +540,9 @@ class MlxEngine:
         from mlx_lm import stream_generate
 
         # Passing tools lets the chat template render them in the model's expected
-        # tool-calling format. _render_prompt normalises tool_calls and handles the
-        # tools-kwarg fallback without masking real template errors.
-        prompt = _render_prompt(
-            self._tokenizer.apply_chat_template, messages, tools, chat_template_kwargs,
-            harmony=self._harmony,
-        )
-        full_ids = self._encode_for_generation(prompt)
+        # tool-calling format. _render_prompt (via encode_prompt) normalises tool_calls and
+        # handles the tools-kwarg fallback without masking real template errors.
+        full_ids = self.encode_prompt(messages, tools, chat_template_kwargs)
         if usage_out is not None:
             # Full prompt count regardless of cache reuse — it's the context size Claude Code tracks.
             usage_out["input_tokens"] = len(full_ids)

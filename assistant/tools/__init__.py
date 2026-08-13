@@ -16,6 +16,7 @@ def build_registry() -> ToolRegistry:
         plan_tool,
         shell,
         skill_tools,
+        subagent_tool,
         video_tool,
         vision_tool,
         web_tools,

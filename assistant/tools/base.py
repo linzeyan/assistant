@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from assistant.agent.subagents import SubagentRunner
     from assistant.images.service import MediaService
     from assistant.memory.provider import MemoryProvider
     from assistant.models.mlx_audio import AudioService
@@ -39,6 +40,12 @@ class ToolContext:
     on_progress: "Callable[[float, str], None] | None" = None
     # Where over-budget tool output is spilled in full (S4); None = bound in place, no spill.
     output_spill_dir: Path | None = None
+    # The chat model driving the current turn, set per run by the agent loop — lets a tool
+    # that spawns model work (spawn_subagents) target the conversation's own model.
+    model: str | None = None
+    # Subagent fan-out runner (N105). None in subagent children, which both hides the
+    # spawn_subagents tool from their schema (check_fn) and blocks recursion at call time.
+    subagents: "SubagentRunner | None" = None
 
 
 def service_available(attr: str) -> "Callable[[ToolContext], bool]":

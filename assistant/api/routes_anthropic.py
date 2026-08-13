@@ -71,7 +71,11 @@ async def messages(request: Request):
         calls: list[dict] = []
         usage = {"input_tokens": 0, "output_tokens": 0}
         try:
-            async for ev in service.stream_chat(oa_messages, model, tools=tools, **params):
+            # concurrent=True: subagent fan-out lands here, so requests on the same model may
+            # decode together (native backend's batch lane; other backends ignore the flag).
+            async for ev in service.stream_chat(
+                oa_messages, model, tools=tools, concurrent=True, **params
+            ):
                 if ev["type"] == "text":
                     text_parts.append(ev["content"])
                 elif ev["type"] == "tool_calls":
@@ -129,7 +133,9 @@ async def messages(request: Request):
         stop_reason = "end_turn"
         output_tokens = 0
         try:
-            async for ev in service.stream_chat(oa_messages, model, tools=tools, **params):
+            async for ev in service.stream_chat(
+                oa_messages, model, tools=tools, concurrent=True, **params
+            ):
                 if ev["type"] == "usage":
                     output_tokens = ev.get("output_tokens", output_tokens)
                     continue

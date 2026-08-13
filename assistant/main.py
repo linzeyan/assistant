@@ -112,6 +112,7 @@ def _build_model_service(settings: Settings, per_model=None, fusion=None):
     service = MlxModelService(
         models_dir=settings.models_dir,
         max_loaded=settings.max_loaded_models,
+        max_concurrent=settings.mlx_max_concurrent,
         mem_ceiling_gb=settings.mem_ceiling_gb,
         include_hf_cache=settings.hf_cache,
         extra_model_dirs=settings.extra_model_dirs,
@@ -339,6 +340,19 @@ async def lifespan(app: FastAPI):
         approval_ask_once=settings.approval_ask_once,
         hooks=hooks,
         trace_store=trace_store,
+    )
+    # N105: product-native subagent fan-out. Assigned onto the SHARED tool context after the
+    # loop deps exist — tools read it per call, and the spawn_subagents schema gate keys off
+    # its presence (subagent children get a context without it, so no recursion). Children
+    # ride the N104 batch lane, decoding together on one model where the engine allows.
+    from assistant.agent.subagents import SubagentRunner
+
+    ctx.subagents = SubagentRunner(
+        llm,
+        registry,
+        approval_rules=approval_rules,
+        max_output_tokens=settings.max_output_tokens,
+        turn_timeout_s=settings.turn_timeout_s,
     )
 
     _t = _phase("build services + discovery", _boot)

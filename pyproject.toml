@@ -22,7 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 # Each MLX backend is a heavy, Apple-Silicon-only opt-in: the matching feature
 # reports UNAVAILABLE (never crashes) when its extra isn't installed.
-mlx = ["mlx-lm>=0.20,<1.0"]            # native LLM inference backend
+mlx = ["mlx-lm>=0.31,<1.0"]            # native LLM inference backend (>=0.31: batch lane API, N104)
 images = ["mflux>=0.18,<1.0"]          # FLUX image generation + Qwen-Image-Edit
 embeddings = ["mlx-embeddings>=0.0.1,<1.0"]  # semantic memory search
 vlm = ["mlx-vlm>=0.1,<1.0"]            # vision-language (read images)
