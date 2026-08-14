@@ -415,6 +415,94 @@ def _common_prefix_len(a: list[int], b: list[int]) -> int:
     return i
 
 
+def _default_trimmer(prompt_cache: object, drop: int) -> int:
+    """Trim ``drop`` tokens off a banked cache; returns how many actually came off
+    (``trim_prompt_cache`` is all-or-nothing across layers, so != drop means "don't reuse")."""
+    from mlx_lm.models.cache import trim_prompt_cache
+
+    return trim_prompt_cache(prompt_cache, drop)
+
+
+class PromptCacheStore:
+    """Small LRU bank of finished turns' KV caches, keyed by the token ids they represent.
+
+    Requests that interleave between conversations would otherwise evict each other every
+    turn, leaving only the shared system prefix reusable — measured on four concurrent coding
+    sessions as ``cached`` pinned at 4979 while prefill ran 20-50k tokens, 17-67s, per step.
+    ``take`` removes the entry while its cache is in flight (a KV cache is mutable — two
+    requests must never share one), and the finished request banks the extended cache back.
+
+    ``max_tokens`` bounds the bank by the thing that actually costs: a KV cache is a fixed
+    number of bytes per token for a given model, so a token budget IS a byte budget. Left
+    None the bank is bounded only by ``max_entries``, which is fine where turns are short and
+    ruinous where they are not — an agent turn reaching 120k tokens is ~12GB of KV on a
+    30B model, and four of those do not fit anywhere.
+    """
+
+    def __init__(self, max_entries: int = 4, trimmer=None, max_tokens: int | None = None):
+        self._entries: list[tuple[list[int], object]] = []
+        self._max = max_entries
+        self._max_tokens = max_tokens
+        self._trim = trimmer or _default_trimmer
+
+    def take(self, full_ids: list[int]) -> tuple[list[int], object | None]:
+        """(suffix to prefill, cache to resume from) — or (full_ids, None) for a cold start."""
+        best_i, best_common = -1, 0
+        for i, (ids, _cache) in enumerate(self._entries):
+            common = _common_prefix_len(ids, full_ids)
+            if common > best_common:
+                best_i, best_common = i, common
+        best_common = min(best_common, len(full_ids) - 1)  # always leave ≥1 token to feed
+        if best_i < 0 or best_common <= 0:
+            return full_ids, None
+        ids, _ = self._entries[best_i]
+        drop = len(ids) - best_common
+        # Reuse TRIMS the entry back to the shared prefix, destroying the rest — which belongs to
+        # whichever conversation banked it. That's the right trade when this turn continues that
+        # conversation (the tail dropped is a couple of template tokens) and the wrong one when it
+        # merely shares the system prompt: we'd save `best_common` tokens now and cost that
+        # conversation `drop` on its next turn. Without this guard the bank never holds more than
+        # one entry at all — serial generation means every turn takes the only cache there is,
+        # trims it to the system prefix and banks it back, which is the single-slot behaviour this
+        # bank replaced. So while a slot is free, only cannibalize an entry we keep more of than we
+        # drop. Once full there is nothing left to protect: every choice costs an entry, so take
+        # the longest match.
+        if drop > best_common and len(self._entries) < self._max:
+            return full_ids, None
+        _, cache = self._entries.pop(best_i)
+        if drop and self._trim(cache, drop) != drop:
+            # Untrimmable (e.g. a wrapped rotating layer) — a cache out of step with its ids
+            # would corrupt the turn, so pay the full prefill instead.
+            return full_ids, None
+        return full_ids[best_common:], cache
+
+    def put(self, ids: list[int], cache: object) -> None:
+        self._entries.append((list(ids), cache))
+        while len(self._entries) > self._max:
+            self._entries.pop(0)
+        # Never evict what was just banked: one conversation longer than the whole budget still
+        # gets its cache back, because dropping it would mean re-prefilling it every single turn
+        # — the exact cost this bank exists to avoid.
+        while (
+            self._max_tokens is not None
+            and len(self._entries) > 1
+            and sum(len(ids) for ids, _ in self._entries) > self._max_tokens
+        ):
+            self._entries.pop(0)
+
+
+# How many conversations one engine keeps warm, and the ceiling on what they may hold.
+#
+# A KV cache costs a fixed number of bytes per token for a given model, so a token budget IS a
+# byte budget: Qwen3-Coder-30B-A3B is 48 layers x 4 KV heads x 128 head_dim x 2 (K+V) x 2 bytes
+# = 96KB/token, making this budget ~12GB — the same order as the single long conversation the
+# old one-slot design already retained, so this trades no extra memory for the reuse.
+# Four slots because that is what a person actually drives at once (a few chats, a few agent
+# tracks); the budget, not the slot count, is what keeps it honest.
+_CACHE_SLOTS = 4
+_CACHE_TOKEN_BUDGET = 128_000
+
+
 class MlxEngine:
     """A loaded mlx-lm model + tokenizer that streams text for one chat turn."""
 
@@ -425,12 +513,15 @@ class MlxEngine:
         # template's thinking/content fields at render time (N82/N84). Decided once at
         # load (vocab carries <|call|>), so render never guesses per turn.
         self._harmony = harmony
-        # Single-slot prompt cache reused across turns (see _prefill_plan). ``_cache_ids`` is the
-        # token sequence the KV in ``_cache`` currently represents; both are only valid together.
-        # Safe without a lock: the pool pins each model to a single-thread executor, so all of a
-        # model's generation is serialized.
-        self._cache: object | None = None
-        self._cache_ids: list[int] = []
+        # Prompt caches reused across turns (see _prefill_plan). Safe without a lock: the pool
+        # pins each model to a single-thread executor, so all of a model's generation is
+        # serialized — but *sequential* is not *single-conversation*. One slot assumed the next
+        # request continues the last one, which a single chat does and several do not: with four
+        # sessions in flight the previous generation was always somebody else's, so every turn
+        # reused only the shared system prefix and re-prefilled tens of thousands of tokens.
+        self._caches = PromptCacheStore(
+            max_entries=_CACHE_SLOTS, max_tokens=_CACHE_TOKEN_BUDGET
+        )
         # High-water working memory (KV cache + activations) this model needed for a turn, over and
         # above its resident weights. The pool harvests it at admission time so a load is budgeted
         # against what generation actually costs rather than a guess (N86).
@@ -479,25 +570,14 @@ class MlxEngine:
         return [kv_cls() if isinstance(entry, rotating) else entry for entry in cache]
 
     def _prefill_plan(self, full_ids: list[int]) -> tuple[list[int], object]:
-        """Reuse the KV of the longest common prefix with the previous turn and prefill only the new
-        tail. Claude Code re-sends the whole conversation every turn, so without this each turn
-        re-prefills tens of thousands of tokens (system prompt + tools + history + file reads) before
-        the first output token — the dominant per-turn cost. Falls back to a fresh full prefill when
-        nothing is shared or the cache can't be trimmed back to the shared prefix.
+        """Reuse the KV of the banked turn sharing the longest prefix with this one, and prefill
+        only the new tail. Claude Code re-sends the whole conversation every turn, so without this
+        each turn re-prefills tens of thousands of tokens (system prompt + tools + history + file
+        reads) before the first output token — the dominant per-turn cost. Falls back to a fresh
+        full prefill when nothing is shared or no cache can be trimmed back to the shared prefix.
         """
-        from mlx_lm.models.cache import trim_prompt_cache
-
-        common = _common_prefix_len(self._cache_ids, full_ids)
-        common = min(common, len(full_ids) - 1)  # always leave ≥1 token to feed the generator
-        if self._cache is not None and common > 0:
-            drop = len(self._cache_ids) - common
-            # drop==0: cache already exactly the shared prefix. Otherwise trim it back — a cache
-            # that can't drop them all leaves the KV out of step with _cache_ids, so rebuild rather
-            # than reuse a mismatched one. (trim_prompt_cache itself is all-or-nothing: it checks
-            # every layer first and returns 0 without touching anything.)
-            if drop == 0 or trim_prompt_cache(self._cache, drop) == drop:
-                return full_ids[common:], self._cache
-        return full_ids, self._new_prompt_cache()
+        suffix, cache = self._caches.take(full_ids)
+        return suffix, cache if cache is not None else self._new_prompt_cache()
 
     def encode_prompt(
         self,
@@ -597,17 +677,14 @@ class MlxEngine:
                     self.working_memory_bytes, peak - resident_before
                 )
             if committed:
-                # The cache now holds the whole prompt plus everything generated; record that so the
+                # The cache now holds the whole prompt plus everything generated; bank that so the
                 # next turn of this conversation reuses it instead of re-prefilling from scratch.
-                self._cache = cache
-                self._cache_ids = full_ids + generated
+                self._caches.put(full_ids + generated, cache)
                 if usage_out is not None:
                     usage_out["output_tokens"] = len(generated)
-            else:
-                # Early stop / error / client disconnect left the cache extended past _cache_ids —
-                # invalidate so a stale mismatch can't corrupt the next turn's prefix reuse.
-                self._cache = None
-                self._cache_ids = []
+            # An early stop / error / client disconnect leaves the cache extended past the ids it
+            # was taken under, so it is simply not banked — ``take`` already removed it, and a
+            # mismatched cache would corrupt the next turn's prefix reuse.
 
 
 class VlmChatEngine:

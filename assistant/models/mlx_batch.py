@@ -33,21 +33,13 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from .mlx_engine import (
+    PromptCacheStore,
     _active_memory_bytes,
-    _common_prefix_len,
     _peak_memory_bytes,
     _reset_peak_memory,
 )
 
 log = logging.getLogger(__name__)
-
-
-def _default_trimmer(prompt_cache: object, drop: int) -> int:
-    """Trim ``drop`` tokens off a banked cache; returns how many actually came off
-    (``trim_prompt_cache`` is all-or-nothing across layers, so != drop means "don't reuse")."""
-    from mlx_lm.models.cache import trim_prompt_cache
-
-    return trim_prompt_cache(prompt_cache, drop)
 
 
 def _default_generator_factory(engine: object, max_concurrent: int) -> object:
@@ -111,44 +103,6 @@ class _Active:
     prefill: int  # tokens actually prefilled (cache-miss cost, for the log line)
     count: int = 0  # generated tokens, excluding the stop token
     t0: float = field(default_factory=time.monotonic)
-
-
-class PromptCacheStore:
-    """Small LRU bank of finished turns' KV caches, keyed by the token ids they represent.
-
-    The serial engine keeps ONE cache slot because its requests are strictly sequential; the
-    lane needs a few, because concurrent conversations would evict each other every turn.
-    ``take`` removes the entry while its cache is in flight (a KV cache is mutable — two
-    requests must never share one), and the finished request banks the extended cache back.
-    """
-
-    def __init__(self, max_entries: int = 4, trimmer=None):
-        self._entries: list[tuple[list[int], object]] = []
-        self._max = max_entries
-        self._trim = trimmer or _default_trimmer
-
-    def take(self, full_ids: list[int]) -> tuple[list[int], object | None]:
-        """(suffix to prefill, cache to resume from) — or (full_ids, None) for a cold start."""
-        best_i, best_common = -1, 0
-        for i, (ids, _cache) in enumerate(self._entries):
-            common = _common_prefix_len(ids, full_ids)
-            if common > best_common:
-                best_i, best_common = i, common
-        best_common = min(best_common, len(full_ids) - 1)  # always leave ≥1 token to feed
-        if best_i < 0 or best_common <= 0:
-            return full_ids, None
-        ids, cache = self._entries.pop(best_i)
-        drop = len(ids) - best_common
-        if drop and self._trim(cache, drop) != drop:
-            # Untrimmable (e.g. a wrapped rotating layer) — a cache out of step with its ids
-            # would corrupt the turn, so pay the full prefill instead.
-            return full_ids, None
-        return full_ids[best_common:], cache
-
-    def put(self, ids: list[int], cache: object) -> None:
-        self._entries.append((list(ids), cache))
-        if len(self._entries) > self._max:
-            self._entries.pop(0)
 
 
 class BatchLane:

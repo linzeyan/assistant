@@ -532,6 +532,11 @@ class _FakeCache:
     """Distinguishable stand-in for an mlx-lm prompt cache (identity is what the tests check)."""
 
 
+def _banked(eng) -> list[tuple[list[int], object]]:
+    """The engine's banked (ids, cache) pairs, oldest first."""
+    return list(eng._caches._entries)
+
+
 def _install_mlx(monkeypatch, *, script, trim_result=None, raise_after=None):
     """Stub mlx_lm.stream_generate + the cache helpers (the real package can't import in CI). Records
     each stream_generate call's (prompt, cache) so a test can assert what got prefilled and reused."""
@@ -606,8 +611,7 @@ def test_stream_text_first_turn_prefills_full_and_reports_usage(monkeypatch):
     assert out == ["a", "b"]
     assert calls[0]["prompt"] == [1, 2, 3]  # no prior cache → whole prompt prefilled
     assert usage == {"input_tokens": 3, "output_tokens": 2}
-    assert eng._cache_ids == [1, 2, 3, 10, 11]  # prompt + generated
-    assert eng._cache is calls[0]["cache"]  # the fresh cache was committed
+    assert _banked(eng) == [([1, 2, 3, 10, 11], calls[0]["cache"])]  # prompt + generated
 
 
 def _fake_memory(monkeypatch, *, resident: int, peak: int):
@@ -675,8 +679,8 @@ def test_stream_text_reuses_cache_on_shared_prefix(monkeypatch):
     tok = _StubTok([1, 2, 3])
     calls = _install_mlx(monkeypatch, script=[(10, "a"), (11, "b")])
     eng = MlxEngine(model=object(), tokenizer=tok)
-    list(eng.stream_text([{"role": "user", "content": "hi"}]))  # cache_ids -> [1,2,3,10,11]
-    first_cache = eng._cache
+    list(eng.stream_text([{"role": "user", "content": "hi"}]))  # banks [1,2,3,10,11]
+    first_cache = _banked(eng)[-1][1]
     tok.ids = [1, 2, 3, 10, 11, 20]  # next turn = full prior context + one new token
     list(eng.stream_text([{"role": "user", "content": "more"}]))
     assert calls[1]["prompt"] == [20]  # ONLY the new tail is prefilled
@@ -687,8 +691,8 @@ def test_stream_text_trims_cache_to_shared_prefix(monkeypatch):
     tok = _StubTok([1, 2, 3])
     calls = _install_mlx(monkeypatch, script=[(10, "a"), (11, "b")])  # trim returns n (full)
     eng = MlxEngine(model=object(), tokenizer=tok)
-    list(eng.stream_text([{"role": "user", "content": "hi"}]))  # cache_ids -> [1,2,3,10,11]
-    first_cache = eng._cache
+    list(eng.stream_text([{"role": "user", "content": "hi"}]))  # banks [1,2,3,10,11]
+    first_cache = _banked(eng)[-1][1]
     tok.ids = [1, 2, 3, 99]  # diverges after [1,2,3]; cache must drop its last 2 tokens
     list(eng.stream_text([{"role": "user", "content": "x"}]))
     assert calls[1]["prompt"] == [99]
@@ -699,8 +703,8 @@ def test_stream_text_rebuilds_when_cache_cannot_be_trimmed(monkeypatch):
     tok = _StubTok([1, 2, 3])
     calls = _install_mlx(monkeypatch, script=[(10, "a")], trim_result=0)  # trim can't drop → 0
     eng = MlxEngine(model=object(), tokenizer=tok)
-    list(eng.stream_text([{"role": "user", "content": "hi"}]))  # cache_ids -> [1,2,3,10]
-    first_cache = eng._cache
+    list(eng.stream_text([{"role": "user", "content": "hi"}]))  # banks [1,2,3,10]
+    first_cache = _banked(eng)[-1][1]
     tok.ids = [1, 2, 3, 99]  # needs a 1-token trim, which the cache refuses
     list(eng.stream_text([{"role": "user", "content": "x"}]))
     assert calls[1]["prompt"] == [1, 2, 3, 99]  # fall back to a full prefill
@@ -729,7 +733,53 @@ def test_stream_text_invalidates_cache_on_error(monkeypatch):
     with pytest.raises(RuntimeError):
         list(eng.stream_text([{"role": "user", "content": "hi"}]))
     # A mid-stream failure must not leave a cache whose token record is out of sync.
-    assert eng._cache is None and eng._cache_ids == []
+    assert _banked(eng) == []
+
+
+def test_stream_text_keeps_a_cache_per_conversation(monkeypatch):
+    # Why the engine banks several caches instead of one: two chats in flight take turns, so
+    # with a single slot each turn found the *other* conversation's cache, shared only the
+    # system prefix, and re-prefilled everything else. Measured on four concurrent sessions as
+    # cached pinned at 4979 while prefill ran 20-50k tokens per step.
+    tok = _StubTok([])
+    calls = _install_mlx(monkeypatch, script=[(10, "a")])
+    eng = MlxEngine(model=object(), tokenizer=tok)
+    tok.ids = [1, 20, 21, 22]  # conversation A, on a 1-token system prefix
+    list(eng.stream_text([{"role": "user", "content": "A1"}]))
+    cache_a = _banked(eng)[-1][1]
+    tok.ids = [1, 40, 41, 42]  # conversation B: shares only the system prefix with A
+    list(eng.stream_text([{"role": "user", "content": "B1"}]))
+    cache_b = _banked(eng)[-1][1]
+    # B started fresh rather than trimming A's cache down to that one shared token: what it
+    # would have saved (1 token) is less than what A would have had to re-prefill (4).
+    assert cache_b is not cache_a
+    assert calls[1]["prompt"] == [1, 40, 41, 42]
+
+    tok.ids = [1, 20, 21, 22, 10, 23]  # back to A, whose cache one slot would have lost
+    list(eng.stream_text([{"role": "user", "content": "A2"}]))
+    assert calls[2]["cache"] is cache_a
+    assert calls[2]["prompt"] == [23]  # only A's new tail, not A's whole history
+    tok.ids = [1, 40, 41, 42, 10, 43]  # and B is still banked too
+    list(eng.stream_text([{"role": "user", "content": "B2"}]))
+    assert calls[3]["cache"] is cache_b
+    assert calls[3]["prompt"] == [43]
+
+
+def test_cache_bank_evicts_by_token_budget(monkeypatch):
+    # A KV cache is a fixed number of bytes per token, so the bank has to be bounded by tokens,
+    # not just by slot count: four 120k-token agent turns are ~48GB of KV on a 30B model.
+    store = mlx_engine.PromptCacheStore(max_entries=4, max_tokens=10, trimmer=lambda c, d: d)
+    store.put([1, 2, 3, 4, 5, 6], "old")
+    store.put([1, 7, 8, 9, 10, 11], "new")
+    assert [ids for ids, _ in store._entries] == [[1, 7, 8, 9, 10, 11]]
+
+
+def test_cache_bank_keeps_a_conversation_larger_than_the_whole_budget(monkeypatch):
+    # Evicting what was just banked would re-prefill that conversation every single turn — the
+    # exact cost the bank exists to avoid — so the newest entry always survives.
+    store = mlx_engine.PromptCacheStore(max_entries=4, max_tokens=2, trimmer=lambda c, d: d)
+    store.put([1, 2, 3, 4, 5], "huge")
+    assert [ids for ids, _ in store._entries] == [[1, 2, 3, 4, 5]]
 
 
 def _install_mlx_vlm(monkeypatch, processor):
