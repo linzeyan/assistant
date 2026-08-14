@@ -22,6 +22,15 @@ def test_normalize_drops_empty_titles_and_defaults_bad_status():
     ]
 
 
+def test_normalize_accepts_a_stringified_array():
+    """Small models hand nested arguments over as a string, and often as a Python repr rather
+    than as JSON. Rejecting that spelling cost a real turn: the model retried it three times
+    and then gave up on the task."""
+    expected = [{"title": "read", "status": "completed"}]
+    assert normalize_steps('[{"title": "read", "status": "completed"}]') == expected
+    assert normalize_steps("[{'title': 'read', 'status': 'completed'}]") == expected
+
+
 def test_normalize_rejects_unusable_input():
     for bad in (None, [], "steps", [{"status": "pending"}], [{"title": "   "}]):
         with pytest.raises(ValueError):

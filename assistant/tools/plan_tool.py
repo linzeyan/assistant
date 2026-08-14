@@ -14,6 +14,9 @@ against compaction, S6). The short ack returned here IS what the conversation hi
 
 from __future__ import annotations
 
+import ast
+import json
+
 from .base import ToolContext, ToolResult
 from .registry import registry
 
@@ -27,6 +30,18 @@ def normalize_steps(raw) -> list[dict]:
     emitting a junk checklist. An unknown/missing status defaults to ``pending``; titles are
     stripped and empty-title steps dropped.
     """
+    if isinstance(raw, str):
+        # Small models routinely serialize a nested argument as a string instead of as JSON,
+        # and often as a Python repr (single quotes) rather than JSON — which is why
+        # literal_eval backs json up. Rejecting that spelling cost a real coding turn: the
+        # model retried the same shape three times, then abandoned the task. The plan is an
+        # aid, so meeting it where it is beats being right about the schema.
+        for parse in (json.loads, ast.literal_eval):
+            try:
+                raw = parse(raw)
+                break
+            except (ValueError, SyntaxError):
+                continue
     if not isinstance(raw, list) or not raw:
         raise ValueError("steps must be a non-empty array of {title, status}")
     out: list[dict] = []
