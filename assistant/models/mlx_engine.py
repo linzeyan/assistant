@@ -495,12 +495,16 @@ class PromptCacheStore:
 #
 # A KV cache costs a fixed number of bytes per token for a given model, so a token budget IS a
 # byte budget: Qwen3-Coder-30B-A3B is 48 layers x 4 KV heads x 128 head_dim x 2 (K+V) x 2 bytes
-# = 96KB/token, making this budget ~12GB — the same order as the single long conversation the
-# old one-slot design already retained, so this trades no extra memory for the reuse.
+# = 96KB/token, making this budget ~24GB. Sized against what the bank is actually asked to
+# hold: an agent turn runs 60-90k tokens, so anything under ~200k fits one such conversation
+# and evicts the second — which is the single-slot behaviour this replaced, just later.
+# Deliberately a flat number rather than a fraction of RAM: it is only honest for a model of
+# this size, and the pool's own admission ceiling (which books each engine's measured working
+# memory, this bank included) is what stops a load that would not fit.
 # Four slots because that is what a person actually drives at once (a few chats, a few agent
 # tracks); the budget, not the slot count, is what keeps it honest.
 _CACHE_SLOTS = 4
-_CACHE_TOKEN_BUDGET = 128_000
+_CACHE_TOKEN_BUDGET = 256_000
 
 
 class MlxEngine:
