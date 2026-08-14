@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -25,6 +26,12 @@ class ChatRequest(BaseModel):
     # Optional per-request tool-iteration ceiling (H7); overrides the global default for this turn
     # only. Clamped server-side (see below). None / non-positive → the configured default.
     max_iters: int | None = None
+    # Working directory for this turn's file/shell tools, overriding the configured
+    # workspace_dir. The loop has always taken a per-run cwd — Telegram's /cd rides it — but
+    # over HTTP the whole backend shared one directory, so a client driving several isolated
+    # checkouts (git worktrees, one task per tree) had no way to keep them apart. None keeps
+    # the server default.
+    workspace: str | None = None
 
 
 class ApproveRequest(BaseModel):
@@ -45,6 +52,15 @@ async def chat(req: ChatRequest, request: Request):
             detail="No model backend is reachable. Install mlx-lm (make setup-mlx) "
             "or use the omlx backend.",
         )
+
+    # Rejected here rather than at first tool call: a bad path would otherwise surface as a
+    # confusing "not a file" several tool calls into a turn the client has already paid for.
+    workspace = None
+    if req.workspace is not None:
+        workspace = Path(req.workspace).expanduser()
+        if not workspace.is_dir():
+            raise HTTPException(status_code=400, detail=f"not a directory: {req.workspace}")
+        workspace = str(workspace.resolve())
 
     store = request.app.state.sessions
     agent = request.app.state.agent
@@ -71,7 +87,12 @@ async def chat(req: ChatRequest, request: Request):
             # loop (or a zero that would disable the backstop); None passes through as "default".
             req_max_iters = min(req.max_iters, 100) if req.max_iters else None
             async for event in agent.run(
-                session, req.message, req.model, approver=approver, max_iters=req_max_iters
+                session,
+                req.message,
+                req.model,
+                approver=approver,
+                cwd=workspace,
+                max_iters=req_max_iters,
             ):
                 yield _sse(event)
             completed = True

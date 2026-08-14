@@ -27,10 +27,22 @@ class _OkService:
 class _BoomAgent:
     """Mirrors the real loop: the user message is recorded before the turn blows up."""
 
-    async def run(self, session, message, model, approver=None, max_iters=None):
+    async def run(self, session, message, model, approver=None, cwd=None, max_iters=None):
         session.add_user(message)
         raise RuntimeError("template render boom")
         yield  # pragma: no cover - unreachable, makes this an async generator
+
+
+class _RecordingAgent:
+    """Records the cwd the route handed the loop, then ends the turn immediately."""
+
+    def __init__(self):
+        self.cwd = "unset"
+
+    async def run(self, session, message, model, approver=None, cwd=None, max_iters=None):
+        self.cwd = cwd
+        session.add_user(message)
+        yield {"type": "done", "usage": {}}
 
 
 def _session_id_from_sse(text: str) -> str | None:
@@ -57,3 +69,37 @@ def test_failed_turn_is_still_checkpointed(tmp_path):
         assert any(
             m.get("role") == "user" and m["content"] == "hi" for m in reloaded.messages
         )
+
+
+def test_workspace_overrides_the_server_default(tmp_path):
+    """One backend has to serve several checkouts at once — a client driving N git worktrees
+    keeps them apart only if the turn's cwd comes from the request, not from startup config."""
+    tree = tmp_path / "worktree"
+    tree.mkdir()
+    with _client(tmp_path) as client:
+        client.app.state.model_service = _OkService()
+        agent = client.app.state.agent = _RecordingAgent()
+        r = client.post(
+            "/chat", json={"message": "hi", "model": "m", "workspace": str(tree)}
+        )
+        assert r.status_code == 200
+        assert agent.cwd == str(tree.resolve())
+
+
+def test_workspace_defaults_to_none_when_omitted(tmp_path):
+    with _client(tmp_path) as client:
+        client.app.state.model_service = _OkService()
+        agent = client.app.state.agent = _RecordingAgent()
+        assert client.post("/chat", json={"message": "hi", "model": "m"}).status_code == 200
+        assert agent.cwd is None  # the loop falls back to the configured workspace_dir
+
+
+def test_workspace_that_is_not_a_directory_is_rejected(tmp_path):
+    """Rejecting up front beats letting the agent burn a turn discovering the path is wrong."""
+    with _client(tmp_path) as client:
+        client.app.state.model_service = _OkService()
+        client.app.state.agent = _RecordingAgent()
+        r = client.post(
+            "/chat", json={"message": "hi", "model": "m", "workspace": str(tmp_path / "nope")}
+        )
+        assert r.status_code == 400
