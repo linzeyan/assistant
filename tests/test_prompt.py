@@ -88,6 +88,17 @@ def test_system_prompt_reports_the_change_actually_made():
     assert "cut short" in p and "has established nothing" in p
 
 
+def test_system_prompt_refuses_placeholders_that_compile():
+    # Observed: asked for a parser over a packed binary buffer, the model shipped a function
+    # whose body was `return false` under a comment saying the real one would come later, plus
+    # three checks of the form assert(true == true). Every gate passed and the feature did
+    # nothing. Distinct from the rules above, which cover misreporting finished work — this is
+    # about work that was never done wearing the shape of work that was.
+    p = build_system_prompt("(skills index)")
+    assert "cannot write the real thing" in p
+    assert "placeholder that compiles" in p
+
+
 def test_system_prompt_has_code_mode_batch_policy():
     # N100: for fan-out/loop work the model should write ONE script (bash tool: shell or
     # python3 heredoc) instead of N sequential tool calls — intermediate results stay in the
