@@ -77,6 +77,17 @@ def test_system_prompt_treats_a_failed_read_as_a_stop():
     assert "report that mismatch and stop" in p
 
 
+def test_system_prompt_reports_the_change_actually_made():
+    # Observed: asked for three edits to a Makefile, the model made two, then reported all three
+    # ("Fixed the wait loop…") — its own diff contradicted the claim. In the same turn a bash call
+    # died on the 120s timeout and the run was reported as tests passing. The transcript rule above
+    # only covered inventing OUTPUT; this covers inventing one's own EDITS and treating a killed
+    # command as a result. Static policy, so it belongs in the cacheable prefix.
+    p = build_system_prompt("(skills index)")
+    assert "Report the change you MADE" in p
+    assert "cut short" in p and "has established nothing" in p
+
+
 def test_system_prompt_has_code_mode_batch_policy():
     # N100: for fan-out/loop work the model should write ONE script (bash tool: shell or
     # python3 heredoc) instead of N sequential tool calls — intermediate results stay in the
@@ -96,7 +107,10 @@ def test_skills_index_is_budget_capped():
     huge = "\n".join(f"- skill-{i:04d}: does thing number {i}" for i in range(2000))
     p = build_system_prompt(huge)
     assert "index truncated" in p and "skills_list" in p
-    assert estimate_tokens(p) < 3500  # raw index alone is ~17k tokens
+    # Raw index alone is ~17k tokens, so any ceiling in this range proves the cut happened.
+    # Kept well clear of the current size: a bound that tracks the base prompt turns every
+    # added line of static policy into a failure of a test about the *index*.
+    assert estimate_tokens(p) < 4500
 
     small = build_system_prompt("- one: does a thing")
     assert "- one: does a thing" in small and "index truncated" not in small
