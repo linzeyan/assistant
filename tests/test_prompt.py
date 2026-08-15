@@ -66,6 +66,17 @@ def test_system_prompt_has_grounding_policy():
     assert "fetch_url" in p  # verify from the real source
 
 
+def test_system_prompt_treats_a_failed_read_as_a_stop():
+    # Observed: asked to edit a file that was not in the worktree (a gitignored symlink), the
+    # model's read_file returned "not a file", it marked its own "read the file" step completed,
+    # and then wrote the file from imagination — a plausible-looking document that had never
+    # existed. The grounding rules above only covered *not reading*; a read that failed still
+    # looked to the model like a read. Static policy, so it belongs in the cacheable prefix.
+    p = build_system_prompt("(skills index)")
+    assert "A tool call that FAILED opened nothing" in p
+    assert "report that mismatch and stop" in p
+
+
 def test_system_prompt_has_code_mode_batch_policy():
     # N100: for fan-out/loop work the model should write ONE script (bash tool: shell or
     # python3 heredoc) instead of N sequential tool calls — intermediate results stay in the
