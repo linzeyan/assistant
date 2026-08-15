@@ -918,3 +918,69 @@ async def test_n94_batch_token_cap_bounds_model_view_not_events(tmp_path):
     # The events (GUI/trace view) still carry the full output — only the model's view shrinks.
     results = [e for e in events if e["type"] == "tool_result"]
     assert [e["content"] for e in results] == [big, big, big]
+
+
+# --- degenerate-generation guard ---------------------------------------------------------
+
+from assistant.agent.loop import _DEGENERATE_EVERY, _is_degenerate  # noqa: E402
+
+
+def _deltas(text: str, chunk: int = 20) -> list[dict]:
+    return [{"type": "text", "content": text[i:i + chunk]} for i in range(0, len(text), chunk)]
+
+
+def test_a_long_answer_that_never_repeats_is_not_degenerate():
+    # The guard must not fire on ordinary long prose, or it would truncate real answers.
+    assert not _is_degenerate("".join(f"Paragraph {i} says something new. " for i in range(400)))
+
+
+def test_a_file_that_repeats_a_block_is_not_degenerate():
+    # Generated code repeats itself: an error-mapping line per fallible call, a near-identical
+    # test function per case. What makes that different from a loop is that the repeats are a
+    # minority of the file, which is the coverage half of the check.
+    arm = (
+        "        Format::{name} => Box::new(\n"
+        "            reader_for(file, schema)\n"
+        "                .map_err(|e| DbError::new(e.to_string()))?,\n"
+        "        ),\n"
+    )
+    body = "".join(arm.format(name=n) for n in ("Csv", "Tsv", "JsonLines", "Parquet"))
+    unique = "".join(f"    // {i}: why this arm reads the way it does\n" for i in range(120))
+    assert not _is_degenerate(f"fn reader() {{\n{unique}{body}}}\n")
+
+
+def test_a_reply_repeating_its_own_tail_is_degenerate():
+    assert _is_degenerate("OK, let me just write the code now. I'll follow the instructions. " * 200)
+
+
+async def test_a_repeating_generation_is_stopped_and_reported(tmp_path):
+    # Left alone this spends the whole output budget and then returns the wall of repeats as the
+    # answer, so the caller sees a successful turn that did nothing.
+    loop = AgentLoop(
+        FakeLLM([_deltas("OK, let me just write the code now. I'll follow the instructions. " * 200)]),
+        _reg_with(),
+        PolicyApprover(approval_required=False),
+        ToolContext(cwd=tmp_path),
+        max_iters=4,
+    )
+    events = await _collect(loop.run(Session(id="d"), "go", "m"))
+
+    err = next(e for e in events if e["type"] == "error")
+    assert "repeating itself" in err["detail"]
+    # Stopped part way rather than after the whole generation, and never reported as an answer.
+    emitted = len([e for e in events if e["type"] == "assistant_delta"])
+    assert 0 < emitted < len(_deltas("x" * 13000))
+    assert not any(e["type"] == "done" for e in events)
+
+
+async def test_a_short_reply_is_never_checked(tmp_path):
+    # Below the minimum the guard does not run at all, so a brief answer costs nothing.
+    loop = AgentLoop(
+        FakeLLM([[{"type": "text", "content": "done"}]]),
+        _reg_with(),
+        PolicyApprover(approval_required=False),
+        ToolContext(cwd=tmp_path),
+    )
+    events = await _collect(loop.run(Session(id="s"), "go", "m"))
+    assert not any(e["type"] == "error" for e in events)
+    assert _DEGENERATE_EVERY > 1

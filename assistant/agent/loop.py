@@ -48,6 +48,37 @@ _THRASH_REPEAT_CAP = 3
 # can blow the context. A backstop, not a knob.
 _TOOL_RESULT_BATCH_TOKENS = 6000
 
+# Degenerate-generation guard: a model that falls into a repetition loop emits the same
+# sentences until it hits max_output_tokens, and because the turn ends with text and no tool
+# call, the loop above treats that wall of repeats as the answer and reports success. Seen on a
+# 35B: twenty minutes and the whole output budget spent on "OK, let me just write the code now."
+# repeated eighty times, with not one file written.
+#
+# Two conditions, because either alone has a false positive. A verbatim 240-character tail
+# recurring several times is the shape of the loop — but source code repeats blocks too, so
+# recurrence alone would truncate a legitimate file. The second condition is that those repeats
+# account for most of the reply: a repeated block inside otherwise-new text is someone writing
+# code, whereas a reply that IS its own tail six times over has stopped saying anything.
+#
+# Checked only past _DEGENERATE_MIN_CHARS, and only every _DEGENERATE_EVERY deltas, so short
+# answers never pay for it and long ones do not pay per token.
+_DEGENERATE_TAIL = 240
+_DEGENERATE_REPEATS = 6
+_DEGENERATE_COVERAGE = 0.5
+_DEGENERATE_MIN_CHARS = 4000
+_DEGENERATE_EVERY = 50
+
+
+def _is_degenerate(text: str) -> bool:
+    """Whether `text` has collapsed into repeating its own tail."""
+    if len(text) < _DEGENERATE_MIN_CHARS:
+        return False
+    tail = text[-_DEGENERATE_TAIL:]
+    repeats = text.count(tail)
+    if repeats < _DEGENERATE_REPEATS:
+        return False
+    return repeats * _DEGENERATE_TAIL >= _DEGENERATE_COVERAGE * len(text)
+
 # Path-like substrings in a user turn: something containing a slash (a/b, /abs, ~/x, src/),
 # a bare filename.ext (config.toml, README.md), or a well-known extensionless name (Makefile,
 # Dockerfile). re.ASCII keeps \w to [A-Za-z0-9_] so CJK is NOT a word char — a path pressed
@@ -257,12 +288,21 @@ class AgentLoop:
                 step = TraceStep() if trace is not None else None
 
                 send_messages = self._messages_for_send(session.messages, context_blocks)
+                degenerate = False
+                deltas = 0
                 async for ev in self._llm.stream_chat(
                     send_messages, model, tools=tools, max_tokens=self._max_output_tokens
                 ):
                     if ev["type"] == "text":
                         text_parts.append(ev["content"])
                         yield {"type": "assistant_delta", "content": ev["content"]}
+                        # Joining the whole reply per token would make a long answer
+                        # quadratic, and a repetition loop takes thousands of tokens to
+                        # become one — there is nothing to catch early.
+                        deltas += 1
+                        if deltas % _DEGENERATE_EVERY == 0 and _is_degenerate("".join(text_parts)):
+                            degenerate = True
+                            break
                     elif ev["type"] == "tool_calls":
                         tool_calls = ev["tool_calls"]
                     elif ev["type"] == "usage":
@@ -274,6 +314,15 @@ class AgentLoop:
                         # Forward any other event the model layer emits (e.g. Fusion's panel
                         # tool_progress) straight to the gateway/SSE consumer.
                         yield ev
+
+                if degenerate:
+                    if trace is not None:
+                        self._trace.record(trace.finalize("error"))
+                    yield {
+                        "type": "error",
+                        "detail": "the model started repeating itself and was stopped",
+                    }
+                    return
 
                 if not tool_calls:
                     answer = "".join(text_parts)
