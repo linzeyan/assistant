@@ -74,3 +74,49 @@ async def test_grep_skips_binary(ctx, tools):
     hits = await tools["grep"].handler({"pattern": "match"}, ctx)
     # Only the text file should appear; the binary file is skipped, not crashed on.
     assert "ok.txt" in hits.content and "bin.dat" not in hits.content
+
+
+async def test_a_write_outside_the_workspace_is_refused(ctx, tools, tmp_path):
+    """The standing approval rule pre-authorises edit_file and write_file, so this
+    boundary is the only thing left between "edit a file in the project" and "edit
+    any file on the machine". A resource glob cannot express it: the rule sees the
+    path as the model wrote it, and ../ reaches the same file under another name."""
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("untouched")
+
+    res = await tools["write_file"].handler({"path": str(outside), "content": "x"}, ctx)
+    assert not res.ok and "outside the workspace" in res.content
+    assert outside.read_text() == "untouched"
+
+    res = await tools["write_file"].handler({"path": "../outside.txt", "content": "x"}, ctx)
+    assert not res.ok and "outside the workspace" in res.content
+    assert outside.read_text() == "untouched"
+
+    res = await tools["edit_file"].handler(
+        {"path": "../outside.txt", "old": "untouched", "new": "x"}, ctx
+    )
+    assert not res.ok and "outside the workspace" in res.content
+    assert outside.read_text() == "untouched"
+
+
+async def test_a_symlink_out_of_the_workspace_is_refused(ctx, tools, tmp_path):
+    """Resolved rather than compared as text, or a link inside the tree would be a
+    door out of it."""
+    outside = tmp_path.parent / "linked.txt"
+    outside.write_text("untouched")
+    (ctx.cwd / "link.txt").symlink_to(outside)
+
+    res = await tools["edit_file"].handler(
+        {"path": "link.txt", "old": "untouched", "new": "x"}, ctx
+    )
+    assert not res.ok and "outside the workspace" in res.content
+    assert outside.read_text() == "untouched"
+
+
+async def test_reading_outside_the_workspace_is_still_allowed(ctx, tools, tmp_path):
+    """Only the mutating tools are bounded. An agent asked about a sibling checkout
+    or a config file is doing something ordinary, and a read damages nothing."""
+    outside = tmp_path.parent / "readable.txt"
+    outside.write_text("visible")
+    res = await tools["read_file"].handler({"path": str(outside)}, ctx)
+    assert res.ok and "visible" in res.content
