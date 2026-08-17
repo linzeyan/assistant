@@ -367,7 +367,7 @@ def parse_tool_calls(
     # yield none, because the model never actually decided. A missing closer on a real
     # block still parses, like the Hermes truncation branch above.
     if _PLAIN_FUNCTION_OPEN in text:
-        visible = _strip_think_blocks(text)
+        visible = strip_think_blocks(text)
         if _PLAIN_FUNCTION_OPEN in visible:
             blocks = _PLAIN_FUNCTION_RE.findall(visible)
             source = "\n".join(blocks) if blocks else visible.split(_PLAIN_FUNCTION_OPEN, 1)[1]
@@ -396,7 +396,7 @@ def parse_tool_calls(
     return []
 
 
-def _strip_think_blocks(text: str) -> str:
+def strip_think_blocks(text: str) -> str:
     """Text with ``<think>…</think>`` regions removed. An unterminated ``<think>`` drops
     everything after it: reasoning that never concluded must not contribute tool calls."""
     out: list[str] = []

@@ -984,3 +984,55 @@ async def test_a_short_reply_is_never_checked(tmp_path):
     events = await _collect(loop.run(Session(id="s"), "go", "m"))
     assert not any(e["type"] == "error" for e in events)
     assert _DEGENERATE_EVERY > 1
+
+
+# --- reasoning-only turn guard -----------------------------------------------------------
+
+
+async def test_a_turn_that_is_only_reasoning_is_reported_not_answered(tmp_path):
+    # How a tool call the parser could not read reaches this layer: the model thought
+    # about calling something, never emitted a form the parser recognises, and the loop
+    # sees a turn with no calls and no text. Left alone that is reported as a completed
+    # answer, so a task that did a third of its work looks finished.
+    loop = AgentLoop(
+        FakeLLM(
+            [[{"type": "text", "content": '<think>I should read it.\n{"path": "a.rs"}</think>'}]]
+        ),
+        _reg_with(),
+        PolicyApprover(approval_required=False),
+        ToolContext(cwd=tmp_path),
+    )
+    events = await _collect(loop.run(Session(id="r"), "go", "m"))
+
+    err = next(e for e in events if e["type"] == "error")
+    assert "could not be parsed" in err["detail"]
+    assert not any(e["type"] == "done" for e in events)
+
+
+async def test_reasoning_followed_by_an_answer_is_an_answer(tmp_path):
+    # The guard keys on there being nothing outside the reasoning, not on reasoning
+    # being present: thinking out loud and then answering is the ordinary case.
+    loop = AgentLoop(
+        FakeLLM([[{"type": "text", "content": "<think>weighing it up</think>The answer is 4."}]]),
+        _reg_with(),
+        PolicyApprover(approval_required=False),
+        ToolContext(cwd=tmp_path),
+    )
+    events = await _collect(loop.run(Session(id="r2"), "go", "m"))
+
+    assert not any(e["type"] == "error" for e in events)
+    assert any(e["type"] == "done" for e in events)
+
+
+async def test_an_unterminated_think_block_is_reported(tmp_path):
+    # Ran out of output budget mid-reasoning. Nothing was decided, so the turn failed —
+    # and this is the case where the scratchpad is longest and least like an answer.
+    loop = AgentLoop(
+        FakeLLM([[{"type": "text", "content": "<think>still working it out when budget ran"}]]),
+        _reg_with(),
+        PolicyApprover(approval_required=False),
+        ToolContext(cwd=tmp_path),
+    )
+    events = await _collect(loop.run(Session(id="r3"), "go", "m"))
+
+    assert any(e["type"] == "error" for e in events)

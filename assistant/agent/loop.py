@@ -10,6 +10,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
+from assistant.models.tool_parsing import strip_think_blocks
 from assistant.tools.approval import ApprovalPolicy, Rule, resource_of
 from assistant.tools.base import ToolContext, ToolResult
 from assistant.tools.plan_tool import normalize_steps
@@ -326,6 +327,26 @@ class AgentLoop:
 
                 if not tool_calls:
                     answer = "".join(text_parts)
+                    # A turn that produced only reasoning decided nothing: it called no
+                    # tool and said nothing outside <think>. Handing that back as the
+                    # answer gives the caller the model's scratchpad and reports a
+                    # failure as a success — which is exactly what a tool call the
+                    # parser could not read looks like from here. Measured on
+                    # gpt-oss-120b: five calls parsed, then it rehearsed the sixth
+                    # inside its reasoning without ever emitting the recipient header,
+                    # the loop saw no calls, and the turn "succeeded" having done a
+                    # third of the work.
+                    if not strip_think_blocks(answer).strip():
+                        if trace is not None:
+                            self._trace.record(trace.finalize("error"))
+                        yield {
+                            "type": "error",
+                            "detail": "the model ended its turn without answering or "
+                            "calling a tool — its reply was reasoning only, which "
+                            "usually means a tool call it meant to make could not be "
+                            "parsed",
+                        }
+                        return
                     session.add_assistant(answer)
                     if trace is not None:
                         step.model_text = answer
