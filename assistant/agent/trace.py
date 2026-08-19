@@ -22,6 +22,7 @@ a dir, capped to bound disk growth (no separate GC at P0).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -186,6 +187,21 @@ class TraceStore:
         if self._dir is None:
             return None
         return self._read_json(self._dir / f"{turn_id}.json")
+
+    def clear(self) -> int:
+        """Wipe every recorded trace, memory and disk (Settings ▸ "Clear traces"). Returns how
+        many turns were dropped. Best-effort per file — a locked/vanished file must not fail the
+        wipe; stray ``.json.tmp`` from a dead write is swept too."""
+        dropped = set(self._cache)
+        self._cache.clear()
+        if self._dir is not None:
+            for path in self._dir.glob("*.json"):
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                    dropped.add(path.stem)
+            for tmp in self._dir.glob("*.json.tmp"):
+                tmp.unlink(missing_ok=True)
+        return len(dropped)
 
     def list_for_session(self, session_id: str) -> list[dict]:
         """Turn summaries for one session, newest first. Merges the in-memory cache with

@@ -135,6 +135,9 @@ struct AssistantClient {
     func clearLogs() async throws {
         try await postJSONNoDecode("/logs/clear", body: [:])
     }
+    func clearTraces() async throws {
+        try await sendJSONNoDecode("DELETE", "/traces", body: [:])
+    }
 
     func installTool(feature: String, upgrade: Bool = false) async throws {
         try await postJSONNoDecode("/setup/install", body: ["feature": feature, "upgrade": upgrade])

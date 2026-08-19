@@ -94,6 +94,28 @@ def test_record_prunes_to_max_turns(tmp_path):
 # --- outcome classification (the scannable signal) ---
 
 
+def test_clear_wipes_memory_and_disk(tmp_path):
+    # Settings ▸ "Clear traces": everything goes — cached turns, on-disk turns from a previous
+    # run (not in this cache), and stray .tmp from a dead write. The store keeps working after.
+    d = tmp_path / "traces"
+    store = TraceStore(d)
+    store.record(TurnTrace.new("sess", "m", "one").finalize("answered"))
+    (d / "leftover.json").write_text('{"turn_id": "leftover", "session_id": "old"}')
+    (d / "dead.json.tmp").write_text("{")
+    assert store.clear() == 2  # the recorded turn + the leftover
+    assert list(d.iterdir()) == []
+    assert store.list_for_session("sess") == []
+    store.record(TurnTrace.new("sess", "m", "two").finalize("answered"))  # still usable
+    assert len(store.list_for_session("sess")) == 1
+
+
+def test_clear_memory_only_store():
+    store = TraceStore(None)
+    store.record(TurnTrace.new("sess", "m", "one").finalize("answered"))
+    assert store.clear() == 1
+    assert store.list_for_session("sess") == []
+
+
 def test_finalize_answered():
     t = TurnTrace.new("s", "m", "hi")
     t.steps.append(TraceStep(model_text="hello"))
@@ -255,3 +277,5 @@ def test_trace_routes_are_wired(tmp_path):
         assert client.get("/turns/nope").status_code == 404
         r = client.get("/sessions/whatever/turns")
         assert r.status_code == 200 and r.json() == {"turns": []}
+        r = client.delete("/traces")  # maintenance wipe (Settings ▸ "Clear traces")
+        assert r.status_code == 200 and r.json() == {"cleared": 0}

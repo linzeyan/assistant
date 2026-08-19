@@ -31,6 +31,7 @@ struct SettingsScreen: View {
     // Maintenance (clear logs / clear all conversations) — destructive, so gated behind a confirm.
     @State private var maintenanceNote: String?
     @State private var confirmClearLogs = false
+    @State private var confirmClearTraces = false
     @State private var confirmClearSessions = false
 
     @State private var fusionEnabled = false
@@ -281,18 +282,27 @@ struct SettingsScreen: View {
         Section("Maintenance") {
             HStack(spacing: 10) {
                 Button("Clear logs") { confirmClearLogs = true }
+                Button("Clear traces") { confirmClearTraces = true }
                 Button("Clear all conversations", role: .destructive) { confirmClearSessions = true }
             }
             if let maintenanceNote {
                 Text(maintenanceNote).font(.caption).foregroundStyle(.secondary)
             }
-            Text("Clear logs truncates the backend and app log files. Clear all conversations "
-                + "permanently deletes every saved chat — this can't be undone.")
+            Text("Clear logs truncates the backend and app log files. Clear traces deletes the "
+                + "per-turn debug recordings. Clear all conversations permanently deletes every "
+                + "saved chat — this can't be undone.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .confirmationDialog("Clear the backend and app logs?", isPresented: $confirmClearLogs) {
             Button("Clear logs", role: .destructive) { Task { await clearLogs() } }
             Button("Cancel", role: .cancel) {}
+        }
+        .confirmationDialog("Delete all recorded turn traces?", isPresented: $confirmClearTraces) {
+            Button("Clear traces", role: .destructive) { Task { await clearTraces() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Traces are per-turn debug recordings (model text, tool calls, results). "
+                + "Chats themselves are not affected.")
         }
         .confirmationDialog(
             "Delete every saved conversation?", isPresented: $confirmClearSessions
@@ -310,6 +320,15 @@ struct SettingsScreen: View {
             maintenanceNote = "Logs cleared."
         } catch {
             maintenanceNote = "Couldn't clear logs: \(error.localizedDescription)"
+        }
+    }
+
+    private func clearTraces() async {
+        do {
+            try await controller.client.clearTraces()
+            maintenanceNote = "Traces cleared."
+        } catch {
+            maintenanceNote = "Couldn't clear traces: \(error.localizedDescription)"
         }
     }
 
