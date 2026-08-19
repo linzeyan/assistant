@@ -37,6 +37,28 @@ async def test_edit_requires_unique_match(ctx, tools):
     assert ok.ok and (ctx.cwd / "g.txt").read_text() == "alpha gamma"
 
 
+async def test_a_failed_anchor_says_where_the_candidates_are(ctx, tools):
+    """Both failures name line numbers, because the observed failure mode is a model that
+    resends the identical anchor until the loop stops it. The anchor is nearly always right
+    except for indentation it dropped — which is also what makes a unique anchor ambiguous —
+    so the lines that nearly match are the one thing that lets it fix the call itself."""
+    (ctx.cwd / "s.swift").write_text("func run() {\n    check()\n}\n\nfunc check() {\n}\n")
+
+    dup = await tools["edit_file"].handler(
+        {"path": "s.swift", "old": "check()", "new": "check()\n    other()"}, ctx
+    )
+    assert dup.ok is False and "not unique" in dup.content
+    assert "2: " in dup.content, dup.content
+
+    # The anchor a model actually sends when it fails: the first line is right and the
+    # indentation of the second is not, so the whole snippet matches nothing.
+    missing = await tools["edit_file"].handler(
+        {"path": "s.swift", "old": "func run() {\ncheck()", "new": "x"}, ctx
+    )
+    assert missing.ok is False and "not found" in missing.content
+    assert "1: func run() {" in missing.content, missing.content
+
+
 async def test_glob_and_grep(ctx, tools):
     (ctx.cwd / "one.py").write_text("import os\nVALUE = 1\n")
     (ctx.cwd / "two.py").write_text("VALUE = 2\n")

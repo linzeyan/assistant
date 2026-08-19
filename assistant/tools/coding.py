@@ -82,6 +82,20 @@ async def write_file(args: dict, ctx: ToolContext) -> ToolResult:
     return ToolResult(True, f"wrote {len(args['content'])} chars to {p}")
 
 
+def _lines_resembling(text: str, old: str, limit: int = 5) -> str:
+    """`n: line` for each line holding the stripped first line of `old`.
+
+    Matched stripped, and on the first line only, because that is what an anchor that failed
+    over indentation or over a later line still has right — matching the whole snippet would
+    find nothing, which is the situation being reported.
+    """
+    wanted = old.strip().splitlines()[0].strip() if old.strip() else ""
+    if not wanted:
+        return ""
+    hits = [f"{n}: {line}" for n, line in enumerate(text.splitlines(), 1) if wanted in line]
+    return "\n".join(hits[:limit])
+
+
 @registry.tool(
     name="edit_file",
     description="Replace a unique snippet of text in a file with new text.",
@@ -105,10 +119,27 @@ async def edit_file(args: dict, ctx: ToolContext) -> ToolResult:
     text = p.read_text(errors="replace")
     old = args["old"]
     count = text.count(old)
+    # Both failures below report *where*, because a model told only that its anchor failed
+    # retries the identical call: observed three times in a row on one edit, which is a wedged
+    # turn rather than a mistake it can recover from. The near-miss lines are what let it fix
+    # the call — the anchor is nearly always right except for leading whitespace it dropped,
+    # which is also what turns a unique anchor into an ambiguous one.
     if count == 0:
-        return ToolResult(False, "old snippet not found")
+        near = _lines_resembling(text, old)
+        if near:
+            return ToolResult(
+                False,
+                "old snippet not found. These lines hold its first line — the difference is "
+                f"probably leading whitespace, or a later line that has changed:\n{near}",
+            )
+        return ToolResult(False, "old snippet not found, and no line resembles its first")
     if count > 1:
-        return ToolResult(False, f"old snippet is not unique ({count} occurrences)")
+        return ToolResult(
+            False,
+            f"old snippet is not unique ({count} occurrences). Sending it again unchanged will "
+            "fail again: put back the leading whitespace, or extend the snippet with the line "
+            f"above or below it.\n{_lines_resembling(text, old)}",
+        )
     p.write_text(text.replace(old, args["new"], 1))
     return ToolResult(True, f"edited {p}")
 
