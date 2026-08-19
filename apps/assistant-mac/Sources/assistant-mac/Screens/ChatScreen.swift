@@ -412,7 +412,10 @@ private struct AssistantBubble: View {
                 case .prose(let p):
                     let trimmed = p.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !trimmed.isEmpty {
-                        Text(trimmed).textSelection(.enabled)
+                        // Rendered as markdown: models answer in it whether or not we render
+                        // it, and raw ``` fences / ## headings read terribly. Copy still
+                        // takes the raw prose (proseText), so the clipboard stays markdown.
+                        MarkdownText(text: trimmed)
                     }
                 case .think(let inner):
                     CollapsibleBlock(title: "Thinking", systemImage: "brain", text: inner)
