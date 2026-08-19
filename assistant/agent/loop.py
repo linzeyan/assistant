@@ -286,6 +286,7 @@ class AgentLoop:
                     return
                 text_parts: list[str] = []
                 tool_calls: list[dict] | None = None
+                truncated = False
                 step = TraceStep() if trace is not None else None
 
                 send_messages = self._messages_for_send(session.messages, context_blocks)
@@ -310,6 +311,7 @@ class AgentLoop:
                         # Token counts for the Anthropic compat route only; the GUI/gateway SSE has
                         # no use for them. Swallow here so it doesn't reach the client. (A future
                         # token-accounting feature would consume ev["input_tokens"]/["output_tokens"].)
+                        truncated = ev.get("finish_reason") == "length"
                         continue
                     else:
                         # Forward any other event the model layer emits (e.g. Fusion's panel
@@ -327,6 +329,24 @@ class AgentLoop:
 
                 if not tool_calls:
                     answer = "".join(text_parts)
+                    # A reply that stopped because it ran out of output budget is not an
+                    # answer, whatever it happens to end on. Reported rather than returned:
+                    # a model that spent its whole budget deliberating leaves prose that
+                    # reads like a considered reply, the caller acts on it, and the work it
+                    # was actually asked for was never started. Observed twice on a coding
+                    # task, each time costing ten minutes and producing no edit at all.
+                    if truncated:
+                        if trace is not None:
+                            self._trace.record(trace.finalize("error"))
+                        yield {
+                            "type": "error",
+                            "detail": "the model ran out of output budget before it "
+                            "finished — its reply was cut off mid-generation, so nothing "
+                            "it says here is a conclusion. Raise max_output_tokens, or "
+                            "lower the model's reasoning effort so it spends less of the "
+                            "budget before acting",
+                        }
+                        return
                     # A turn that produced only reasoning decided nothing: it called no
                     # tool and said nothing outside <think>. Handing that back as the
                     # answer gives the caller the model's scratchpad and reports a

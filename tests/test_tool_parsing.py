@@ -4,6 +4,7 @@ from assistant.models.tool_parsing import (
     earliest_marker,
     normalize_arguments,
     parse_tool_calls,
+    strip_think_blocks,
 )
 
 
@@ -325,3 +326,20 @@ def test_plain_function_does_not_shadow_named_xml_form():
     calls = parse_tool_calls(text)
     assert [c.name for c in calls] == ["web_search"]
     assert calls[0].arguments == {"query": "taipei"}
+
+
+def test_strip_think_blocks_closes_a_block_the_prompt_opened():
+    # Qwen3.x's generation prompt ends with a bare `<think>`, so the reply's only tag is the
+    # close. Read literally there is no reasoning here at all, and a turn that was nothing but
+    # scratchpad would be reported as an answer.
+    assert strip_think_blocks("weighing it up</think>\n\nUse the second.").strip() == (
+        "Use the second."
+    )
+    assert strip_think_blocks("only ever reasoned</think>").strip() == ""
+
+
+def test_strip_think_blocks_leaves_a_matched_pair_alone():
+    # The dangling case is recognised by a close that precedes any open; a normal pair must
+    # still be stripped by the loop below it rather than by that branch.
+    assert strip_think_blocks("<think>a</think>b") == "b"
+    assert strip_think_blocks("head <think>a</think> tail") == "head  tail"

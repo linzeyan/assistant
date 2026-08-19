@@ -359,6 +359,24 @@ def test_messages_for_template_preserves_unparseable_args():
     assert out[0]["tool_calls"][0]["function"]["arguments"] == "not json"
 
 
+def test_messages_for_template_lifts_reasoning_the_prompt_opened():
+    # Qwen3.x's template ends its generation prompt with a bare `<think>`, so the reply carries
+    # only the closing tag. Left in `content`, that scratchpad is replayed as prose on every
+    # later render — the template can only drop reasoning it finds in `reasoning_content`.
+    msgs = [{"role": "assistant", "content": "weighing the options</think>\n\nUse the second."}]
+    out = _messages_for_template(msgs)
+    assert out[0]["content"] == "Use the second."
+    assert out[0]["reasoning_content"] == "weighing the options"
+    assert msgs[0]["content"].startswith("weighing")  # copy-on-write, as above
+
+
+def test_messages_for_template_leaves_a_properly_opened_block_alone():
+    # The pre-opened case is recognised by the *absence* of an opener. A model that emits both
+    # tags is the ordinary path and must not be split by this branch.
+    msgs = [{"role": "assistant", "content": "<think>a</think>b"}]
+    assert _messages_for_template(msgs)[0]["content"] == "<think>a</think>b"
+
+
 def test_render_prompt_forwards_template_kwargs():
     # Fusion disables thinking via the chat template (Qwen3.x `enable_thinking=False` swaps the
     # open `<think>` for an empty block). The kwargs must reach the templater on BOTH paths —

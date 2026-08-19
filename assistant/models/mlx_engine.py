@@ -234,6 +234,24 @@ class ModelAdmissionError(RuntimeError):
 _THINK_RE = re.compile(r"^\s*<think>(.*?)</think>\s*(.*)$", re.DOTALL)
 
 
+def _split_preopened_think(content: str) -> tuple[str, str] | None:
+    """``(reasoning, answer)`` where the model was already inside a think block when it started
+    generating, else None.
+
+    Qwen3.x's template ends its generation prompt with a bare ``<think>``, so the reply opens
+    inside the block and the only tag the model ever emits is the *closing* one. Nothing that
+    looks for a ``<think>`` finds anything, so the whole scratchpad is kept as the answer: the
+    caller is handed the model's reasoning with a stray ``</think>`` in the middle of it, and —
+    worse — the next render replays that text as prose, because the template puts reasoning in
+    its own ``reasoning_content`` field and this never reached it. Every later turn then carries
+    every earlier turn's thinking, in the one form the template cannot strip.
+    """
+    if "<think>" in content or "</think>" not in content:
+        return None
+    reasoning, _, answer = content.partition("</think>")
+    return reasoning.strip(), answer.strip()
+
+
 def _messages_for_template(messages: list[dict], harmony: bool = False) -> list[dict]:
     """Return messages reshaped for chat-template rendering only: assistant tool_calls'
     ``arguments`` parsed from JSON string to a dict, and (for harmony models) reasoning
@@ -261,6 +279,13 @@ def _messages_for_template(messages: list[dict], harmony: bool = False) -> list[
                 m = {**m, "content": tm.group(2).strip()}
                 if tm.group(1).strip():
                     m["thinking"] = tm.group(1).strip()
+            elif (split := _split_preopened_think(m["content"])) is not None:
+                # ``reasoning_content`` is the field Qwen3.x's template reads, and it is the
+                # template's own decision whether to replay it — which is the point: reasoning
+                # left in ``content`` is replayed unconditionally and forever.
+                m = {**m, "content": split[1]}
+                if split[0]:
+                    m["reasoning_content"] = split[0]
         tcs = m.get("tool_calls") if isinstance(m, dict) else None
         if not tcs:
             out.append(m)
@@ -691,6 +716,52 @@ class MlxEngine:
             # mismatched cache would corrupt the next turn's prefix reuse.
 
 
+# APC pool geometry. Blocks are the unit of KV reuse; a lookup matches whole blocks of a
+# prompt's leading tokens, so a smaller block wastes less at the boundary and 16 is the
+# library's own default.
+#
+# The block count is the only real decision, and it is a memory budget: this model's KV is
+# 2 (K and V) × 64 layers × 4 KV heads × 256 head_dim × 2 bytes = 256 KB per token, so 4096
+# blocks is 65,536 tokens ≈ 16 GB held beside ~30 GB of weights. That is sized for what this
+# backend is actually asked to do — an agent turn whose conversation grows to 60–90k tokens
+# across forty tool calls — where the pool has to hold one turn's prefix for the next
+# iteration to match it. Raise it on a machine with room; the cost is linear and paid in
+# resident memory, the benefit is prefill that stops growing with the conversation.
+_APC_BLOCK_SIZE = 16
+_APC_NUM_BLOCKS = 4096
+
+
+def _apc_manager_for(model: object):
+    """A prefix cache for ``model``, or None where one cannot be used.
+
+    One manager per loaded model, never shared: APC keys blocks by the hash of the token ids
+    alone, with nothing in it that says which model produced them, so a pool serving two
+    models would hand one of them the other's K/V.
+
+    Off rather than fatal when the model's cache layout isn't one APC can reconstruct — the
+    alternative is an AttributeError from inside ``stream_generate`` on every turn — but the
+    reason is logged, because "the assistant got slower" is otherwise the only symptom.
+    """
+    try:
+        from mlx_vlm import apc as vlm_apc
+    except Exception as exc:  # an mlx-vlm too old to have APC at all
+        log.info("prefix cache unavailable (mlx-vlm has no apc module): %s", exc)
+        return None
+    language_model = getattr(model, "language_model", None)
+    if language_model is None:
+        log.info("prefix cache off: this model exposes no language_model to cache")
+        return None
+    mode = vlm_apc.model_apc_mode(language_model)
+    if mode is None:
+        log.info("prefix cache off: this model's cache layout is not one APC can rebuild")
+        return None
+    log.info(
+        "prefix cache on (mode=%s, %d blocks × %d tokens)",
+        mode, _APC_NUM_BLOCKS, _APC_BLOCK_SIZE,
+    )
+    return vlm_apc.APCManager(num_blocks=_APC_NUM_BLOCKS, block_size=_APC_BLOCK_SIZE)
+
+
 class VlmChatEngine:
     """A loaded mlx-vlm model used as a *text* chat model.
 
@@ -700,11 +771,27 @@ class VlmChatEngine:
     Image *input* isn't wired into chat here; the agent reads images via the separate
     ``view_image`` tool. The processor proxies the model's chat template, so multi-turn
     role handling matches the LLM path.
+
+    Prompt reuse is APC's rather than ``MlxEngine``'s ``PromptCacheStore``: mlx-vlm takes no
+    ``prompt_cache`` from a caller, but it does take a prefix-cache manager and match a new
+    prompt's leading blocks against it. Without one, every tool call in an agent turn
+    re-prefills the whole conversation from the system prompt down, which is quadratic in the
+    number of calls and was the dominant cost of a long turn — minutes per call by the
+    fortieth, against seconds for the first.
     """
 
     def __init__(self, model: object, processor: object):
         self._model = model
         self._processor = processor
+        self._apc = _apc_manager_for(model)
+        # Matched-token total as of the last generation, so each line can report its own turn.
+        self._apc_matched = 0
+
+    def _generate_kwargs(self) -> dict:
+        """What this engine adds to ``stream_generate`` beyond the prompt. Empty here; the
+        speculative subclass is the reason it exists, so that both share one generate loop
+        and one place where prefix caching and the timing line are wired."""
+        return {}
 
     def _templater(self):
         return getattr(self._processor, "apply_chat_template", None) or getattr(
@@ -718,8 +805,7 @@ class VlmChatEngine:
         chat_template_kwargs: dict | None = None,
     ) -> int:
         """Token length of the rendered prompt, via the processor's tokenizer. Mirrors MlxEngine so
-        /v1/messages/count_tokens works for VLM-loaded chat models too (mlx-vlm has no prompt cache,
-        so these don't get the KV reuse, but counting must still not crash)."""
+        /v1/messages/count_tokens works for VLM-loaded chat models too."""
         prompt = _render_prompt(self._templater(), messages, tools, chat_template_kwargs)
         tok = getattr(self._processor, "tokenizer", None) or self._processor
         return len(tok.encode(prompt))
@@ -730,20 +816,74 @@ class VlmChatEngine:
         tools: list[dict] | None = None,
         max_tokens: int = 1024,
         chat_template_kwargs: dict | None = None,
+        usage_out: dict | None = None,
         **_ignored,
     ) -> Iterator[str]:
         from mlx_vlm import stream_generate
 
-        templater = self._templater()
-        prompt = _render_prompt(templater, messages, tools, chat_template_kwargs)
+        prompt = _render_prompt(self._templater(), messages, tools, chat_template_kwargs)
+        kwargs = dict(self._generate_kwargs())
+        if self._apc is not None:
+            # No tenant: the namespace only exists to keep conversations apart, and keeping
+            # them together is the point — every turn of every session shares a system prompt,
+            # and that prefix is the largest block run any of them can match.
+            kwargs["apc_manager"] = self._apc
+        t0 = time.monotonic()
+        ttft: float | None = None
+        last = None
         for chunk in stream_generate(
-            self._model, self._processor, prompt, max_tokens=max_tokens
+            self._model, self._processor, prompt, max_tokens=max_tokens, **kwargs
         ):
+            # Draft chunks are the drafter's speculative preview; the accepted text arrives
+            # again in normal chunks — forwarding both would duplicate output. Always checked,
+            # not only under the speculative subclass: a plain run has no draft chunks to skip.
+            if getattr(chunk, "is_draft", False):
+                continue
+            if ttft is None:
+                ttft = time.monotonic() - t0  # ≈ prefill time (first token out)
+            last = chunk
             text = getattr(chunk, "text", None)
             if text is None and isinstance(chunk, str):
                 text = chunk
             if text:
                 yield text
+        if usage_out is not None and last is not None:
+            usage_out["input_tokens"] = getattr(last, "prompt_tokens", 0) or 0
+            usage_out["output_tokens"] = getattr(last, "generation_tokens", 0) or 0
+            # "length" means the reply stopped because it ran out of budget, not because the
+            # model finished. Reported so the agent loop can say so: a truncated reply with no
+            # tool call in it is indistinguishable from a considered answer, and gets acted on
+            # as one — which is how a turn that ran out mid-sentence reports success.
+            usage_out["finish_reason"] = getattr(last, "finish_reason", None)
+        self._log_generation(last, ttft, t0)
+
+    def _log_generation(self, last: object, ttft: float | None, t0: float) -> None:
+        """The line that settles "why is this slow" on this path, as ``MlxEngine`` logs it on
+        the other: prefill is what a cache miss costs and is fixable by cache hygiene, decode
+        is the model's ceiling and is not.
+
+        ``reused`` is this turn's own matched-token count, differenced from the manager's
+        running totals rather than read off its ``token_hit_rate``. That ratio is served
+        tokens against matched ones, and the exact-snapshot path — the only one a hybrid
+        attention model can use — never counts a served token, so the ratio reads 100% for a
+        turn that reused sixteen tokens of a twenty-thousand-token prompt. A number that is
+        always 100% is worse than no number: it answers the question this line exists to ask.
+        """
+        if last is None:
+            return
+        reused = 0
+        if self._apc is not None:
+            stats = self._apc.stats_snapshot()
+            total = stats.get("matched_tokens", 0)
+            reused, self._apc_matched = total - self._apc_matched, total
+        log.info(
+            "generation: prompt=%d prefill=%.2fs decode=%d tok (%.1f tok/s) apc reused=%d",
+            getattr(last, "prompt_tokens", 0) or 0,
+            ttft or 0.0,
+            getattr(last, "generation_tokens", 0) or 0,
+            getattr(last, "generation_tps", 0.0) or 0.0,
+            reused,
+        )
 
 
 class SpeculativeVlmEngine(VlmChatEngine):
@@ -752,8 +892,8 @@ class SpeculativeVlmEngine(VlmChatEngine):
     MTP heads are split off their target model (e.g. ``…-27B-MTP-8bit``) and need the target's
     hidden states each step, so only mlx-vlm's speculative loop can drive them — mlx-lm's
     ``draft_model`` kwarg expects a standalone LM and cannot. That is why a drafted model loads
-    through mlx-vlm even when mlx-lm could serve it plainly; the trade is mlx-lm's prompt-cache
-    reuse for a faster decode.
+    through mlx-vlm even when mlx-lm could serve it plainly; the trade is mlx-lm's own prompt
+    cache for a faster decode, and APC on the base class is what buys the reuse back.
     """
 
     def __init__(self, model: object, processor: object, draft_model: object, draft_kind: str):
@@ -761,34 +901,8 @@ class SpeculativeVlmEngine(VlmChatEngine):
         self._draft_model = draft_model
         self._draft_kind = draft_kind
 
-    def stream_text(
-        self,
-        messages: list[dict],
-        tools: list[dict] | None = None,
-        max_tokens: int = 1024,
-        chat_template_kwargs: dict | None = None,
-        **_ignored,
-    ) -> Iterator[str]:
-        from mlx_vlm import stream_generate
-
-        prompt = _render_prompt(self._templater(), messages, tools, chat_template_kwargs)
-        for chunk in stream_generate(
-            self._model,
-            self._processor,
-            prompt,
-            max_tokens=max_tokens,
-            draft_model=self._draft_model,
-            draft_kind=self._draft_kind,
-        ):
-            # Draft chunks are the drafter's speculative preview; the accepted text arrives
-            # again in normal chunks — forwarding both would duplicate output.
-            if getattr(chunk, "is_draft", False):
-                continue
-            text = getattr(chunk, "text", None)
-            if text is None and isinstance(chunk, str):
-                text = chunk
-            if text:
-                yield text
+    def _generate_kwargs(self) -> dict:
+        return {"draft_model": self._draft_model, "draft_kind": self._draft_kind}
 
 
 def _load_speculative(path: Path, draft_path: Path) -> SpeculativeVlmEngine:

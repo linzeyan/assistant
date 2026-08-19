@@ -398,9 +398,17 @@ def parse_tool_calls(
 
 def strip_think_blocks(text: str) -> str:
     """Text with ``<think>…</think>`` regions removed. An unterminated ``<think>`` drops
-    everything after it: reasoning that never concluded must not contribute tool calls."""
+    everything after it: reasoning that never concluded must not contribute tool calls.
+
+    A ``</think>`` that arrives with no opening tag closes a block the *prompt* opened: Qwen3.x's
+    template ends its generation prompt with a bare ``<think>``, so the model emits only the
+    close. Read literally, none of that reply is reasoning — and a turn that was pure scratchpad
+    then reads as a real answer, which is the failure this function exists to catch.
+    """
     out: list[str] = []
-    rest = text
+    opened, closed = text.find("<think>"), text.find("</think>")
+    dangling = closed >= 0 and (opened < 0 or closed < opened)
+    rest = text[closed + len("</think>") :] if dangling else text
     while True:
         head, sep, tail = rest.partition("<think>")
         out.append(head)

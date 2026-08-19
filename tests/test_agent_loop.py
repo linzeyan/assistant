@@ -1036,3 +1036,40 @@ async def test_an_unterminated_think_block_is_reported(tmp_path):
     events = await _collect(loop.run(Session(id="r3"), "go", "m"))
 
     assert any(e["type"] == "error" for e in events)
+
+
+async def test_reply_cut_off_by_the_token_budget_is_an_error(tmp_path):
+    # WHY: a generation stopped by max_tokens leaves prose that reads like a considered
+    # reply. Returned as the answer, the caller acts on a sentence the model never
+    # finished — and on a coding task that means a turn that wrote nothing reports
+    # success. The usage event's finish_reason is the only thing that can tell them apart.
+    llm = FakeLLM(
+        [
+            [
+                {"type": "text", "content": "I should start by considering whether"},
+                {"type": "usage", "output_tokens": 8192, "finish_reason": "length"},
+            ]
+        ]
+    )
+    events = await _collect(
+        _loop(llm, tmp_path, approval_required=False).run(Session(id="s1"), "do it", "m")
+    )
+    assert [e["type"] for e in events][-1] == "error"
+    assert "ran out of output budget" in events[-1]["detail"]
+
+
+async def test_a_reply_that_stopped_on_its_own_is_still_an_answer(tmp_path):
+    # WHY: the check above must key on finish_reason and not on "there was a usage event",
+    # or every counted turn would be reported as truncated.
+    llm = FakeLLM(
+        [
+            [
+                {"type": "text", "content": "done"},
+                {"type": "usage", "output_tokens": 1, "finish_reason": "stop"},
+            ]
+        ]
+    )
+    events = await _collect(
+        _loop(llm, tmp_path, approval_required=False).run(Session(id="s1"), "do it", "m")
+    )
+    assert "error" not in [e["type"] for e in events]
