@@ -746,6 +746,77 @@ class VlmChatEngine:
                 yield text
 
 
+class SpeculativeVlmEngine(VlmChatEngine):
+    """A VlmChatEngine that decodes with a speculative drafter (MTP/DFlash/EAGLE).
+
+    MTP heads are split off their target model (e.g. ``…-27B-MTP-8bit``) and need the target's
+    hidden states each step, so only mlx-vlm's speculative loop can drive them — mlx-lm's
+    ``draft_model`` kwarg expects a standalone LM and cannot. That is why a drafted model loads
+    through mlx-vlm even when mlx-lm could serve it plainly; the trade is mlx-lm's prompt-cache
+    reuse for a faster decode.
+    """
+
+    def __init__(self, model: object, processor: object, draft_model: object, draft_kind: str):
+        super().__init__(model, processor)
+        self._draft_model = draft_model
+        self._draft_kind = draft_kind
+
+    def stream_text(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        max_tokens: int = 1024,
+        chat_template_kwargs: dict | None = None,
+        **_ignored,
+    ) -> Iterator[str]:
+        from mlx_vlm import stream_generate
+
+        prompt = _render_prompt(self._templater(), messages, tools, chat_template_kwargs)
+        for chunk in stream_generate(
+            self._model,
+            self._processor,
+            prompt,
+            max_tokens=max_tokens,
+            draft_model=self._draft_model,
+            draft_kind=self._draft_kind,
+        ):
+            # Draft chunks are the drafter's speculative preview; the accepted text arrives
+            # again in normal chunks — forwarding both would duplicate output.
+            if getattr(chunk, "is_draft", False):
+                continue
+            text = getattr(chunk, "text", None)
+            if text is None and isinstance(chunk, str):
+                text = chunk
+            if text:
+                yield text
+
+
+def _load_speculative(path: Path, draft_path: Path) -> SpeculativeVlmEngine:
+    """Load a chat model paired with a speculative drafter (the per-model "draft" setting).
+
+    The target loads through mlx-vlm (``_load_vlm``: same engine the speculative loop needs,
+    chat-template refusal included); the drafter loads via mlx-vlm's own ``load_drafter``, which
+    resolves the draft kind (mtp/dflash/eagle3) from the drafter's model_type. Compatibility is
+    validated structurally (hidden sizes), so a drafter for the wrong target fails loud here
+    instead of generating garbage.
+    """
+    engine = _load_vlm(path)
+    try:
+        from mlx_vlm.speculative.drafters import (
+            load_drafter,
+            validate_drafter_compatibility,
+        )
+    except ImportError as exc:  # an mlx-vlm too old to know drafters
+        raise RuntimeError(
+            "speculative decoding needs mlx-vlm with drafter support — update mlx-vlm "
+            "in Settings ▸ Managed tools, or clear this model's draft setting."
+        ) from exc
+    draft_model, draft_kind = load_drafter(str(draft_path))
+    validate_drafter_compatibility(engine._model, draft_model, draft_kind)
+    log.info("loaded speculative drafter (%s): %s", draft_kind, draft_path)
+    return SpeculativeVlmEngine(engine._model, engine._processor, draft_model, draft_kind)
+
+
 def _load_llm(path: Path) -> MlxEngine:
     from mlx_lm import load
 
@@ -832,11 +903,17 @@ def _load_vlm(path: Path) -> VlmChatEngine:
     return VlmChatEngine(model, processor)
 
 
-def _default_loader(path: Path, forced_kind: str | None = None) -> object:
+def _default_loader(
+    path: Path, forced_kind: str | None = None, draft_path: Path | None = None
+) -> object:
     # Dispatch by model family: a VL/omni checkpoint loads through mlx-vlm, everything else
     # through mlx-lm. ``forced_kind`` (a per-model type override) wins over auto-detection — it is
     # how a checkpoint we'd misclassify as VLM, and then crash the mlx-vlm loader on, is told to
     # load as a plain LLM and just work. When unset, classify_kind re-reads config.json from path.
+    # A paired drafter (per-model "draft" setting) forces the mlx-vlm speculative path — the only
+    # loop that can drive an MTP head — regardless of which engine would serve the model plainly.
+    if draft_path is not None:
+        return _load_speculative(path, draft_path)
     from .mlx_discovery import classify_kind
 
     kind = forced_kind or classify_kind(path)
@@ -887,10 +964,16 @@ class MlxEnginePool:
         return None if self._ceiling is not None else 1
 
     async def acquire(
-        self, model_id: str, path: Path, forced_kind: str | None = None
+        self,
+        model_id: str,
+        path: Path,
+        forced_kind: str | None = None,
+        draft_path: Path | None = None,
     ) -> object:
         """Return the loaded engine for ``model_id``, loading (and evicting) as needed.
-        ``forced_kind`` overrides the loader's auto-detection (per-model type override).
+        ``forced_kind`` overrides the loader's auto-detection (per-model type override);
+        ``draft_path`` pairs a speculative drafter checkpoint with the load. Both matter only
+        on a cold load — changing them for a resident model takes effect after unload.
 
         Raises ``ModelAdmissionError`` *before* loading if a memory ceiling is set and the model
         can't be made to fit — fail loud rather than OOM-crash."""
@@ -917,9 +1000,12 @@ class MlxEnginePool:
             # (mlx-vlm stream affinity), so the executor is created first and the load is its
             # first job. Torn down when the model leaves the pool.
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"mlx-{model_id}")
+            # draft_path is appended only when set so injected test loaders (and any older
+            # two-arg loader) keep their (path, forced_kind) signature.
+            args = (path, forced_kind) if draft_path is None else (path, forced_kind, draft_path)
             try:
                 engine = await asyncio.get_running_loop().run_in_executor(
-                    executor, self._loader, path, forced_kind
+                    executor, self._loader, *args
                 )
             except BaseException:
                 # A failed load still ran mlx code on this thread, so it retires like any other.
@@ -1044,8 +1130,14 @@ class MlxEnginePool:
             + ". Free memory (unload other models / close apps) or pick a smaller model."
         )
 
-    async def load(self, model_id: str, path: Path, forced_kind: str | None = None) -> None:
-        await self.acquire(model_id, path, forced_kind)
+    async def load(
+        self,
+        model_id: str,
+        path: Path,
+        forced_kind: str | None = None,
+        draft_path: Path | None = None,
+    ) -> None:
+        await self.acquire(model_id, path, forced_kind, draft_path)
 
     async def unload(self, model_id: str) -> bool:
         async with self._lock:

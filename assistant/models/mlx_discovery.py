@@ -26,7 +26,7 @@ class DiscoveredModel:
     id: str  # stable identifier the rest of the app uses to load/switch
     path: Path  # directory passed to ``mlx_lm.load``
     source: str  # "local" | "hf_cache"
-    kind: str = "llm"  # "llm" | "vlm" | "embedding" — which engine can load it
+    kind: str = "llm"  # llm|vlm|embedding|image|video|audio|draft — which engine can load it
     size_bytes: int = 0  # on-disk footprint, so the GUI can show / manage capacity
 
 
@@ -104,7 +104,18 @@ _VIDEO_TYPES = {"s2v", "ti2v", "t2v", "i2v"}
 # `WhisperForConditionalGeneration` arch, so without this they fail open to "llm" and land in the
 # CHAT picker — where mlx-lm cannot load them at all (the same class of bug as the Wan video
 # models, N27). They belong to the audio backend (transcribe_audio), not the chat list.
+# The "fish_" prefix covers mlx-audio's Fish TTS family (fish_qwen3_omni / fish_s1_dac …):
+# their config is a text LLM plus an audio decoder head, so they too fail open to "llm"
+# and pollute the chat picker (observed: mlx-community/fish-audio-s2-pro-bf16).
 _AUDIO_TYPES = {"whisper", "wav2vec2", "hubert", "parakeet"}
+_AUDIO_TYPE_PREFIXES = ("fish_",)
+# Speculative-decoding drafter checkpoints (MTP heads split off a target model, DFlash/EAGLE
+# assistants). They are not standalone models — the target supplies embeddings and the LM head —
+# so they must never appear in a chat picker; they pair with a target via the per-model "draft"
+# setting instead. The names mirror mlx-vlm's DRAFTER_KIND_BY_MODEL_TYPE (hardcoded here because
+# discovery is pure filesystem inspection and must not import mlx-vlm).
+_DRAFT_TYPES = {"eagle3", "gemma4_assistant", "gemma4_unified_assistant"}
+_DRAFT_TYPE_SUFFIXES = ("_mtp", "_dflash")
 # Diffusion image-pipeline class/arch markers (FLUX, Qwen-Image via mflux). A diffusers
 # pipeline declares its class in model_index.json (_class_name "FluxPipeline" / "QwenImage…").
 _IMAGE_CLASS_MARKERS = ("flux", "qwenimage", "qwen_image", "stablediffusion")
@@ -177,9 +188,18 @@ def classify_kind(d: Path) -> str:
     # /video picker's is_video_checkpoint filter excludes it too.
     if (d / "vae.safetensors").is_file():
         return "video"
+    # Speculative drafters before the audio/vision/LLM rules: an MTP head's config mirrors its
+    # target's text_config (it would read as a plain "llm") but the checkpoint holds only the
+    # drafter weights — loading it as a chat model dies, exactly the N27 failure class.
+    if mtype in _DRAFT_TYPES or mtype.endswith(_DRAFT_TYPE_SUFFIXES):
+        return "draft"
     # Speech/ASR before the vision + LLM rules: Whisper's arch ends in "…ForConditionalGeneration"
     # and carries no vision_config, so it would otherwise fall straight through to "llm".
-    if mtype in _AUDIO_TYPES or any(t in arch for t in _AUDIO_TYPES):
+    if (
+        mtype in _AUDIO_TYPES
+        or mtype.startswith(_AUDIO_TYPE_PREFIXES)
+        or any(t in arch for t in _AUDIO_TYPES)
+    ):
         return "audio"
     # Vision-language first: a VL config also carries a causal-LM head, so it would
     # otherwise read as a plain LLM. ``vision_config`` is the strongest signal.

@@ -307,6 +307,33 @@ def test_classify_kind_whisper_is_audio_not_chat(tmp_path):
     assert classify_kind(d) == "audio"
 
 
+def test_classify_kind_fish_tts_is_audio_not_chat(tmp_path):
+    # mlx-community/fish-audio-s2-pro-bf16 declares model_type "fish_qwen3_omni" (mlx-audio's
+    # Fish TTS family): a text LLM plus an audio decoder head, no architectures key at all — so
+    # it failed open to "llm" and landed in the CHAT picker. It belongs to the audio backend.
+    d = tmp_path / "fish-audio-s2-pro-bf16"
+    d.mkdir()
+    (d / "config.json").write_text(
+        json.dumps({"model_type": "fish_qwen3_omni", "audio_decoder_config": {"dim": 2560}})
+    )
+    (d / "model.safetensors").write_bytes(b"\x00")
+    assert classify_kind(d) == "audio"
+
+
+def test_classify_kind_mtp_drafter_is_draft_not_chat(tmp_path):
+    # An MTP drafter (mlx-community/Qwen3.8-27B-MTP-8bit, model_type "qwen3_5_mtp") mirrors its
+    # target's text_config, so it read as a plain "llm" and polluted the chat picker — but the
+    # checkpoint holds only drafter weights (no embeddings/LM head) and is not standalone. It
+    # pairs with a target via the per-model "draft" setting instead.
+    d = tmp_path / "Qwen3.8-27B-MTP-8bit"
+    d.mkdir()
+    (d / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5_mtp", "block_size": 3, "text_config": {"hidden_size": 5120}})
+    )
+    (d / "model.safetensors").write_bytes(b"\x00")
+    assert classify_kind(d) == "draft"
+
+
 def _discovered(path, kind="llm"):
     return DiscoveredModel(id=path.name, path=path, source="local", kind=kind, size_bytes=1)
 

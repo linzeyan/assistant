@@ -13,6 +13,9 @@ Three independent concerns share one store/file/API:
   every render (e.g. Qwen3.x ``enable_thinking: false``, which swaps the open ``<think>`` in the
   generation prompt for an empty block so the model answers directly). Templates ignore variables
   they don't know, so these are safe to store for any model.
+- **Draft pairing** — the model id of a speculative drafter (an MTP/DFlash/EAGLE checkpoint,
+  kind "draft") to decode this model with. Set → the model loads through mlx-vlm's speculative
+  path; unset → plain decoding.
 
 The concerns are kept apart at read time: generation params are merged into sampling kwargs, but
 ``type``/``chat_template_kwargs`` must NOT be (a stray kwarg would break generation, and the
@@ -32,7 +35,7 @@ ALLOWED_KEYS = ("temperature", "top_p", "top_k", "max_tokens")
 # Kinds a user may force via the type override. "auto" is the UI's way to clear it (→ detection);
 # it is never stored. These MUST match mlx_discovery.classify_kind's outputs so a forced kind
 # routes the loader and filters into the right Models tab identically to a detected one.
-VALID_TYPES = ("llm", "vlm", "image", "video", "embedding")
+VALID_TYPES = ("llm", "vlm", "image", "video", "embedding", "audio", "draft")
 
 
 def _clean_template_kwargs(value) -> dict:
@@ -57,6 +60,12 @@ def _clean(settings: dict) -> dict:
     t = settings.get("type")
     if isinstance(t, str) and t.strip().lower() in VALID_TYPES:
         out["type"] = t.strip().lower()
+    # Speculative-decoding drafter: the model id of an MTP/DFlash/EAGLE checkpoint to pair with
+    # this model at load time. Just a reference — resolution/compatibility is checked at load,
+    # where the drafter's weights and the target actually meet.
+    d = settings.get("draft")
+    if isinstance(d, str) and d.strip():
+        out["draft"] = d.strip()
     tpl = _clean_template_kwargs(settings.get("chat_template_kwargs"))
     if tpl:
         out["chat_template_kwargs"] = tpl
@@ -88,6 +97,11 @@ class PerModelStore:
         """The forced kind for this model, or None to auto-detect."""
         t = self._data.get(model_id, {}).get("type")
         return t if t in VALID_TYPES else None
+
+    def draft_model(self, model_id: str) -> str | None:
+        """The paired speculative drafter's model id, or None when the model decodes plainly."""
+        d = self._data.get(model_id, {}).get("draft")
+        return d if isinstance(d, str) and d else None
 
     def chat_template_kwargs(self, model_id: str) -> dict:
         """This model's saved chat-template variables ({} when none). Merged into the

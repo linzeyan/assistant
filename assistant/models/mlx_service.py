@@ -205,6 +205,33 @@ class MlxModelService(ModelService):
                 entry = replace(entry, kind=override)
         return entry
 
+    async def _draft_path_for(self, model_id: str) -> Path | None:
+        """Resolve this model's paired speculative drafter (per-model "draft" setting) to the
+        drafter checkpoint's path, or None when no drafter is configured. Fail-loud on a bad
+        pairing: an unknown drafter id or a non-draft checkpoint raises here, at load time,
+        instead of surfacing as an opaque weight-shape error inside mlx-vlm."""
+        if self._per_model is None:
+            return None
+        draft_id = self._per_model.draft_model(model_id)
+        if not draft_id:
+            return None
+        entry = await self._entry_for(draft_id)  # ValueError("unknown model: …") if missing
+        if entry.kind != "draft":
+            raise ValueError(
+                f"'{draft_id}' is a {entry.kind} model, not a speculative drafter — "
+                f"pick an MTP/DFlash/EAGLE checkpoint (kind 'draft') or clear the setting."
+            )
+        return entry.path
+
+    async def _acquire(self, model_id: str, entry: DiscoveredModel):
+        """Pool acquire with the model's drafter (if any) resolved — the single path every
+        engine-needing call takes, so chat, token counting and explicit loads all get the
+        same engine variant for a given configuration."""
+        draft_path = await self._draft_path_for(model_id)
+        return await self._pool.acquire(
+            model_id, entry.path, forced_kind=entry.kind, draft_path=draft_path
+        )
+
     # Kinds usable as a chat model — the shared definition (model_traits.CHATTABLE_KINDS), so the
     # load gate, the GUI picker and the Telegram picker can never drift apart.
     _CHATTABLE_KINDS = CHATTABLE_KINDS
@@ -279,7 +306,7 @@ class MlxModelService(ModelService):
             return  # virtual model: nothing to load (its panel models load on demand)
         entry = await self._entry_for(model_id)
         self._require_chat_model(entry)
-        await self._pool.load(model_id, entry.path, forced_kind=entry.kind)
+        await self._acquire(model_id, entry)
 
     async def unload(self, model_id: str) -> None:
         await self._pool.unload(model_id)
@@ -328,7 +355,7 @@ class MlxModelService(ModelService):
             return None
         entry = await self._entry_for(model)
         self._require_chat_model(entry)
-        engine = await self._pool.acquire(model, entry.path, forced_kind=entry.kind)
+        engine = await self._acquire(model, entry)
         counter = getattr(engine, "count_tokens", None)
         if counter is None:  # an engine variant that can't count → unknown, never a 500
             return None
@@ -379,7 +406,7 @@ class MlxModelService(ModelService):
     ) -> AsyncIterator[dict]:
         entry = await self._entry_for(model)
         self._require_chat_model(entry)
-        engine = await self._pool.acquire(model, entry.path, forced_kind=entry.kind)
+        engine = await self._acquire(model, entry)
         # Generation MUST run on the thread the model was loaded on: mlx-vlm binds a GPU
         # stream to the load thread and raises "There is no Stream(gpu, N) in current thread"
         # from any other (the bug that silently knocked VLM panel models out of fusion). No

@@ -64,6 +64,79 @@ async def test_type_override_reroutes_the_loader(tmp_path):
     assert seen == ["vlm"]  # the override, not the auto-detected "llm", reached the loader
 
 
+def _make_drafter(tmp_path: Path, name: str) -> Path:
+    import json
+
+    d = tmp_path / name
+    d.mkdir(parents=True)
+    (d / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5_mtp", "block_size": 3})
+    )
+    (d / "model.safetensors").write_bytes(b"\x00")
+    return d
+
+
+async def test_draft_setting_reaches_the_loader(tmp_path):
+    # The per-model "draft" pairing must reach the loader as the drafter's path, so the pool
+    # loads the model through the speculative engine instead of the plain one.
+    from assistant.models.per_model_store import PerModelStore
+
+    _make_model(tmp_path, "qwen")
+    _make_drafter(tmp_path, "qwen-mtp")
+    seen: list[tuple] = []
+
+    def recording_loader(path, forced_kind=None, draft_path=None):
+        seen.append((forced_kind, draft_path))
+        return FakeEngine(("hi",))
+
+    store = PerModelStore(tmp_path / "pm.json")
+    store.set("qwen", {"draft": "qwen-mtp"})
+    svc = MlxModelService(
+        models_dir=tmp_path,
+        include_hf_cache=False,
+        pool=MlxEnginePool(max_loaded=2, loader=recording_loader),
+        per_model=store,
+        available_override=True,
+    )
+    await svc.start()
+    await svc.load("qwen")
+    assert seen == [("llm", tmp_path / "qwen-mtp")]
+
+
+async def test_draft_setting_rejects_unknown_and_non_draft_ids(tmp_path):
+    # Fail loud at load time: an unknown drafter id, or a checkpoint that isn't a drafter,
+    # must raise a clear error instead of surfacing as a weight-shape crash inside mlx-vlm.
+    from assistant.models.per_model_store import PerModelStore
+
+    _make_model(tmp_path, "qwen")
+    _make_model(tmp_path, "plain-llm")  # a chat model, not a drafter
+    store = PerModelStore(tmp_path / "pm.json")
+    svc = MlxModelService(
+        models_dir=tmp_path,
+        include_hf_cache=False,
+        pool=MlxEnginePool(max_loaded=2, loader=lambda p, _k=None, _d=None: FakeEngine(("hi",))),
+        per_model=store,
+        available_override=True,
+    )
+    await svc.start()
+    store.set("qwen", {"draft": "no-such-model"})
+    with pytest.raises(ValueError, match="unknown model"):
+        await svc.load("qwen")
+    store.set("qwen", {"draft": "plain-llm"})
+    with pytest.raises(ValueError, match="not a speculative drafter"):
+        await svc.load("qwen")
+
+
+async def test_drafter_checkpoint_is_not_chattable(tmp_path):
+    # A drafter is not standalone (no embeddings / LM head) — loading it as a chat model must
+    # be refused by the kind gate, same as image/video/audio checkpoints (the N27 class).
+    _make_drafter(tmp_path, "qwen-mtp")
+    svc = _service(tmp_path)
+    await svc.start()
+    with pytest.raises(ValueError, match="draft"):
+        await svc.load("qwen-mtp")
+
+
 async def test_type_override_shows_in_list_models(tmp_path):
     from assistant.models.per_model_store import PerModelStore
 

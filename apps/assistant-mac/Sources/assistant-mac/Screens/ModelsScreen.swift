@@ -18,7 +18,7 @@ struct ModelsScreen: View {
     /// classifies — image / video / audio (ASR) / embedding.
     private enum ModelKindTab: String, CaseIterable, Identifiable {
         case all = "All", chat = "Chat", image = "Image", video = "Video"
-        case audio = "Audio", embedding = "Embedding"
+        case audio = "Audio", embedding = "Embedding", draft = "Draft"
         var id: String { rawValue }
     }
 
@@ -33,6 +33,7 @@ struct ModelsScreen: View {
         case .video: return model.type == "video"
         case .audio: return model.type == "audio"
         case .embedding: return model.type == "embedding"
+        case .draft: return model.type == "draft"
         // The Chat tab is exactly what the Chat picker offers — the backend's own `chattable`
         // verdict, not a locally-maintained type list that drifts from it (this tab used to say
         // "anything but embedding", which let video and ASR checkpoints in).
@@ -246,12 +247,13 @@ struct ModelSettingsView: View {
     @State private var maxTokens = ""
     @State private var type = "auto"
     @State private var thinking = "auto"
+    @State private var draft = "none"
     @State private var saving = false
     @State private var error: String?
 
     // "auto" = trust detection; the rest force the loader (fixes a misdetected checkpoint, e.g. a
     // model wrongly seen as VLM that crashes the mlx-vlm loader — force it to load as a plain LLM).
-    private static let typeChoices = ["auto", "llm", "vlm", "image", "video", "embedding"]
+    private static let typeChoices = ["auto", "llm", "vlm", "image", "video", "embedding", "audio", "draft"]
     // Maps to the chat template's enable_thinking variable (Qwen3.x): "off" makes the model
     // answer directly instead of streaming untagged reasoning; "auto" leaves the template's
     // default. Templates without the variable ignore it, so the picker is safe on any model.
@@ -281,6 +283,20 @@ struct ModelSettingsView: View {
                 field("Top-p", $topP)
                 field("Top-k", $topK)
                 field("Max tokens", $maxTokens)
+                // Speculative decoding: pair this model with a drafter checkpoint (kind "draft",
+                // e.g. an …-MTP repo split off the same base model). Shown only when one exists.
+                if !draftChoices.isEmpty {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Draft").font(.caption2).foregroundStyle(.secondary)
+                        Picker("", selection: $draft) {
+                            Text("none").tag("none")
+                            ForEach(draftChoices, id: \.self) { Text($0).tag($0) }
+                        }
+                        .labelsHidden().frame(maxWidth: 220)
+                        .help("Decode with this speculative drafter (MTP) — faster output, "
+                              + "same quality. Reload the model after changing it.")
+                    }
+                }
             }
             HStack(spacing: 8) {
                 Button("Save") { Task { await save() } }.disabled(saving)
@@ -298,6 +314,11 @@ struct ModelSettingsView: View {
         .task { await load() }
     }
 
+    /// Discovered drafter checkpoints (kind "draft") — the only valid Draft picker entries.
+    private var draftChoices: [String] {
+        controller.models.filter { $0.type == "draft" }.map(\.id)
+    }
+
     private func field(_ label: String, _ binding: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 1) {
             Text(label).font(.caption2).foregroundStyle(.secondary)
@@ -312,6 +333,7 @@ struct ModelSettingsView: View {
         topK = s.topK.map { String($0) } ?? ""
         maxTokens = s.maxTokens.map { String($0) } ?? ""
         type = s.type ?? "auto"
+        draft = s.draft ?? "none"
         switch s.chatTemplateKwargs?.enableThinking {
         case .some(true): thinking = "on"
         case .some(false): thinking = "off"
@@ -328,6 +350,7 @@ struct ModelSettingsView: View {
         if let v = Int(topK) { body["top_k"] = v }
         if let v = Int(maxTokens) { body["max_tokens"] = v }
         if type != "auto" { body["type"] = type }  // "auto" omits it → clears the override
+        if draft != "none" { body["draft"] = draft }  // "none" omits it → plain decoding
         if thinking != "auto" {  // "auto" omits it → template default applies again
             body["chat_template_kwargs"] = ["enable_thinking": thinking == "on"]
         }

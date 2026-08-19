@@ -51,6 +51,21 @@ def test_type_override_is_kept_out_of_generation_params(tmp_path):
     assert s.get("m") == {"temperature": 0.5, "type": "vlm"}  # full view keeps both
 
 
+def test_draft_pairing_is_stored_and_isolated(tmp_path):
+    # The draft pairing (speculative drafter model id) persists, is surfaced via its own getter,
+    # and must never leak into sampler kwargs — it's load metadata, not a generation argument.
+    s = PerModelStore(tmp_path / "p.json")
+    s.set("m", {"draft": "mlx-community/Qwen3.8-27B-MTP-8bit", "temperature": 0.5})
+    assert s.draft_model("m") == "mlx-community/Qwen3.8-27B-MTP-8bit"
+    assert s.generation("m") == {"temperature": 0.5}
+    assert PerModelStore(tmp_path / "p.json").draft_model("m") == "mlx-community/Qwen3.8-27B-MTP-8bit"
+    # Blank / non-string clears the pairing.
+    s.set("m", {"draft": "  "})
+    assert s.draft_model("m") is None
+    s.set("m", {"draft": 42})
+    assert s.draft_model("m") is None
+
+
 def test_chat_template_kwargs_stored_validated_and_isolated(tmp_path):
     # 2-B: per-model chat-template variables (e.g. Qwen3.x enable_thinking). Stored as a dict of
     # scalars, surfaced via its own getter, and NEVER merged into generation params — a stray

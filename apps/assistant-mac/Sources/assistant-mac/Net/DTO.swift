@@ -74,7 +74,9 @@ struct ModelSettingsDTO: Decodable {
         let topP: Double?
         let topK: Int?
         let maxTokens: Int?
-        let type: String?  // forced kind override (llm/vlm/image/video/embedding); nil = auto
+        let type: String?  // forced kind override (llm/vlm/image/video/embedding/audio/draft); nil = auto
+        /// Paired speculative drafter (an MTP/DFlash/EAGLE checkpoint's model id); nil = plain decode.
+        let draft: String?
         // Chat-template variables the backend stores as a free dict; the GUI surfaces only
         // enable_thinking (the Thinking picker) — other keys stay API-managed.
         let chatTemplateKwargs: TemplateKwargs?
@@ -90,6 +92,7 @@ struct ModelSettingsDTO: Decodable {
             case topK = "top_k"
             case maxTokens = "max_tokens"
             case type
+            case draft
             case chatTemplateKwargs = "chat_template_kwargs"
         }
     }
