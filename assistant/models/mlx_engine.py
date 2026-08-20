@@ -730,6 +730,26 @@ class MlxEngine:
 _APC_BLOCK_SIZE = 16
 _APC_NUM_BLOCKS = 4096
 
+# How many exact-prefix snapshots the pool keeps, and it is a concurrency budget rather than a
+# memory one. A hybrid-attention model cannot reuse block by block — its recurrent state is not
+# block-concatenable — so every reuse on this path goes through APC's *exact* cache, and every
+# generation stores one snapshot into it. mlx-vlm's own default is 2, which is enough for one
+# conversation and exactly wrong for two: with A and B alternating, A's store evicts B's
+# snapshot and B's store evicts A's, so every single lookup misses.
+#
+# Not theoretical. Measured 2026-08-20 driving two agent tracks against this backend: `apc
+# reused=0` on all nine interleaved generations with prefill at 8–30 s, against `reused=8711`
+# and prefill 0.8–5 s the moment one track was left running alone. Wall clock per track was
+# about six times worse, which made two concurrent tracks slower in total than running them one
+# after the other.
+#
+# Six because it is two snapshots each for the three tracks a person actually drives at once,
+# and one entry is a full KV snapshot of that conversation's prompt — at 256 KB/token an
+# agent turn's 10k-token prompt is ~2.5 GB, so this is the number to lower on a smaller
+# machine. Set through the environment because the library reads it in `APCManager.__init__`
+# and takes no argument for it; `setdefault`, so an operator who has chosen a number keeps it.
+_APC_EXACT_CACHE_ENTRIES = "6"
+
 
 def _apc_manager_for(model: object):
     """A prefix cache for ``model``, or None where one cannot be used.
@@ -755,9 +775,11 @@ def _apc_manager_for(model: object):
     if mode is None:
         log.info("prefix cache off: this model's cache layout is not one APC can rebuild")
         return None
+    os.environ.setdefault("APC_EXACT_CACHE_ENTRIES", _APC_EXACT_CACHE_ENTRIES)
     log.info(
-        "prefix cache on (mode=%s, %d blocks × %d tokens)",
+        "prefix cache on (mode=%s, %d blocks × %d tokens, %s exact snapshots)",
         mode, _APC_NUM_BLOCKS, _APC_BLOCK_SIZE,
+        os.environ["APC_EXACT_CACHE_ENTRIES"],
     )
     return vlm_apc.APCManager(num_blocks=_APC_NUM_BLOCKS, block_size=_APC_BLOCK_SIZE)
 
