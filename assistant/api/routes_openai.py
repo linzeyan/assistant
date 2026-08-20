@@ -14,7 +14,7 @@ import uuid
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from assistant.api.compat import resolve_model, sampling_params
+from assistant.api.compat import reasoning_overrides, resolve_model, sampling_params
 
 router = APIRouter(tags=["openai-compat"])
 
@@ -57,6 +57,11 @@ async def chat_completions(request: Request):
     model = await resolve_model(service, body.get("model", ""))
     tools = body.get("tools")
     params = sampling_params(body)
+    # `reasoning_effort` is the OpenAI-side spelling of the same knob; validated against the
+    # model's template before it's forwarded (see reasoning_overrides).
+    overrides = await reasoning_overrides(service, model, body)
+    if overrides:
+        params["chat_template_overrides"] = overrides
     cid = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 

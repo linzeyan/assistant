@@ -29,6 +29,7 @@ from assistant.agent.fusion import FUSION_MODEL_ID
 
 from assistant.model_traits import CHATTABLE_KINDS
 
+from .chat_template import reasoning_support
 from .mlx_discovery import DiscoveredModel, discover_models, is_mlx_loadable
 from .mlx_engine import MlxEnginePool, _estimate_model_bytes, _total_ram_bytes
 from .service import ModelService
@@ -344,6 +345,15 @@ class MlxModelService(ModelService):
             return None
         return await asyncio.to_thread(_read_context_window, entry.path)
 
+    async def template_capabilities(self, model: str) -> dict:
+        """Which reasoning knobs this model's chat template understands (see ``chat_template``).
+
+        Off-thread and load-free — it reads the checkpoint's template source, so it answers for
+        models that have never been loaded. Raises ValueError for an unknown model id.
+        """
+        entry = await self._entry_for(model)
+        return await asyncio.to_thread(reasoning_support, entry.path)
+
     async def count_tokens(
         self, messages: list[dict], model: str, tools: list[dict] | None = None
     ) -> int | None:
@@ -380,6 +390,11 @@ class MlxModelService(ModelService):
         # decode several requests at once (Claude Code subagent fan-out). Popped here so it
         # never reaches an engine's stream_text.
         concurrent = bool(params.pop("concurrent", False))
+        # This turn's explicit template choices (the Chat header's Thinking/Effort menu). Kept in
+        # their own param so they can land LAST: the per-model settings below deliberately beat the
+        # caller's defaults, but a knob the user just flipped for this conversation must beat the
+        # model's saved default too, or the menu would silently do nothing on a configured model.
+        overrides = params.pop("chat_template_overrides", None) or {}
         # The model's saved overrides win over the caller's defaults (e.g. a per-model
         # max_tokens overrides the loop's global cap; temperature/top_p/top_k are added).
         if self._per_model is not None:
@@ -393,6 +408,11 @@ class MlxModelService(ModelService):
                     **(params.get("chat_template_kwargs") or {}),
                     **stored_tpl,
                 }
+        if overrides:
+            params["chat_template_kwargs"] = {
+                **(params.get("chat_template_kwargs") or {}),
+                **overrides,
+            }
         return self._stream(messages, model, tools, known, concurrent=concurrent, **params)
 
     async def _stream(

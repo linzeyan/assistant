@@ -27,20 +27,29 @@ class _OkService:
 class _BoomAgent:
     """Mirrors the real loop: the user message is recorded before the turn blows up."""
 
-    async def run(self, session, message, model, approver=None, cwd=None, max_iters=None):
+    async def run(
+        self, session, message, model, approver=None, cwd=None, max_iters=None,
+        template_kwargs=None,
+    ):
         session.add_user(message)
         raise RuntimeError("template render boom")
         yield  # pragma: no cover - unreachable, makes this an async generator
 
 
 class _RecordingAgent:
-    """Records the cwd the route handed the loop, then ends the turn immediately."""
+    """Records what the route handed the loop (cwd, per-turn template kwargs), then ends the
+    turn immediately."""
 
     def __init__(self):
         self.cwd = "unset"
+        self.template_kwargs = "unset"
 
-    async def run(self, session, message, model, approver=None, cwd=None, max_iters=None):
+    async def run(
+        self, session, message, model, approver=None, cwd=None, max_iters=None,
+        template_kwargs=None,
+    ):
         self.cwd = cwd
+        self.template_kwargs = template_kwargs
         session.add_user(message)
         yield {"type": "done", "usage": {}}
 
@@ -92,6 +101,30 @@ def test_workspace_defaults_to_none_when_omitted(tmp_path):
         agent = client.app.state.agent = _RecordingAgent()
         assert client.post("/chat", json={"message": "hi", "model": "m"}).status_code == 200
         assert agent.cwd is None  # the loop falls back to the configured workspace_dir
+
+
+def test_per_turn_reasoning_knobs_reach_the_loop(tmp_path):
+    """The Chat header's Thinking/Effort menu is per-conversation: it rides the request, so
+    flipping it must not require saving anything against the model."""
+    with _client(tmp_path) as client:
+        client.app.state.model_service = _OkService()
+        agent = client.app.state.agent = _RecordingAgent()
+        r = client.post(
+            "/chat",
+            json={"message": "hi", "model": "m", "thinking": False, "reasoning_effort": "low"},
+        )
+        assert r.status_code == 200
+        assert agent.template_kwargs == {"enable_thinking": False, "reasoning_effort": "low"}
+
+
+def test_unset_reasoning_knobs_send_nothing(tmp_path):
+    """"Model default" has to mean *absent*: pinning enable_thinking=True here would override
+    a model whose saved setting says otherwise."""
+    with _client(tmp_path) as client:
+        client.app.state.model_service = _OkService()
+        agent = client.app.state.agent = _RecordingAgent()
+        assert client.post("/chat", json={"message": "hi", "model": "m"}).status_code == 200
+        assert agent.template_kwargs == {}
 
 
 def test_workspace_that_is_not_a_directory_is_rejected(tmp_path):

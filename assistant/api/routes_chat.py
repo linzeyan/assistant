@@ -32,6 +32,13 @@ class ChatRequest(BaseModel):
     # checkouts (git worktrees, one task per tree) had no way to keep them apart. None keeps
     # the server default.
     workspace: str | None = None
+    # Per-turn reasoning knobs, forwarded into the model's chat template and beating that model's
+    # saved defaults (the Chat header's Thinking/Effort menu). None = whatever the model is
+    # configured for. ``reasoning_effort`` is only accepted by templates that declare it, and an
+    # unknown value makes some of them raise — clients read GET /models/{id}/settings
+    # ``capabilities`` for the value list rather than guessing.
+    thinking: bool | None = None
+    reasoning_effort: str | None = None
 
 
 class ApproveRequest(BaseModel):
@@ -61,6 +68,14 @@ async def chat(req: ChatRequest, request: Request):
         if not workspace.is_dir():
             raise HTTPException(status_code=400, detail=f"not a directory: {req.workspace}")
         workspace = str(workspace.resolve())
+
+    # Only keys the client actually set: an absent knob must leave the model's own default
+    # (and the per-model store's) alone rather than pinning it to a value we invented.
+    template_kwargs: dict = {}
+    if req.thinking is not None:
+        template_kwargs["enable_thinking"] = req.thinking
+    if req.reasoning_effort:
+        template_kwargs["reasoning_effort"] = req.reasoning_effort
 
     store = request.app.state.sessions
     agent = request.app.state.agent
@@ -93,6 +108,7 @@ async def chat(req: ChatRequest, request: Request):
                 approver=approver,
                 cwd=workspace,
                 max_iters=req_max_iters,
+                template_kwargs=template_kwargs,
             ):
                 yield _sse(event)
             completed = True

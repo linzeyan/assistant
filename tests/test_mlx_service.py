@@ -188,6 +188,16 @@ async def test_per_model_template_kwargs_reach_the_engine(tmp_path):
     # No caller kwargs → the stored dict alone.
     [ev async for ev in svc.stream_chat([{"role": "user", "content": "hi"}], "qwen")]
     assert seen[-1] == {"enable_thinking": True}
+    # A per-turn override (the Chat header's Thinking/Effort menu) lands LAST — it must beat the
+    # model's saved default, or flipping the menu on a configured model would do nothing.
+    [ev async for ev in svc.stream_chat(
+        [{"role": "user", "content": "hi"}], "qwen",
+        chat_template_overrides={"enable_thinking": False, "reasoning_effort": "low"},
+    )]
+    assert seen[-1] == {"enable_thinking": False, "reasoning_effort": "low"}
+    # …and is a per-turn thing: the next turn without it is back to the stored default.
+    [ev async for ev in svc.stream_chat([{"role": "user", "content": "hi"}], "qwen")]
+    assert seen[-1] == {"enable_thinking": True}
 
 
 async def test_generation_runs_on_the_models_load_thread(tmp_path):

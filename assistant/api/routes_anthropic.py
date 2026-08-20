@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from assistant.api.compat import (
     anthropic_to_openai_messages,
     anthropic_tools_to_openai,
+    reasoning_overrides,
     resolve_model,
     sampling_params,
 )
@@ -64,6 +65,12 @@ async def messages(request: Request):
     params = sampling_params(body)
     if "max_tokens" not in params:  # Anthropic requires max_tokens; honour it as the cap
         params["max_tokens"] = body.get("max_tokens", 1024)
+    # "think hard" / "ultrathink" arrive as a thinking block with a token budget. A local model
+    # spends no such budget, so it's mapped onto its template's own reasoning knobs instead of
+    # being dropped — the whole point of pointing Claude Code at this backend.
+    overrides = await reasoning_overrides(service, model, body)
+    if overrides:
+        params["chat_template_overrides"] = overrides
     mid = f"msg_{uuid.uuid4().hex}"
 
     if not body.get("stream"):

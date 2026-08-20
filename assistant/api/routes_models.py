@@ -62,7 +62,19 @@ async def set_default_model(request: Request):
 
 @router.get("/models/{model_id:path}/settings")
 async def get_model_settings(model_id: str, request: Request):
-    return {"model": model_id, "settings": request.app.state.per_model_store.get(model_id)}
+    # ``capabilities`` rides this response rather than /models: it's read off the checkpoint's
+    # chat template, and the clients only need it when they're actually showing this model's
+    # knobs — one file read on demand instead of one per model on every catalogue refresh.
+    # Omitted entirely (not defaulted) when the backend can't tell, so a client can distinguish
+    # "no reasoning knobs" from "don't know" and fall back instead of hiding a working toggle.
+    body = {"model": model_id, "settings": request.app.state.per_model_store.get(model_id)}
+    probe = getattr(_svc(request), "template_capabilities", None)
+    if probe is not None:
+        try:
+            body["capabilities"] = await probe(model_id)
+        except Exception:  # unknown id / unreadable dir — settings must still come back
+            pass
+    return body
 
 
 @router.put("/models/{model_id:path}/settings")

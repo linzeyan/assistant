@@ -23,6 +23,10 @@ struct ChatScreen: View {
     @EnvironmentObject var controller: BackendController
     @EnvironmentObject var chat: ChatModel
     @State private var showSessions = false
+    /// Reasoning knobs the *selected* model's chat template understands. Refetched on every model
+    /// switch, because the answer is per-checkpoint: Qwen3.8 takes low/medium/xhigh, gpt-oss takes
+    /// low/medium/high, and most models take neither.
+    @State private var reasoning: ModelSettingsDTO.TemplateCapabilities?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -58,6 +62,8 @@ struct ChatScreen: View {
             .frame(maxWidth: 320)
             .help("⚠️ = weak at tool calls; for coding pick a *-Coder model")
 
+            if showsReasoningMenu { reasoningMenu }
+
             Spacer()
 
             if let ctx = chat.contextTokens {
@@ -85,6 +91,89 @@ struct ChatScreen: View {
             }
         }
         .padding(8)
+        // Model switches are the only thing that changes the answer, so refetch on exactly those.
+        .task(id: controller.selectedModel) { await loadReasoningCapabilities() }
+    }
+
+    /// Hidden entirely for models whose template reads neither knob — a control that provably
+    /// does nothing is worse than no control.
+    private var showsReasoningMenu: Bool {
+        reasoning?.thinking == true || !(reasoning?.effort.isEmpty ?? true)
+    }
+
+    /// Per-conversation reasoning overrides. Lives next to the model picker because it's the same
+    /// kind of decision — how this conversation should be answered — and resets with the chat.
+    private var reasoningMenu: some View {
+        Menu {
+            if reasoning?.thinking == true {
+                Picker("Thinking", selection: thinkingBinding) {
+                    Text("Model default").tag("auto")
+                    Text("On").tag("on")
+                    Text("Off").tag("off")
+                }
+                .pickerStyle(.inline)
+            }
+            if let values = reasoning?.effort, !values.isEmpty {
+                Picker("Effort", selection: effortBinding) {
+                    Text("Model default").tag("auto")
+                    ForEach(values, id: \.self) { Text($0).tag($0) }
+                }
+                .pickerStyle(.inline)
+                // Effort is read only while the model is thinking; leaving it selectable here
+                // would promise an influence this turn won't have.
+                .disabled(chat.thinkingOverride == false)
+            }
+        } label: {
+            Image(systemName: "brain")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .foregroundStyle(overridesActive ? Color.accentColor : Color.secondary)
+        .help(overridesActive
+              ? "Reasoning for this conversation: \(overrideSummary)"
+              : "Reasoning for this conversation (defaults to the model's own setting)")
+    }
+
+    private var overridesActive: Bool {
+        chat.thinkingOverride != nil || chat.effortOverride != nil
+    }
+
+    private var overrideSummary: String {
+        var parts: [String] = []
+        if let t = chat.thinkingOverride { parts.append(t ? "thinking on" : "thinking off") }
+        if let e = chat.effortOverride { parts.append("effort \(e)") }
+        return parts.joined(separator: ", ")
+    }
+
+    private var thinkingBinding: Binding<String> {
+        Binding(
+            get: {
+                switch chat.thinkingOverride {
+                case .some(true): return "on"
+                case .some(false): return "off"
+                case .none: return "auto"
+                }
+            },
+            set: { chat.thinkingOverride = $0 == "auto" ? nil : $0 == "on" }
+        )
+    }
+
+    private var effortBinding: Binding<String> {
+        Binding(
+            get: { chat.effortOverride ?? "auto" },
+            set: { chat.effortOverride = $0 == "auto" ? nil : $0 }
+        )
+    }
+
+    private func loadReasoningCapabilities() async {
+        guard let model = controller.selectedModel else { reasoning = nil; return }
+        reasoning = try? await controller.client.modelSettings(model).capabilities
+        // A value the new model wouldn't accept must not survive the switch: sending an unknown
+        // reasoning_effort makes some templates raise mid-render and takes the turn down.
+        if let e = chat.effortOverride, !(reasoning?.effort.contains(e) ?? false) {
+            chat.effortOverride = nil
+        }
+        if reasoning?.thinking != true { chat.thinkingOverride = nil }
     }
 
     /// Saved-conversation list shown from the header. Loads on appearance; tap to resume,

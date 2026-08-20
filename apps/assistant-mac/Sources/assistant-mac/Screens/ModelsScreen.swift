@@ -247,17 +247,31 @@ struct ModelSettingsView: View {
     @State private var maxTokens = ""
     @State private var type = "auto"
     @State private var thinking = "auto"
+    @State private var effort = "auto"
     @State private var draft = "none"
     @State private var saving = false
     @State private var error: String?
+    /// What this model's chat template understands (backend-read). nil until loaded, and on an
+    /// older backend that can't tell — see `showThinking` / `effortChoices` for the fallback.
+    @State private var capabilities: ModelSettingsDTO.TemplateCapabilities?
 
     // "auto" = trust detection; the rest force the loader (fixes a misdetected checkpoint, e.g. a
     // model wrongly seen as VLM that crashes the mlx-vlm loader — force it to load as a plain LLM).
     private static let typeChoices = ["auto", "llm", "vlm", "image", "video", "embedding", "audio", "draft"]
     // Maps to the chat template's enable_thinking variable (Qwen3.x): "off" makes the model
     // answer directly instead of streaming untagged reasoning; "auto" leaves the template's
-    // default. Templates without the variable ignore it, so the picker is safe on any model.
+    // default.
     private static let thinkingChoices = ["auto", "on", "off"]
+
+    /// Shown only for templates that read `enable_thinking`. A backend too old to report
+    /// capabilities still gets the picker: the variable is inert on templates that ignore it,
+    /// so the old always-on behaviour is the safe fallback.
+    private var showThinking: Bool { capabilities?.thinking ?? true }
+
+    /// The values this model's template accepts, straight from the checkpoint — empty hides the
+    /// picker. Never guessed locally: Qwen3.8 takes low/medium/xhigh and *raises* on "high",
+    /// which would kill the turn mid-render, and gpt-oss takes low/medium/high.
+    private var effortChoices: [String] { capabilities?.effort ?? [] }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -270,14 +284,31 @@ struct ModelSettingsView: View {
                     .labelsHidden().frame(width: 96)
                     .help("Force how this model loads instead of auto-detecting its kind")
                 }
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Thinking").font(.caption2).foregroundStyle(.secondary)
-                    Picker("", selection: $thinking) {
-                        ForEach(Self.thinkingChoices, id: \.self) { Text($0).tag($0) }
+                if showThinking {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Thinking").font(.caption2).foregroundStyle(.secondary)
+                        Picker("", selection: $thinking) {
+                            ForEach(Self.thinkingChoices, id: \.self) { Text($0).tag($0) }
+                        }
+                        .labelsHidden().frame(width: 82)
+                        .help("Enable/disable the model's reasoning via its chat template "
+                              + "(enable_thinking)")
                     }
-                    .labelsHidden().frame(width: 82)
-                    .help("Enable/disable the model's reasoning via its chat template "
-                          + "(enable_thinking; Qwen3.x honours it, others ignore it)")
+                }
+                if !effortChoices.isEmpty {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Effort").font(.caption2).foregroundStyle(.secondary)
+                        Picker("", selection: $effort) {
+                            Text("auto").tag("auto")
+                            ForEach(effortChoices, id: \.self) { Text($0).tag($0) }
+                        }
+                        .labelsHidden().frame(width: 90)
+                        // Greyed out rather than hidden when thinking is off: the setting is
+                        // still saved, it just has nothing to act on until reasoning is back on.
+                        .disabled(thinking == "off")
+                        .help("How hard this model thinks before answering (reasoning_effort). "
+                              + "Only applies while thinking is on.")
+                    }
                 }
                 field("Temperature", $temperature)
                 field("Top-p", $topP)
@@ -327,7 +358,9 @@ struct ModelSettingsView: View {
     }
 
     private func load() async {
-        guard let s = try? await controller.client.modelSettings(modelID).settings else { return }
+        guard let dto = try? await controller.client.modelSettings(modelID) else { return }
+        capabilities = dto.capabilities
+        let s = dto.settings
         temperature = s.temperature.map { String($0) } ?? ""
         topP = s.topP.map { String($0) } ?? ""
         topK = s.topK.map { String($0) } ?? ""
@@ -339,6 +372,7 @@ struct ModelSettingsView: View {
         case .some(false): thinking = "off"
         case .none: thinking = "auto"
         }
+        effort = s.chatTemplateKwargs?.reasoningEffort ?? "auto"
     }
 
     private func save() async {
@@ -351,9 +385,12 @@ struct ModelSettingsView: View {
         if let v = Int(maxTokens) { body["max_tokens"] = v }
         if type != "auto" { body["type"] = type }  // "auto" omits it → clears the override
         if draft != "none" { body["draft"] = draft }  // "none" omits it → plain decoding
-        if thinking != "auto" {  // "auto" omits it → template default applies again
-            body["chat_template_kwargs"] = ["enable_thinking": thinking == "on"]
-        }
+        // Both reasoning knobs live in one dict the backend replaces wholesale, so they're
+        // assembled together: "auto" omits a key → that template default applies again.
+        var templateKwargs: [String: Any] = [:]
+        if thinking != "auto" { templateKwargs["enable_thinking"] = thinking == "on" }
+        if effort != "auto" { templateKwargs["reasoning_effort"] = effort }
+        if !templateKwargs.isEmpty { body["chat_template_kwargs"] = templateKwargs }
         do {
             try await controller.client.setModelSettings(modelID, body)
             error = nil

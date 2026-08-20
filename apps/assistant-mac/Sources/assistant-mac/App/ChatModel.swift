@@ -10,6 +10,13 @@ final class ChatModel: ObservableObject {
     @Published var streaming = false
     @Published var pendingApproval: PendingApproval?
 
+    /// This conversation's reasoning overrides (the Chat header menu), sent with every turn and
+    /// beating the model's saved defaults. nil = use those defaults. Conversation-scoped rather
+    /// than global: "think hard about this one" is a property of the task at hand, not of the
+    /// model — so it resets whenever the transcript does, and isn't persisted with the session.
+    @Published var thinkingOverride: Bool?
+    @Published var effortOverride: String?
+
     @Published private(set) var currentSessionId: String?
     @Published var sessions: [SessionSummaryDTO] = []
     /// Estimated context size (tokens) of the last completed turn, from the `done` event.
@@ -64,6 +71,8 @@ final class ChatModel: ObservableObject {
         messages.removeAll()
         currentSessionId = nil
         contextTokens = nil
+        thinkingOverride = nil
+        effortOverride = nil
     }
 
     /// Start a fresh conversation; the backend assigns a new session id on the next turn.
@@ -80,6 +89,10 @@ final class ChatModel: ObservableObject {
         stop()
         currentSessionId = detail.id
         contextTokens = nil  // unknown until this conversation's next turn reports usage
+        // The overrides aren't persisted with the session, so a resumed conversation starts
+        // from the model's defaults rather than inheriting the previous one's.
+        thinkingOverride = nil
+        effortOverride = nil
         messages = detail.messages.compactMap { m in
             guard m.role == "user" || m.role == "assistant" else { return nil }
             return ChatMessage(role: m.role, text: m.content ?? "")
@@ -96,7 +109,10 @@ final class ChatModel: ObservableObject {
         var currentAssistant: Int? = nil
         planBubbleIndex = nil  // a fresh turn starts a fresh plan bubble
         do {
-            for try await event in client.chat(message: text, model: model, sessionId: currentSessionId) {
+            for try await event in client.chat(
+                message: text, model: model, sessionId: currentSessionId,
+                thinking: thinkingOverride, reasoningEffort: effortOverride
+            ) {
                 try Task.checkCancellation()
                 reduce(event, currentAssistant: &currentAssistant)
             }

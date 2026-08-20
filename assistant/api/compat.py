@@ -15,8 +15,17 @@ blocks, tool_use/tool_result), kept here as pure functions so it can be unit-tes
 from __future__ import annotations
 
 import json
+import logging
+
+log = logging.getLogger("assistant")
 
 _CHATTABLE = ("llm", "vlm")
+
+# Claude Code's thinking budgets, bucketed: "think" ≈ 4k tokens, "think hard" ≈ 10k,
+# "ultrathink" ≈ 32k. A local model has no token budget to spend — its chat template exposes an
+# effort ladder instead — so the budget is read as the *degree* the user asked for and mapped onto
+# whatever rungs that particular model publishes.
+_BUDGET_BUCKETS = (8_000, 24_000)
 
 
 async def resolve_model(service, requested: str) -> str:
@@ -158,3 +167,68 @@ def sampling_params(body: dict) -> dict:
         if body.get(k) is not None:
             params[k] = body[k]
     return params
+
+
+async def _accepted_efforts(service, model: str) -> list[str] | None:
+    """The effort values this model's chat template accepts; ``None`` when the backend can't say.
+
+    The distinction matters: ``[]`` means the template never reads ``reasoning_effort`` (drop the
+    key — at best inert, and it can't be validated), while ``None`` means we simply don't know, so
+    an explicit client value is forwarded on the client's own authority.
+    """
+    probe = getattr(service, "template_capabilities", None)
+    if probe is None:
+        return None
+    try:
+        return list((await probe(model)).get("effort") or [])
+    except Exception:
+        return None
+
+
+def _bucket_budget(budget: int, values: list[str]) -> str:
+    """A thinking budget → one rung of this model's own effort ladder (weakest/middle/strongest)."""
+    rank = sum(budget >= b for b in _BUDGET_BUCKETS)
+    return [values[0], values[len(values) // 2], values[-1]][rank]
+
+
+async def reasoning_overrides(service, model: str, body: dict) -> dict:
+    """Per-request chat-template overrides from either API's reasoning knobs.
+
+    This is what makes "think harder" mean something locally: Claude Code's ``thinking`` block and
+    an OpenAI client's ``reasoning_effort`` both land on the same two template variables the GUI's
+    per-conversation menu drives, and beat the model's saved defaults for that one request.
+
+    An effort value the model would reject is dropped with a warning rather than forwarded: some
+    templates ``raise_exception`` on an unknown value, which would kill the turn mid-render — a
+    worse answer to a client's bad guess than quietly using the model's own default.
+    """
+    out: dict = {}
+    budget: int | None = None
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict):
+        # Anthropic sends the block only to state an intent, so "disabled" is as explicit as
+        # "enabled" — a client that asked for no thinking must not get a thinking model anyway.
+        if thinking.get("type") in ("enabled", "disabled"):
+            out["enable_thinking"] = thinking["type"] == "enabled"
+        b = thinking.get("budget_tokens")
+        if out.get("enable_thinking") and isinstance(b, int) and not isinstance(b, bool):
+            budget = b
+
+    effort = body.get("reasoning_effort")
+    if not isinstance(effort, str) or not effort:
+        effort = None
+    if effort is None and budget is None:
+        return out
+
+    values = await _accepted_efforts(service, model)
+    if effort is not None:  # an explicit value outranks one inferred from a budget
+        if values is None or effort in values:
+            out["reasoning_effort"] = effort
+        else:
+            log.warning(
+                "ignoring reasoning_effort=%r for %s: template accepts %s",
+                effort, model, values or "no effort values",
+            )
+    elif values:
+        out["reasoning_effort"] = _bucket_budget(budget, values)
+    return out

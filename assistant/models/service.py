@@ -93,4 +93,13 @@ class OmlxModelService(ModelService):
         # Native-backend routing flag — omlx batches concurrent requests server-side already,
         # and an unknown field must not leak into its HTTP request body.
         params.pop("concurrent", None)
+        # Same for the per-turn template choices: omlx speaks ``chat_template_kwargs``, not our
+        # internal override channel. There's no per-model store on this path to lose a fight
+        # with, so folding them straight in is the whole precedence rule here.
+        overrides = params.pop("chat_template_overrides", None) or {}
+        if overrides:
+            params["chat_template_kwargs"] = {
+                **(params.get("chat_template_kwargs") or {}),
+                **overrides,
+            }
         return self._client.stream_chat(messages, model, tools=tools, **params)

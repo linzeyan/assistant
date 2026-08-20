@@ -177,8 +177,11 @@ struct AssistantClient {
 
     // --- streaming chat (SSE) ---
 
+    /// `thinking` / `reasoningEffort` are this conversation's per-turn overrides (the Chat
+    /// header menu); nil sends nothing, leaving the model's own saved defaults in charge.
     func chat(
-        message: String, model: String, sessionId: String?, interactiveApproval: Bool = true
+        message: String, model: String, sessionId: String?, interactiveApproval: Bool = true,
+        thinking: Bool? = nil, reasoningEffort: String? = nil
     ) -> AsyncThrowingStream<ChatEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -191,6 +194,8 @@ struct AssistantClient {
                         "interactive_approval": interactiveApproval,
                     ]
                     if let sessionId { body["session_id"] = sessionId }
+                    if let thinking { body["thinking"] = thinking }
+                    if let reasoningEffort { body["reasoning_effort"] = reasoningEffort }
                     request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
                     let (bytes, response) = try await session.bytes(for: request)

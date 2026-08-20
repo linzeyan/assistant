@@ -25,8 +25,14 @@ from fastapi.testclient import TestClient
 class _FakeService:
     """Records the (messages, model, tools) it was called with; scripts events back."""
 
-    def __init__(self, events=None, models=None, count=None):
+    def __init__(self, events=None, models=None, count=None, efforts=None):
         self._events = events or [{"type": "text", "content": "hello"}]
+        # `efforts=None` models a backend that can't report template capabilities at all (the
+        # method is simply absent, as on the omlx service); a list is what a real checkpoint's
+        # chat template published.
+        self._efforts = efforts
+        if efforts is not None:
+            self.template_capabilities = self._capabilities
         self._models = models or [
             ModelInfo(id="mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit", type="llm",
                       loaded=False, source="local", size_bytes=1),
@@ -42,6 +48,9 @@ class _FakeService:
 
     async def list_models(self):
         return self._models
+
+    async def _capabilities(self, model):
+        return {"thinking": True, "effort": list(self._efforts)}
 
     async def count_tokens(self, messages, model, tools=None):
         self.seen_count = {"messages": messages, "model": model, "tools": tools}
@@ -164,6 +173,86 @@ async def test_resolve_model_matches_basename_then_substring():
 def test_sampling_params_omits_none():
     assert sampling_params({"max_tokens": 50, "temperature": 0.2, "top_p": None}) == \
         {"max_tokens": 50, "temperature": 0.2}
+
+
+def _overrides_for(tmp_path, body, efforts=None, path="/v1/messages"):
+    """POST `body` and return the chat-template overrides that reached the model service."""
+    svc = _FakeService(efforts=efforts)
+    with _client(tmp_path) as client:
+        client.app.state.model_service = svc
+        r = client.post(path, json={"model": "gemma-4",
+                                    "messages": [{"role": "user", "content": "hi"}],
+                                    "max_tokens": 16, **body})
+    assert r.status_code == 200, r.text
+    return svc.seen["params"].get("chat_template_overrides")
+
+
+# Qwen3.8's ladder: note it has no "high", and rejects anything off the list.
+_QWEN38 = ["low", "medium", "xhigh"]
+
+
+def test_thinking_budget_maps_onto_the_models_own_effort_ladder(tmp_path):
+    # This is what makes pointing Claude Code at the local backend meaningful: "think" vs
+    # "ultrathink" is a token budget there, and a rung of the model's own ladder here.
+    assert _overrides_for(
+        tmp_path, {"thinking": {"type": "enabled", "budget_tokens": 4000}}, efforts=_QWEN38
+    ) == {"enable_thinking": True, "reasoning_effort": "low"}
+    assert _overrides_for(
+        tmp_path, {"thinking": {"type": "enabled", "budget_tokens": 10000}}, efforts=_QWEN38
+    ) == {"enable_thinking": True, "reasoning_effort": "medium"}
+    assert _overrides_for(
+        tmp_path, {"thinking": {"type": "enabled", "budget_tokens": 31999}}, efforts=_QWEN38
+    ) == {"enable_thinking": True, "reasoning_effort": "xhigh"}
+
+
+def test_thinking_disabled_turns_reasoning_off(tmp_path):
+    # An explicit "no thinking" must reach the model even if it's configured to think by default,
+    # or a client asking for a fast answer still pays for a scratchpad.
+    assert _overrides_for(
+        tmp_path, {"thinking": {"type": "disabled"}}, efforts=_QWEN38
+    ) == {"enable_thinking": False}
+
+
+def test_budget_is_ignored_for_a_model_without_an_effort_ladder(tmp_path):
+    # Most templates read no reasoning_effort; sending one would be dead weight at best.
+    assert _overrides_for(
+        tmp_path, {"thinking": {"type": "enabled", "budget_tokens": 31999}}, efforts=[]
+    ) == {"enable_thinking": True}
+
+
+def test_openai_reasoning_effort_is_forwarded_when_the_model_accepts_it(tmp_path):
+    assert _overrides_for(
+        tmp_path, {"reasoning_effort": "medium"}, efforts=_QWEN38,
+        path="/v1/chat/completions",
+    ) == {"reasoning_effort": "medium"}
+
+
+def test_effort_the_template_would_reject_is_dropped_not_forwarded(tmp_path):
+    # Qwen3.8 raise_exception's on "high" — forwarding it would kill the turn mid-render, so an
+    # OpenAI client's habitual "high" falls back to the model's own default instead.
+    assert _overrides_for(
+        tmp_path, {"reasoning_effort": "high"}, efforts=_QWEN38, path="/v1/chat/completions"
+    ) is None
+
+
+def test_explicit_effort_outranks_a_thinking_budget(tmp_path):
+    assert _overrides_for(
+        tmp_path,
+        {"reasoning_effort": "low", "thinking": {"type": "enabled", "budget_tokens": 31999}},
+        efforts=_QWEN38,
+    ) == {"enable_thinking": True, "reasoning_effort": "low"}
+
+
+def test_effort_passes_through_when_the_backend_cannot_validate_it(tmp_path):
+    # No capability probe (omlx): the client's explicit value is forwarded on its own authority
+    # rather than silently swallowed.
+    assert _overrides_for(
+        tmp_path, {"reasoning_effort": "high"}, path="/v1/chat/completions"
+    ) == {"reasoning_effort": "high"}
+
+
+def test_requests_without_reasoning_fields_send_no_overrides(tmp_path):
+    assert _overrides_for(tmp_path, {}, efforts=_QWEN38) is None
 
 
 # --- OpenAI endpoint ---

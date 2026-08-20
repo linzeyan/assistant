@@ -69,6 +69,16 @@ struct FusionConfigDTO: Decodable {
 /// unset field means the global default applies.
 struct ModelSettingsDTO: Decodable {
     let settings: Values
+    /// Which reasoning knobs this model's chat template actually understands, read by the
+    /// backend off the checkpoint. nil = an older backend that can't tell: fall back to showing
+    /// Thinking (harmless when unsupported — jinja ignores unknown variables) and hiding Effort
+    /// (an unsupported *value* raises inside the template and kills the turn).
+    let capabilities: TemplateCapabilities?
+    struct TemplateCapabilities: Decodable {
+        let thinking: Bool
+        /// Accepted reasoning_effort values, weakest→strongest; empty = knob unsupported.
+        let effort: [String]
+    }
     struct Values: Decodable {
         let temperature: Double?
         let topP: Double?
@@ -77,13 +87,15 @@ struct ModelSettingsDTO: Decodable {
         let type: String?  // forced kind override (llm/vlm/image/video/embedding/audio/draft); nil = auto
         /// Paired speculative drafter (an MTP/DFlash/EAGLE checkpoint's model id); nil = plain decode.
         let draft: String?
-        // Chat-template variables the backend stores as a free dict; the GUI surfaces only
-        // enable_thinking (the Thinking picker) — other keys stay API-managed.
+        // Chat-template variables the backend stores as a free dict; the GUI surfaces the two
+        // reasoning knobs (the Thinking / Effort pickers) — other keys stay API-managed.
         let chatTemplateKwargs: TemplateKwargs?
         struct TemplateKwargs: Decodable {
             let enableThinking: Bool?
+            let reasoningEffort: String?
             enum CodingKeys: String, CodingKey {
                 case enableThinking = "enable_thinking"
+                case reasoningEffort = "reasoning_effort"
             }
         }
         enum CodingKeys: String, CodingKey {

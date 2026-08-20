@@ -183,6 +183,7 @@ class AgentLoop:
         approver: ApprovalPolicy | None = None,
         cwd: str | Path | None = None,
         max_iters: int | None = None,
+        template_kwargs: dict | None = None,
     ) -> AsyncIterator[dict]:
         # Per-run approver lets the Telegram gateway inject an interactive (inline
         # button) approver while the desktop path uses the default policy approver.
@@ -191,6 +192,10 @@ class AgentLoop:
         # turn without changing the global default. Falls back to the configured default; a non-
         # positive value is ignored so callers can't disable the backstop entirely.
         iters = max_iters if (max_iters and max_iters > 0) else self._max_iters
+        # Per-turn chat-template variables (thinking on/off, reasoning effort). Passed on their own
+        # channel so the model layer can land them after the per-model defaults; empty = send
+        # nothing, which is not the same as sending the defaults explicitly.
+        tpl_params = {"chat_template_overrides": template_kwargs} if template_kwargs else {}
         # Per-run context copy (never a mutation of the shared ctx, so concurrent turns stay
         # isolated): the turn's model rides it — a tool that spawns model work (spawn_subagents)
         # must target the conversation's own model — and Telegram's per-chat cwd overrides the
@@ -293,7 +298,8 @@ class AgentLoop:
                 degenerate = False
                 deltas = 0
                 async for ev in self._llm.stream_chat(
-                    send_messages, model, tools=tools, max_tokens=self._max_output_tokens
+                    send_messages, model, tools=tools, max_tokens=self._max_output_tokens,
+                    **tpl_params,
                 ):
                     if ev["type"] == "text":
                         text_parts.append(ev["content"])

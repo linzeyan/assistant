@@ -222,6 +222,32 @@ struct DTODecodingTests {
         #expect(dto.settings.chatTemplateKwargs == nil)
     }
 
+    @Test func modelSettingsDecodesTemplateCapabilities() throws {
+        // The pickers render from the backend's read of the checkpoint's chat template: Qwen3.8
+        // accepts low/medium/xhigh and *raises* on anything else, so the value list can never be
+        // a local guess.
+        let dto = try decode(
+            ModelSettingsDTO.self,
+            #"{"model":"m","settings":{},"capabilities":{"thinking":true,"effort":["low","medium","xhigh"]}}"#)
+        #expect(dto.capabilities?.thinking == true)
+        #expect(dto.capabilities?.effort == ["low", "medium", "xhigh"])
+    }
+
+    @Test func modelSettingsCapabilitiesAbsentMeansUnknown() throws {
+        // An older backend omits the field: nil ≠ "no knobs", so the Thinking picker still shows
+        // (inert on templates that ignore it) while Effort — which can raise — stays hidden.
+        let dto = try decode(ModelSettingsDTO.self, #"{"model":"m","settings":{}}"#)
+        #expect(dto.capabilities == nil)
+    }
+
+    @Test func modelSettingsDecodesReasoningEffortTemplateKwarg() throws {
+        let dto = try decode(
+            ModelSettingsDTO.self,
+            #"{"model":"m","settings":{"chat_template_kwargs":{"reasoning_effort":"xhigh"}}}"#)
+        #expect(dto.settings.chatTemplateKwargs?.reasoningEffort == "xhigh")
+        #expect(dto.settings.chatTemplateKwargs?.enableThinking == nil)
+    }
+
     @Test func sessionSummaryMapsCountAndTimestamp() throws {
         let dto = try decode(
             SessionSummaryDTO.self,

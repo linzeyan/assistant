@@ -69,6 +69,30 @@ def test_models_list_flags_weak_at_tools(tmp_path, monkeypatch):
     assert models["Qwen3-Coder-30B-A3B-Instruct-8bit"]["weak_at_tools"] is False
 
 
+def test_settings_route_reports_template_reasoning_knobs(tmp_path, monkeypatch):
+    # The pickers must not offer a knob the checkpoint can't use — an unsupported reasoning_effort
+    # value raises inside the chat template and takes the turn down with it. The verdict rides the
+    # settings response so a client fetches it only for the model whose knobs it's showing.
+    monkeypatch.setattr(MlxModelService, "available", lambda self: True)
+    thinker = _make_model(tmp_path / "Qwen3.8-27B-8bit")
+    (thinker / "chat_template.jinja").write_text(
+        "{%- if enable_thinking is undefined or enable_thinking is true %}"
+        "{%- if reasoning_effort not in ('xhigh', 'medium', 'low') %}{{- raise_exception('no') }}"
+        "{%- endif %}{%- endif %}"
+    )
+    _make_model(tmp_path / "plain-llm")  # ships no chat template at all
+    with TestClient(create_app(Settings(models_dir=tmp_path))) as client:
+        thinking = client.get("/models/Qwen3.8-27B-8bit/settings").json()
+        plain = client.get("/models/plain-llm/settings").json()
+        unknown = client.get("/models/nope/settings").json()
+    assert thinking["capabilities"] == {"thinking": True, "effort": ["low", "medium", "xhigh"]}
+    assert plain["capabilities"] == {"thinking": False, "effort": []}
+    # An unknown model still returns its (empty) settings; capabilities are omitted, which the
+    # client reads as "don't know" rather than "no knobs".
+    assert "capabilities" not in unknown
+    assert unknown["settings"] == {}
+
+
 def test_models_route_filters_unloadable_and_flags_chattable(tmp_path, monkeypatch):
     # N103: /models must list only what an MLX engine can load, and each entry must carry the
     # backend's own `chattable` verdict so the GUI picker and the Telegram picker filter from ONE
