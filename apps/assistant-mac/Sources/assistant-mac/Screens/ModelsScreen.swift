@@ -275,7 +275,7 @@ struct ModelSettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
+            WrapRow(spacing: 8, rowSpacing: 8) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Type").font(.caption2).foregroundStyle(.secondary)
                     Picker("", selection: $type) {
@@ -323,22 +323,27 @@ struct ModelSettingsView: View {
                             Text("none").tag("none")
                             ForEach(draftChoices, id: \.self) { Text($0).tag($0) }
                         }
-                        .labelsHidden().frame(maxWidth: 220)
+                        // Fixed, not maxWidth: in a wrapping row a flexible width would still be
+                        // the first thing squeezed; the picker truncates long repo ids anyway.
+                        .labelsHidden().frame(width: 220)
                         .help("Decode with this speculative drafter (MTP) — faster output, "
                               + "same quality. Reload the model after changing it.")
                     }
                 }
             }
+            // Actions pinned to the trailing edge (macOS convention) so they stay put no matter
+            // how the fields above wrap; status reads from the left, away from the buttons.
             HStack(spacing: 8) {
-                Button("Save") { Task { await save() } }.disabled(saving)
+                if let error { Text(error).foregroundStyle(.red) }
+                if saving { ProgressView().controlSize(.small) }
+                Spacer(minLength: 8)
                 Button("Clear") {
                     // Clears the sampler overrides; the type override is left as-is (set it to
                     // "auto" in the picker to drop it).
                     temperature = ""; topP = ""; topK = ""; maxTokens = ""
                     Task { await save() }
                 }.disabled(saving)
-                if saving { ProgressView().controlSize(.small) }
-                if let error { Text(error).foregroundStyle(.red) }
+                Button("Save") { Task { await save() } }.disabled(saving)
             }
         }
         .textFieldStyle(.roundedBorder)
@@ -397,5 +402,64 @@ struct ModelSettingsView: View {
         } catch {
             self.error = "save failed"
         }
+    }
+}
+
+/// Lays children out left-to-right, wrapping to a new line when the next one doesn't fit.
+///
+/// The settings row is up to eight controls wide (~800pt) but the default window leaves it ~580pt,
+/// and an HStack resolves that by squeezing whichever child is flexible — the Draft picker collapsed
+/// to a sliver of vertical letters. Wrapping keeps every control at its readable width and still
+/// uses the full row when the window is wide.
+private struct WrapRow: Layout {
+    var spacing: CGFloat
+    var rowSpacing: CGFloat
+
+    private struct Row {
+        var indices: [Int] = []
+        var width: CGFloat = 0
+        var height: CGFloat = 0
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) -> CGSize {
+        let rows = rows(in: proposal.width ?? .infinity, subviews: subviews)
+        let height = rows.reduce(0) { $0 + $1.height }
+            + rowSpacing * CGFloat(max(0, rows.count - 1))
+        return CGSize(width: rows.map(\.width).max() ?? 0, height: height)
+    }
+
+    func placeSubviews(
+        in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Void
+    ) {
+        var y = bounds.minY
+        for row in rows(in: bounds.width, subviews: subviews) {
+            var x = bounds.minX
+            for index in row.indices {
+                let size = subviews[index].sizeThatFits(.unspecified)
+                subviews[index].place(
+                    at: CGPoint(x: x, y: y), anchor: .topLeading, proposal: ProposedViewSize(size))
+                x += size.width + spacing
+            }
+            y += row.height + rowSpacing
+        }
+    }
+
+    private func rows(in maxWidth: CGFloat, subviews: Subviews) -> [Row] {
+        var rows: [Row] = []
+        var row = Row()
+        for index in subviews.indices {
+            let size = subviews[index].sizeThatFits(.unspecified)
+            let width = row.indices.isEmpty ? size.width : row.width + spacing + size.width
+            if !row.indices.isEmpty, width > maxWidth {
+                rows.append(row)
+                row = Row(indices: [index], width: size.width, height: size.height)
+            } else {
+                row.indices.append(index)
+                row.width = width
+                row.height = max(row.height, size.height)
+            }
+        }
+        if !row.indices.isEmpty { rows.append(row) }
+        return rows
     }
 }
