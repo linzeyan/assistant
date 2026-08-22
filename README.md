@@ -104,6 +104,26 @@ tab marks known weak-at-tools models with ⚠️.
 
 ---
 
+## Put it to work on a codebase (unattended)
+
+`drive/` is a small toolkit for using the agent as a pair of hands on a real
+repository: you decide every line of the change and write it into a *brief*, the
+model places it, runs the build and the tests, and reports what happened.
+
+```sh
+cd drive
+./check-anchors.py brief.md ~/git/project        # every anchor unique?
+./drive.py --brief brief.md --workspace ~/git/project --thinking off --effort low
+```
+
+It ships the driver, an anchor pre-flight, a brief template, a script for proving
+a new test actually fails when you break the code — and, more usefully, the
+measured rules that make local models reliable at this: what to put in a brief,
+why `--thinking off` is the setting that matters, and the three ways a turn goes
+wrong while still looking like progress. See **[drive/README.md](drive/README.md)**.
+
+---
+
 ## Talk to it from your phone (Telegram)
 
 In **Settings → Gateways**, paste a bot token and an allowed-user allowlist
@@ -175,6 +195,7 @@ assistant/             Python backend (FastAPI)
   gateway/             Telegram gateway
   setup/               preflight + managed-tool install
 apps/assistant-mac/    native SwiftUI app (SwiftPM)
+drive/                 drive the agent through a coding brief, unattended
 tests/                 Python tests (faked backends)
 ```
 
