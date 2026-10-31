@@ -12,9 +12,10 @@ jobs:
     name: Backend tests
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      # setup-uv publishes no major-version tag since v8, so it is pinned to a release commit.
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Set up venv + dev deps
         run: make setup
       - name: Run tests
@@ -36,9 +37,9 @@ jobs:
       matrix:
         python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Check lock + resolve the shipped [all] install
         run: make deps-check PYVER=${{ matrix.python }}
 
@@ -54,9 +55,9 @@ jobs:
       # ad-hoc and need no secrets, so fork PRs still build.
       RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v5 # app-package builds the backend wheel via `uv build`
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3 — app-package builds the backend wheel via `uv build`
       - name: Swift version
         run: swift --version
 
@@ -112,14 +113,14 @@ jobs:
         run: cd dist && ditto -c -k --keepParent Assistant.app Assistant.app.zip
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Assistant-macos-arm64
           path: dist/Assistant.app.zip
 
       - name: Release (on tag)
         if: env.RELEASE == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/Assistant.app.zip
 
