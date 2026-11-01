@@ -84,6 +84,16 @@ def test_list_filters_by_session_and_orders_newest_first(tmp_path):
     assert [r["turn_id"] for r in rows] == ["b", "a"]  # newest first; s2 excluded
 
 
+def test_malformed_trace_file_is_skipped_not_raised(tmp_path):
+    # Invalid UTF-8 or a non-object top level must not break listing a session's other turns.
+    store = TraceStore(tmp_path)
+    store.record(TurnTrace("a", "s1", "m", "first", created_at=1.0))
+    (tmp_path / "bad-utf8.json").write_bytes(b'{"session_id": "\xff"}')
+    (tmp_path / "list.json").write_text("[1]")
+    assert [r["turn_id"] for r in TraceStore(tmp_path).list_for_session("s1")] == ["a"]
+    assert store.get("bad-utf8") is None
+
+
 def test_record_prunes_to_max_turns(tmp_path):
     store = TraceStore(tmp_path, max_turns=2)
     for i in range(4):

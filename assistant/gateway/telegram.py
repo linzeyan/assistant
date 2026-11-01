@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import html as _html
 import logging
 import re
@@ -49,6 +50,13 @@ _CHATTABLE_KINDS = CHATTABLE_KINDS
 # The weak-at-tools heuristic lives in model_traits (shared with the /models API + GUI picker),
 # so the ⚠️ flag is identical everywhere. Aliased to the module-private name the picker uses.
 _weak_at_tools = weak_at_tools
+
+
+def _model_token(model_id: str) -> str:
+    # /models callback key. Model ids (local paths included) can blow past callback_data's
+    # 64-byte cap, and a list index goes stale when a model loads/unloads between showing the
+    # picker and the tap — so key by a short digest of the id and match it on tap.
+    return hashlib.sha1(model_id.encode()).hexdigest()[:16]
 
 
 # --- Telegram HTML rendering (think collapse + a small markdown subset) ---
@@ -219,7 +227,12 @@ class _StreamEditor:
         await self._edit(line)
 
     async def set_error(self, detail: str) -> None:
-        await self._edit(f"⚠️ {_clip_error(detail)}")
+        # Pin the error as the message's content: the turn still ends with flush(final=True),
+        # which would otherwise swap it for the partial reply or "(no response)" and hide why
+        # the turn stopped.
+        text = f"⚠️ {_clip_error(detail)}".strip()
+        self._buf = self._shown = text
+        await self._edit(text)
 
     async def _edit(self, text: str, rich: bool = False) -> None:
         # Only the final message is rich-rendered (think collapsed, markdown/code). Partial
@@ -501,13 +514,11 @@ class TelegramGateway:
             await update.message.reply_text("No chat model is available. Load one first.")
             return
         current = await self.pick_model(update.effective_chat.id)
-        # callback_data is capped at 64 bytes and model ids blow past that, so key each
-        # button by catalog index and resolve it back on tap (the chattable order is stable).
         rows = [
             [InlineKeyboardButton(
                 f"{'● ' if m.id == current else '○ '}{'⚠️ ' if _weak_at_tools(m.id) else ''}{m.id}",
-                callback_data=f"model:{i}")]
-            for i, m in enumerate(models)
+                callback_data=f"model:{_model_token(m.id)}")]
+            for m in models
         ]
         note = (
             "Pick the chat model:\n⚠️ = weak at tool calls; for coding use a *-Coder-Instruct."
@@ -980,12 +991,14 @@ class TelegramGateway:
             )
             return
         current = self._session_id(chat_id)
-        # Same index-keyed callback_data trick as /models: session ids blow past the 64-byte cap.
+        # Key buttons by session id, not list index: the list is most-recently-used first, so any
+        # message sent before the tap reorders it and an index would open the wrong conversation.
+        # A chat's ids are `tg:<chat>[:<8 hex>]` (≤ ~37 bytes), inside callback_data's 64-byte cap.
         rows = [
             [InlineKeyboardButton(
                 f"{'● ' if s['id'] == current else '○ '}{s['title'] or 'Untitled'}"[:60],
-                callback_data=f"sess:{i}")]
-            for i, s in enumerate(sessions[:10])  # newest 10: a keyboard must stay tappable
+                callback_data=f"sess:{s['id']}")]
+            for s in sessions[:10]  # newest 10: a keyboard must stay tappable
         ]
         note = "Pick a conversation to continue:"
         if len(sessions) > 10:
@@ -993,12 +1006,10 @@ class TelegramGateway:
         await update.message.reply_text(note, reply_markup=InlineKeyboardMarkup(rows))
 
     async def _apply_session_choice(self, query) -> None:
-        _, _, idx = (query.data or "").partition(":")
+        _, _, sid = (query.data or "").partition(":")
         chat_id = query.message.chat.id
-        sessions = self._chat_sessions(chat_id)
-        try:
-            chosen = sessions[int(idx)]
-        except (ValueError, IndexError):
+        chosen = next((s for s in self._chat_sessions(chat_id) if s["id"] == sid), None)
+        if chosen is None:
             await query.edit_message_text("That conversation is no longer available.")
             return
         self._session_ids[chat_id] = chosen["id"]
@@ -1180,13 +1191,12 @@ class TelegramGateway:
             pass
 
     async def _apply_model_choice(self, query) -> None:
-        # Resolve the button's catalog index back to a model id (see _on_models for why we
-        # key by index), record it as this chat's pick, and confirm.
-        _, _, idx = (query.data or "").partition(":")
+        # Resolve the button's digest back to a model id (see _model_token), record it as this
+        # chat's pick, and confirm.
+        _, _, token = (query.data or "").partition(":")
         models = [m for m in await self._models.list_models() if m.type in _CHATTABLE_KINDS]
-        try:
-            chosen = models[int(idx)].id
-        except (ValueError, IndexError):
+        chosen = next((m.id for m in models if _model_token(m.id) == token), None)
+        if chosen is None:
             await query.edit_message_text("That model is no longer available.")
             return
         self._selected_model[query.message.chat.id] = chosen

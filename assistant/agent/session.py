@@ -209,9 +209,9 @@ class SessionStore:
                 sid = path.stem
                 if sid in summaries:
                     continue
-                data = self._read_json(path)
-                if data is not None:
-                    summaries[sid] = Session.from_dict(data).summary()
+                session = self._read_session(path)
+                if session is not None:
+                    summaries[sid] = session.summary()
         return sorted(
             summaries.values(), key=lambda d: d["last_accessed_at"], reverse=True
         )
@@ -244,9 +244,9 @@ class SessionStore:
             for path in self._dir.glob("*.json"):
                 if path.stem in seen:
                     continue
-                data = self._read_json(path)
-                if data is not None:
-                    _scan(Session.from_dict(data))
+                session = self._read_session(path)
+                if session is not None:
+                    _scan(session)
         results.sort(key=lambda d: d["last_accessed_at"], reverse=True)
         return results[:limit]
 
@@ -307,12 +307,14 @@ class SessionStore:
     def _load(self, session_id: str) -> Session | None:
         if self._dir is None:
             return None
-        data = self._read_json(self._dir / f"{session_id}.json")
-        return Session.from_dict(data) if data is not None else None
+        return self._read_session(self._dir / f"{session_id}.json")
 
     @staticmethod
-    def _read_json(path: Path) -> dict | None:
+    def _read_session(path: Path) -> Session | None:
+        # Corrupt or missing → treat as absent, never crash. Decode and shape errors count too
+        # (invalid UTF-8 is a ValueError; no "id" is a KeyError; a top-level list has no .get):
+        # one bad file must not take every conversation out of list_sessions/search_sessions.
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None  # corrupt or missing → treat as absent, never crash
+            return Session.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None

@@ -80,6 +80,22 @@ def test_corrupt_session_file_is_skipped(tmp_path):
     assert store.list_sessions() == []
 
 
+def test_one_malformed_session_file_does_not_hide_the_others(tmp_path):
+    # Invalid UTF-8, a missing "id" and a non-object top level all parse past json.loads' own
+    # error; any of them used to raise out of list/search and blank every conversation in the
+    # GUI and Telegram /sessions, not just the bad one.
+    good = SessionStore(tmp_path).create(model="m")
+    good.add_user("keep me")
+    SessionStore(tmp_path).checkpoint(good)
+    (tmp_path / "bad-utf8.json").write_bytes(b'{"id": "\xff\xfe"}')
+    (tmp_path / "no-id.json").write_text('{"messages": []}')
+    (tmp_path / "list.json").write_text("[1, 2]")
+    store = SessionStore(tmp_path)
+    assert [s["id"] for s in store.list_sessions()] == [good.id]
+    assert [s["id"] for s in store.search_sessions("keep")] == [good.id]
+    assert store.get("no-id") is None
+
+
 def test_search_sessions_substring_and_snippet(tmp_path):
     # F/S14: cross-session search finds a session by message content and returns a snippet showing
     # why it matched. Case-insensitive substring (not tokenised), so it works mid-word too.

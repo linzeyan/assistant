@@ -243,7 +243,10 @@ class TraceStore:
 
     @staticmethod
     def _read_json(path: Path) -> dict | None:
+        # Corrupt or missing → treat as absent, never crash. ValueError also covers invalid
+        # UTF-8; a non-object top level would break the callers' .get().
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None  # corrupt or missing → treat as absent, never crash
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None

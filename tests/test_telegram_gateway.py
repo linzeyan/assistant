@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, Mock
 from assistant.gateway.approval import TelegramApprover
 from assistant.gateway.telegram import (
     TelegramGateway,
+    _StreamEditor,
     _clip_caption,
     _clip_error,
     _progress_bar,
@@ -230,28 +231,42 @@ async def test_pick_model_stale_selection_falls_back():
     assert await gw.pick_model(42) == "a"
 
 
-async def test_apply_model_choice_records_pick_by_index():
-    # The button index addresses the *chattable* list (video filtered out), so index 1 is
-    # "b", not the video model — confirms index<->id stays aligned with the filter.
-    models = [ModelInfo("a", type="llm"), ModelInfo("Wan", type="video"), ModelInfo("b", type="llm")]
-    gw = _gateway(models=models)
+async def test_models_tap_picks_the_model_shown_even_after_the_catalog_changes():
+    # A model loaded/unloaded between opening /models and tapping shifts the list; the tap must
+    # still pick the model whose button was tapped, and a long local-path id must still fit
+    # Telegram's 64-byte callback_data cap.
+    long_id = "/Users/someone/models/" + "x" * 80
+    gw = _gateway(allowed=[1], models=[ModelInfo("a", type="llm"), ModelInfo(long_id, type="llm")])
+    update = Mock()
+    update.effective_user.id = 1
+    update.effective_chat.id = 42
+    update.message.reply_text = AsyncMock()
+    await gw._on_models(update, Mock())
+    markup = update.message.reply_text.await_args.kwargs["reply_markup"]
+    buttons = [b for row in markup.inline_keyboard for b in row]
+    assert all(len(b.callback_data.encode()) <= 64 for b in buttons)
+    tapped = next(b for b in buttons if long_id in b.text)
+
+    gw._models = _FakeModels(  # a newly loaded model lands ahead of it: every position shifts
+        [ModelInfo("new", type="llm"), ModelInfo("a", type="llm"), ModelInfo(long_id, type="llm")]
+    )
     query = Mock()
-    query.data = "model:1"
+    query.data = tapped.callback_data
     query.message.chat.id = 42
     query.edit_message_text = AsyncMock()
     await gw._apply_model_choice(query)
-    assert gw._selected_model[42] == "b"
-    query.edit_message_text.assert_awaited_once()
+    assert gw._selected_model[42] == long_id
 
 
-async def test_apply_model_choice_handles_stale_index():
+async def test_apply_model_choice_handles_a_model_that_went_away():
     gw = _gateway(models=[ModelInfo("a", type="llm")])
     query = Mock()
-    query.data = "model:9"  # out of range (catalog shrank since the menu was shown)
+    query.data = "model:0123456789abcdef"  # digest of a model no longer in the catalog
     query.message.chat.id = 42
     query.edit_message_text = AsyncMock()
     await gw._apply_model_choice(query)
     assert 42 not in gw._selected_model  # nothing recorded
+    assert "no longer available" in query.edit_message_text.await_args.args[0]
 
 
 # --- Telegram HTML rendering (think collapse + markdown subset, N30) ---
@@ -1071,3 +1086,65 @@ def test_chat_sessions_lists_only_this_chats_conversations(tmp_path):
     gw = _gateway()
     gw._sessions = store
     assert {s["id"] for s in gw._chat_sessions(7)} == {"tg:7", "tg:7:aaa"}
+
+
+async def test_sessions_tap_opens_the_conversation_shown_even_after_a_reorder(tmp_path):
+    # The list is most-recently-used first, so a message sent between opening /sessions and
+    # tapping reorders it. The tap must still open the conversation whose button was tapped —
+    # an index-keyed button would silently switch to its neighbour.
+    from assistant.agent.session import SessionStore
+
+    store = SessionStore(tmp_path)
+    for sid, text in (("tg:7", "older chat"), ("tg:7:aaa", "newer chat")):
+        s = store.get_or_create(sid, model="m")
+        s.add_user(text)
+        store.checkpoint(s)
+    gw = _gateway(allowed=[1])
+    gw._sessions = store
+    update = Mock()
+    update.effective_user.id = 1
+    update.effective_chat.id = 7
+    update.message.reply_text = AsyncMock()
+    await gw._on_sessions(update, Mock())
+    markup = update.message.reply_text.await_args.kwargs["reply_markup"]
+    tapped = next(b for row in markup.inline_keyboard for b in row if "newer chat" in b.text)
+
+    store.checkpoint(store.get("tg:7"))  # a message in the current chat moves it to the top
+    assert store.list_sessions()[0]["id"] == "tg:7"  # the order really did flip
+    query = Mock()
+    query.data = tapped.callback_data
+    query.message.chat.id = 7
+    query.edit_message_text = AsyncMock()
+    await gw._apply_session_choice(query)
+    assert gw._session_ids[7] == "tg:7:aaa"
+    assert len(tapped.callback_data.encode()) <= 64  # Telegram's callback_data cap
+
+
+async def test_sessions_tap_rejects_another_chats_conversation(tmp_path):
+    from assistant.agent.session import SessionStore
+
+    store = SessionStore(tmp_path)
+    store.checkpoint(store.get_or_create("tg:8:bbb", model="m"))
+    gw = _gateway()
+    gw._sessions = store
+    query = Mock()
+    query.data = "sess:tg:8:bbb"
+    query.message.chat.id = 7
+    query.edit_message_text = AsyncMock()
+    await gw._apply_session_choice(query)
+    assert 7 not in gw._session_ids
+    assert "no longer available" in query.edit_message_text.await_args.args[0]
+
+
+async def test_error_stays_on_screen_after_the_final_flush():
+    # loop.py ends a turn on purpose with an "error" event (output budget, repetition, reasoning
+    # only); the turn's closing flush(final=True) must not replace that reason with the partial
+    # reply or "(no response)".
+    bot = Mock()
+    bot.edit_message_text = AsyncMock()
+    editor = _StreamEditor(bot, chat_id=7, message_id=1)
+    editor.add("half a rep")
+    await editor.set_error("the model ran out of output budget")
+    await editor.flush(final=True)
+    shown = bot.edit_message_text.await_args.args[0]
+    assert shown.startswith("⚠️") and "output budget" in shown
