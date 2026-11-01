@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -10,6 +11,21 @@ from pathlib import Path
 # Bump when the on-disk JSON shape changes incompatibly; load tolerates older files by
 # filling defaults rather than failing.
 SCHEMA_VERSION = 1
+
+# A session id becomes a file name (sessions/<id>.json) and arrives from clients (POST /chat), so
+# a "/" or ".." would reach outside the directory. This charset covers every id we mint: uuid hex,
+# Telegram's `tg:<chat>[:<hex>]` (group chat ids are negative) and subagents' `sub_<hex>`.
+_SESSION_ID = re.compile(r"[A-Za-z0-9_:-]{1,128}")
+
+
+class InvalidSessionId(ValueError):
+    """A client-supplied session id that can't safely name a file (the API maps it to 400)."""
+
+
+def check_session_id(session_id: str) -> str:
+    if not _SESSION_ID.fullmatch(session_id):
+        raise InvalidSessionId(f"invalid session id: {session_id[:64]!r}")
+    return session_id
 
 
 def _now() -> float:
@@ -178,6 +194,7 @@ class SessionStore:
 
     def get(self, session_id: str) -> Session | None:
         """Return a session (loading from disk on a cache miss) without creating one."""
+        check_session_id(session_id)  # get_or_create funnels through here too
         if session_id in self._sessions:
             return self._sessions[session_id]
         loaded = self._load(session_id)
@@ -266,7 +283,7 @@ class SessionStore:
         self._sessions[session.id] = session
         if self._dir is None:
             return
-        path = self._dir / f"{session.id}.json"
+        path = self._path(session.id)
         tmp = path.with_name(f"{session.id}.json.tmp")
         try:
             tmp.write_text(
@@ -278,9 +295,10 @@ class SessionStore:
             tmp.unlink(missing_ok=True)
 
     def delete_session(self, session_id: str) -> bool:
+        check_session_id(session_id)
         existed = self._sessions.pop(session_id, None) is not None
         if self._dir is not None:
-            path = self._dir / f"{session_id}.json"
+            path = self._path(session_id)
             if path.exists():
                 path.unlink(missing_ok=True)
                 existed = True
@@ -304,10 +322,14 @@ class SessionStore:
 
     # --- internals ---
 
+    def _path(self, session_id: str) -> Path:
+        # The one place an id becomes a file name — validated here so no write path can skip it.
+        return self._dir / f"{check_session_id(session_id)}.json"
+
     def _load(self, session_id: str) -> Session | None:
         if self._dir is None:
             return None
-        return self._read_session(self._dir / f"{session_id}.json")
+        return self._read_session(self._path(session_id))
 
     @staticmethod
     def _read_session(path: Path) -> Session | None:

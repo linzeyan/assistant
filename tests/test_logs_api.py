@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from assistant.config import Settings
 from assistant.main import create_app
-from fastapi.testclient import TestClient
+from tests._http import local_client
 
 
 def test_clear_logs_truncates_the_log_files(tmp_path):
@@ -19,7 +19,7 @@ def test_clear_logs_truncates_the_log_files(tmp_path):
     app = create_app(
         Settings(sessions_dir=tmp_path / "s", models_dir=tmp_path / "m", log_dir=log_dir)
     )
-    with TestClient(app) as client:
+    with local_client(app) as client:
         r = client.post("/logs/clear")
 
     assert r.status_code == 200
@@ -35,6 +35,6 @@ def test_clear_logs_is_ok_when_no_logs_exist(tmp_path):
     app = create_app(
         Settings(sessions_dir=tmp_path / "s", models_dir=tmp_path / "m", log_dir=tmp_path / "logs")
     )
-    with TestClient(app) as client:
+    with local_client(app) as client:
         r = client.post("/logs/clear")
     assert r.status_code == 200 and r.json()["cleared"] == []

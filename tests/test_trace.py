@@ -275,7 +275,7 @@ async def test_loop_without_trace_store_is_noop(tmp_path):
 def test_trace_routes_are_wired(tmp_path):
     # Proves the router is registered and app.state.trace_store is present — the endpoints
     # the user actually hits to scan turns. trace_dir → tmp so it doesn't touch real dirs.
-    from fastapi.testclient import TestClient
+    from tests._http import local_client
 
     from assistant.config import Settings
     from assistant.main import create_app
@@ -283,7 +283,7 @@ def test_trace_routes_are_wired(tmp_path):
     app = create_app(
         Settings(models_dir=tmp_path / "models", trace_dir=tmp_path / "traces")
     )
-    with TestClient(app) as client:
+    with local_client(app) as client:
         assert client.get("/turns/nope").status_code == 404
         r = client.get("/sessions/whatever/turns")
         assert r.status_code == 200 and r.json() == {"turns": []}

@@ -936,6 +936,8 @@ class TelegramGateway:
         return self._workspace.get(chat_id) or self._default_workspace
 
     async def _on_cd(self, update: "Update", context) -> None:
+        if not await self._ensure_allowed(update):
+            return
         chat_id = update.effective_chat.id
         arg = " ".join(context.args).strip() if getattr(context, "args", None) else ""
         if not arg:
@@ -1156,6 +1158,11 @@ class TelegramGateway:
 
     async def _on_callback(self, update: "Update", context) -> None:
         query = update.callback_query
+        # Buttons are visible to everyone in a group chat, so the tapper — not the chat — must be
+        # allowlisted: otherwise any member could approve a pending shell call or switch models.
+        if not self.is_allowed(query.from_user.id):
+            await query.answer("Not authorized.")
+            return
         await query.answer()
         data = query.data or ""
         if data.startswith("model:"):  # a /models picker tap, not an approval

@@ -549,8 +549,9 @@ async def test_on_stop_when_nothing_running():
 
 
 async def test_on_cd_sets_per_chat_workspace(tmp_path):
-    gw = _gateway()
+    gw = _gateway(allowed=[7])
     update = Mock()
+    update.effective_user.id = 7
     update.effective_chat.id = 42
     update.message.reply_text = AsyncMock()
     context = Mock()
@@ -559,9 +560,25 @@ async def test_on_cd_sets_per_chat_workspace(tmp_path):
     assert gw._workspace[42] == str(tmp_path.resolve())
 
 
-async def test_on_cd_rejects_non_directory():
-    gw = _gateway()
+async def test_on_cd_from_a_non_allowlisted_user_changes_nothing(tmp_path):
+    # The workspace decides where the next turn's file and shell tools run, so only an
+    # allowlisted user may move it (a group member otherwise could, and probe paths too).
+    gw = _gateway(allowed=[7])
     update = Mock()
+    update.effective_user.id = 99
+    update.effective_chat.id = 42
+    update.message.reply_text = AsyncMock()
+    context = Mock()
+    context.args = [str(tmp_path)]
+    await gw._on_cd(update, context)
+    assert 42 not in gw._workspace
+    assert "Not authorized" in update.message.reply_text.await_args.args[0]
+
+
+async def test_on_cd_rejects_non_directory():
+    gw = _gateway(allowed=[7])
+    update = Mock()
+    update.effective_user.id = 7
     update.effective_chat.id = 42
     update.message.reply_text = AsyncMock()
     context = Mock()
@@ -640,11 +657,12 @@ async def test_on_callback_approve_resolves_pending_future():
     # WHY: the live deadlock (approval taps did nothing) hid that _on_callback's ok:/no:
     # routing was never unit-tested. Pin it: an "ok:<token>" tap resolves that token's
     # waiting future to True so the agent loop proceeds.
-    gw = _gateway()
+    gw = _gateway(allowed=[7])
     fut = asyncio.get_event_loop().create_future()
     gw._pending["abc123"] = fut
     query = Mock()
     query.data = "ok:abc123"
+    query.from_user.id = 7
     query.answer = AsyncMock()
     query.edit_message_text = AsyncMock()
     update = Mock()
@@ -654,17 +672,39 @@ async def test_on_callback_approve_resolves_pending_future():
 
 
 async def test_on_callback_deny_resolves_future_false():
-    gw = _gateway()
+    gw = _gateway(allowed=[7])
     fut = asyncio.get_event_loop().create_future()
     gw._pending["abc123"] = fut
     query = Mock()
     query.data = "no:abc123"
+    query.from_user.id = 7
     query.answer = AsyncMock()
     query.edit_message_text = AsyncMock()
     update = Mock()
     update.callback_query = query
     await gw._on_callback(update, Mock())
     assert fut.result() is False
+
+
+async def test_on_callback_from_a_non_allowlisted_member_changes_nothing():
+    # In a group chat every member sees the Approve button. A tap from someone outside the
+    # allowlist must neither approve the pending shell call nor act on any other picker.
+    gw = _gateway(allowed=[7], models=[ModelInfo("a", type="llm")])
+    fut = asyncio.get_event_loop().create_future()
+    gw._pending["abc123"] = fut
+    for data in ("ok:abc123", "model:0123456789abcdef", "sess:tg:42"):
+        query = Mock()
+        query.data = data
+        query.from_user.id = 99
+        query.message.chat.id = 42
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = Mock()
+        update.callback_query = query
+        await gw._on_callback(update, Mock())
+        query.edit_message_text.assert_not_awaited()
+    assert not fut.done()
+    assert 42 not in gw._selected_model and 42 not in gw._session_ids
 
 
 async def test_approver_resolves_on_user_tap():

@@ -7,7 +7,7 @@ import tomllib
 import assistant.api.routes_config as routes_config
 from assistant.config import Settings
 from assistant.main import create_app
-from fastapi.testclient import TestClient
+from tests._http import local_client
 
 
 def _client(tmp_path, monkeypatch):
@@ -15,7 +15,7 @@ def _client(tmp_path, monkeypatch):
     cfg = tmp_path / "config.toml"
     monkeypatch.setattr(routes_config, "_CONFIG_PATH", cfg)
     app = create_app(Settings(models_dir=tmp_path / "models"))
-    return TestClient(app), cfg
+    return local_client(app), cfg
 
 
 def test_get_config_reports_paths(tmp_path, monkeypatch):

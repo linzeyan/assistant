@@ -96,6 +96,24 @@ def test_one_malformed_session_file_does_not_hide_the_others(tmp_path):
     assert store.get("no-id") is None
 
 
+def test_store_refuses_ids_that_could_leave_the_sessions_dir(tmp_path):
+    import pytest
+
+    from assistant.agent.session import InvalidSessionId
+
+    store = SessionStore(tmp_path / "sessions")
+    for bad in ("../x", "a/b", "..", "", "x" * 129, "a b"):
+        with pytest.raises(InvalidSessionId):
+            store.get_or_create(bad) if bad else store.get(bad)
+        with pytest.raises(InvalidSessionId):
+            store.delete_session(bad)
+    # Every id the app itself mints still works, Telegram's negative group ids included.
+    for ok in ("0123abcd" * 4, "tg:42", "tg:-1001234567890:abcd1234", "sub_0123456789ab"):
+        store.checkpoint(store.get_or_create(ok, model="m"))
+        assert store.get(ok) is not None
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["sessions"]
+
+
 def test_search_sessions_substring_and_snippet(tmp_path):
     # F/S14: cross-session search finds a session by message content and returns a snippet showing
     # why it matched. Case-insensitive substring (not tokenised), so it works mid-word too.

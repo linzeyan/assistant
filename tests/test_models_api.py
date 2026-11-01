@@ -7,7 +7,7 @@ import json
 from assistant.config import Settings
 from assistant.main import create_app
 from assistant.models.mlx_service import MlxModelService
-from fastapi.testclient import TestClient
+from tests._http import local_client
 
 
 def _make_model(d):
@@ -20,14 +20,14 @@ def _make_model(d):
 def test_load_route_accepts_slashed_model_id(tmp_path):
     # org/name ids must reach the handler — a plain `{model_id}` path param would 404 on
     # the slash. We expect the load to *fail* (no such model) but NOT a routing 404.
-    with TestClient(create_app(Settings(models_dir=tmp_path))) as client:
+    with local_client(create_app(Settings(models_dir=tmp_path))) as client:
         r = client.post("/models/mlx-community/Does-Not-Exist-4bit/load")
     assert r.status_code != 404, r.text
     assert r.status_code == 502  # reached the handler; load failed cleanly
 
 
 def test_unload_route_accepts_slashed_model_id(tmp_path):
-    with TestClient(create_app(Settings(models_dir=tmp_path))) as client:
+    with local_client(create_app(Settings(models_dir=tmp_path))) as client:
         r = client.post("/models/mlx-community/Does-Not-Exist-4bit/unload")
     assert r.status_code != 404, r.text
 
@@ -39,7 +39,7 @@ def test_delete_removes_local_model_from_disk(tmp_path, monkeypatch):
     # availability on so it runs the same everywhere.
     monkeypatch.setattr(MlxModelService, "available", lambda self: True)
     model = _make_model(tmp_path / "qwen3-8b")
-    with TestClient(create_app(Settings(models_dir=tmp_path))) as client:
+    with local_client(create_app(Settings(models_dir=tmp_path))) as client:
         before = {m["id"] for m in client.get("/models").json()["models"]}
         r = client.delete("/models/qwen3-8b")
         after = {m["id"] for m in client.get("/models").json()["models"]}
@@ -50,7 +50,7 @@ def test_delete_removes_local_model_from_disk(tmp_path, monkeypatch):
 
 
 def test_delete_unknown_model_is_400_not_500(tmp_path):
-    with TestClient(create_app(Settings(models_dir=tmp_path))) as client:
+    with local_client(create_app(Settings(models_dir=tmp_path))) as client:
         r = client.delete("/models/nope")
     assert r.status_code == 400, r.text
 
@@ -63,7 +63,7 @@ def test_models_list_flags_weak_at_tools(tmp_path, monkeypatch):
     monkeypatch.setattr(MlxModelService, "available", lambda self: True)
     _make_model(tmp_path / "Qwen3-30B-A3B-8bit")
     _make_model(tmp_path / "Qwen3-Coder-30B-A3B-Instruct-8bit")
-    with TestClient(create_app(Settings(models_dir=tmp_path))) as client:
+    with local_client(create_app(Settings(models_dir=tmp_path))) as client:
         models = {m["id"]: m for m in client.get("/models").json()["models"]}
     assert models["Qwen3-30B-A3B-8bit"]["weak_at_tools"] is True
     assert models["Qwen3-Coder-30B-A3B-Instruct-8bit"]["weak_at_tools"] is False
@@ -81,7 +81,7 @@ def test_settings_route_reports_template_reasoning_knobs(tmp_path, monkeypatch):
         "{%- endif %}{%- endif %}"
     )
     _make_model(tmp_path / "plain-llm")  # ships no chat template at all
-    with TestClient(create_app(Settings(models_dir=tmp_path))) as client:
+    with local_client(create_app(Settings(models_dir=tmp_path))) as client:
         thinking = client.get("/models/Qwen3.8-27B-8bit/settings").json()
         plain = client.get("/models/plain-llm/settings").json()
         unknown = client.get("/models/nope/settings").json()
@@ -109,7 +109,7 @@ def test_models_route_filters_unloadable_and_flags_chattable(tmp_path, monkeypat
     trained = _make_model(tmp_path / "half-trained")
     (trained / "optimizer.bin").write_bytes(b"\x00")
 
-    with TestClient(create_app(Settings(models_dir=tmp_path))) as client:
+    with local_client(create_app(Settings(models_dir=tmp_path))) as client:
         body = client.get("/models").json()
     by_id = {m["id"]: m for m in body["models"]}
 

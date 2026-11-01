@@ -6,12 +6,12 @@ import pytest
 
 from assistant.config import Settings
 from assistant.main import create_app
-from fastapi.testclient import TestClient
+from tests._http import local_client
 
 
 def _client(tmp_path):
     # `with TestClient` runs the lifespan, which populates app.state (skills store).
-    return TestClient(create_app(Settings(skills_dir=tmp_path / "skills")))
+    return local_client(create_app(Settings(skills_dir=tmp_path / "skills")))
 
 
 def test_create_view_update_delete_cycle(tmp_path):

@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from assistant.agent.compaction import CompactionManager
 from assistant.agent.llm_client import AsyncLLM
@@ -22,9 +23,10 @@ from assistant.agent.hooks import HookRegistry
 from assistant.agent.loop import AgentLoop
 from assistant.downloads import DownloadManager, hub_env
 from assistant.gateway import lifecycle as gateway_lifecycle
-from assistant.agent.session import SessionStore
+from assistant.agent.session import InvalidSessionId, SessionStore
 from assistant.agent.trace import TraceStore
 from assistant.api import (
+    access,
     routes_anthropic,
     routes_audio,
     routes_chat,
@@ -400,6 +402,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="assistant-backend", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings or get_settings()
 
+    # Registered before log_requests so it sits inside it: refusals still get their log line.
+    @app.middleware("http")
+    async def guard_access(request: Request, call_next):
+        if not access.is_allowed(request, app.state.settings.api_token):
+            log.warning(
+                "refused %s %s: client=%s host=%r (not loopback, no valid api token)",
+                request.method, request.url.path,
+                request.client.host if request.client else "?", request.headers.get("host"),
+            )
+            return JSONResponse({"detail": "forbidden"}, status_code=403)
+        return await call_next(request)
+
+    @app.exception_handler(InvalidSessionId)
+    async def invalid_session_id(request: Request, exc: InvalidSessionId):
+        return JSONResponse({"detail": str(exc)}, status_code=400)
+
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
         """One structured line per request (id + method + path + status + duration) so the
@@ -471,6 +489,12 @@ def run() -> None:
         settings.models_dir,
         log_path,
     )
+    if not access.is_loopback_bind(settings.backend_host) and not settings.api_token:
+        log.warning(
+            "backend_host=%s exposes the API beyond this machine but api_token is unset: "
+            "every non-local request will be refused until one is configured",
+            settings.backend_host,
+        )
     uvicorn.run(
         create_app(settings),
         host=settings.backend_host,

@@ -8,11 +8,11 @@ import json
 
 from assistant.config import Settings
 from assistant.main import create_app
-from fastapi.testclient import TestClient
+from tests._http import local_client
 
 
 def _client(tmp_path):
-    return TestClient(
+    return local_client(
         create_app(
             Settings(sessions_dir=tmp_path / "sessions", models_dir=tmp_path / "models")
         )
@@ -78,6 +78,17 @@ def test_failed_turn_is_still_checkpointed(tmp_path):
         assert any(
             m.get("role") == "user" and m["content"] == "hi" for m in reloaded.messages
         )
+
+
+def test_session_id_cannot_escape_the_sessions_dir(tmp_path):
+    # session_id comes straight from the request body and names sessions/<id>.json; a
+    # traversal id must be refused before anything is read or written outside that dir.
+    with _client(tmp_path) as client:
+        client.app.state.model_service = _OkService()
+        client.app.state.agent = _RecordingAgent()
+        r = client.post("/chat", json={"message": "hi", "model": "m", "session_id": "../escaped"})
+        assert r.status_code == 400
+    assert not list(tmp_path.rglob("escaped*"))
 
 
 def test_workspace_overrides_the_server_default(tmp_path):

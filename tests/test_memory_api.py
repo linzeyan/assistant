@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from assistant.config import Settings
 from assistant.main import create_app
-from fastapi.testclient import TestClient
+from tests._http import local_client
 
 
 def _client(tmp_path):
-    return TestClient(create_app(Settings(memory_dir=tmp_path / "memory")))
+    return local_client(create_app(Settings(memory_dir=tmp_path / "memory")))
 
 
 def test_create_list_update_delete_cycle(tmp_path):

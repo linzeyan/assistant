@@ -5,11 +5,11 @@ from __future__ import annotations
 
 from assistant.config import Settings
 from assistant.main import create_app
-from fastapi.testclient import TestClient
+from tests._http import local_client
 
 
 def _client(tmp_path):
-    return TestClient(
+    return local_client(
         create_app(
             Settings(sessions_dir=tmp_path / "sessions", models_dir=tmp_path / "models")
         )

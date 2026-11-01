@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     # --- backend: what the SwiftUI app / Telegram talk to ---
     backend_host: str = "127.0.0.1"  # set 0.0.0.0 to expose on the LAN
     backend_port: int = 9981
+    # Shared secret for clients that aren't on this machine (sent as `Authorization: Bearer` or
+    # `x-api-key`). Local clients addressing the backend as 127.0.0.1/localhost need none; with
+    # no token set, every other request is refused — so a LAN bind is useless until one is set.
+    api_token: str | None = None
 
     # --- model backend selection ---
     # "mlx": native in-process MLX (mlx-lm), no external server — the default, so the

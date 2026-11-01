@@ -19,7 +19,7 @@ from assistant.api.compat import (
 from assistant.config import Settings
 from assistant.main import create_app
 from assistant.models.types import ModelInfo
-from fastapi.testclient import TestClient
+from tests._http import local_client
 
 
 class _FakeService:
@@ -69,7 +69,7 @@ class _FakeService:
 def _client(tmp_path):
     # NB: set app.state.model_service INSIDE the `with` block — startup (on context enter)
     # installs the real service, so an override before entering would be clobbered.
-    return TestClient(create_app(Settings(sessions_dir=tmp_path / "s", models_dir=tmp_path / "m")))
+    return local_client(create_app(Settings(sessions_dir=tmp_path / "s", models_dir=tmp_path / "m")))
 
 
 # --- pure translation ---
