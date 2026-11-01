@@ -44,7 +44,7 @@ video = [
 # Everything the app manages, in one install (recursive extra). `make install`.
 all = ["assistant[mlx,images,embeddings,vlm,audio,video]"]
 dev = [
-    "pytest>=8.0,<9.0",
+    "pytest>=9.0.3,<10.0",
     "pytest-asyncio>=1.0,<2.0",
 ]
 
