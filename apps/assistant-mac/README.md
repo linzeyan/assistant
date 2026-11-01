@@ -21,7 +21,9 @@ swift run                        # launch the window + menu-bar item
 ```
 
 The app connects to `http://127.0.0.1:9981` by default (change it in Settings). It
-talks only to the backend's HTTP API — REST for commands, SSE for streaming chat.
+talks only to the backend's HTTP API — REST for commands, SSE for streaming chat —
+and authenticates with the client token the backend writes to
+`~/.local/share/assistant/client-token` at start-up (sent to loopback hosts only).
 
 ## Screens
 

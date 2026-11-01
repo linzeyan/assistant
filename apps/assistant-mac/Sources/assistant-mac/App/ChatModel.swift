@@ -8,7 +8,9 @@ final class ChatModel: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var input: String = ""
     @Published var streaming = false
-    @Published var pendingApproval: PendingApproval?
+    /// Approval requests in arrival order; the bar shows the first. More than one is normal
+    /// while subagents run, and each child is blocked until its own request is answered.
+    @Published var pendingApprovals: [PendingApproval] = []
 
     /// This conversation's reasoning overrides (the Chat header menu), sent with every turn and
     /// beating the model's saved defaults. nil = use those defaults. Conversation-scoped rather
@@ -57,12 +59,12 @@ final class ChatModel: ObservableObject {
         streamTask?.cancel()
         streamTask = nil
         streaming = false
-        pendingApproval = nil
+        pendingApprovals = []
         messages.append(ChatMessage(role: "tool", text: "⏹ stopped"))
     }
 
     func respond(_ pending: PendingApproval, _ decision: Bool, client: AssistantClient) {
-        pendingApproval = nil
+        pendingApprovals.removeAll { $0.token == pending.token }
         Task { try? await client.approveTool(token: pending.token, decision: decision) }
     }
 
@@ -121,7 +123,7 @@ final class ChatModel: ObservableObject {
         } catch {
             messages.append(ChatMessage(role: "tool", text: "⚠️ \(error)"))
         }
-        pendingApproval = nil  // turn ended; drop any stale prompt
+        pendingApprovals = []  // turn ended; drop any stale prompts
     }
 
     /// Apply one streamed SSE event to the transcript. Factored out of `stream(...)` so
@@ -147,7 +149,8 @@ final class ChatModel: ObservableObject {
         case "approval_request":
             currentAssistant = nil
             if let token = event.token, let name = event.name {
-                pendingApproval = PendingApproval(token: token, name: name)
+                pendingApprovals.append(
+                    PendingApproval(token: token, name: name, arguments: event.argumentsText ?? ""))
             }
         case "tool_result":
             currentAssistant = nil

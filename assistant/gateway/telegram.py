@@ -22,7 +22,8 @@ import time
 import uuid
 from pathlib import Path
 
-from assistant.gateway.approval import TelegramApprover
+from assistant.downloads import valid_repo_id
+from assistant.gateway.approval import NO_PREVIEW, TelegramApprover, pending_key
 from assistant.model_traits import CHATTABLE_KINDS, weak_at_tools
 
 try:
@@ -50,6 +51,12 @@ _CHATTABLE_KINDS = CHATTABLE_KINDS
 # The weak-at-tools heuristic lives in model_traits (shared with the /models API + GUI picker),
 # so the ⚠️ flag is identical everywhere. Aliased to the module-private name the picker uses.
 _weak_at_tools = weak_at_tools
+
+
+# Sender ids Telegram uses when it doesn't reveal who posted: anonymous group admins
+# (GroupAnonymousBot), messages sent on behalf of a channel (Channel_Bot) and its own service
+# account. Each stands for many people, so allowlisting one would allowlist all of them.
+_SHARED_SENDER_IDS = frozenset({1087968824, 136817688, 777000})
 
 
 def _model_token(model_id: str) -> str:
@@ -242,14 +249,14 @@ class _StreamEditor:
             try:
                 await self._bot.edit_message_text(
                     _render_telegram_html(text)[:4096], chat_id=self._chat,
-                    message_id=self._mid, parse_mode="HTML",
+                    message_id=self._mid, parse_mode="HTML", **NO_PREVIEW,
                 )
                 return
             except Exception:
                 pass  # bad/over-long HTML -> fall back to the plain edit below
         try:
             await self._bot.edit_message_text(
-                text[:4000], chat_id=self._chat, message_id=self._mid
+                text[:4000], chat_id=self._chat, message_id=self._mid, **NO_PREVIEW
             )
         except Exception:
             # "message is not modified" / transient rate limits are non-fatal.
@@ -275,6 +282,7 @@ class TelegramGateway:
         default_workspace=None,
         default_store=None,
         download_manager=None,
+        media_inbox=None,
     ):
         self._token = token
         self._allowed = set(allowed_users or [])
@@ -303,6 +311,9 @@ class TelegramGateway:
         # Optional DownloadManager (shared with the GUI/HTTP downloads). Powers /download: submit a
         # HuggingFace repo and watch its progress. Absent -> /download reports it's unavailable.
         self._downloads = download_manager
+        # Owner-only dir for inbound images (main.telegram_inbox); also a read root of the
+        # agent's tools, so viewing an upload doesn't prompt. None = uploads aren't saved.
+        self._inbox = Path(media_inbox) if media_inbox else None
         self._app = None
         self._pending: dict[str, asyncio.Future] = {}
         # Per-chat model override, set via the /models inline-keyboard picker. Takes
@@ -399,7 +410,8 @@ class TelegramGateway:
     # --- pure-ish helpers (unit tested) ---
 
     def is_allowed(self, user_id: int) -> bool:
-        return user_id in self._allowed  # empty allowlist => deny all
+        # Empty allowlist => deny all.
+        return user_id in self._allowed and user_id not in _SHARED_SENDER_IDS
 
     async def pick_model(self, chat_id: int | None = None) -> str | None:
         # Only text LLMs / VLMs can chat (mirror mlx_service._CHATTABLE_KINDS). A video or
@@ -568,7 +580,7 @@ class TelegramGateway:
             await update.message.reply_text("Model download is unavailable on this backend.")
             return
         repo_id = " ".join(context.args or []).strip()
-        if not repo_id or any(c.isspace() for c in repo_id):
+        if not valid_repo_id(repo_id):
             # Match the HTTP route's contract: a single 'namespace/name', no spaces/line breaks.
             await update.message.reply_text(
                 "Usage: <code>/download namespace/name</code>\n"
@@ -1097,21 +1109,30 @@ class TelegramGateway:
         doc = getattr(msg, "document", None)
         if doc is not None and (getattr(doc, "mime_type", "") or "").startswith("image/"):
             name = getattr(doc, "file_name", "") or ""
-            ext = name.rsplit(".", 1)[-1].lower() if "." in name else "png"
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            # The sender names the file; anything but a plain extension ("x./../../y") would
+            # become part of the path the image is saved to.
+            if not re.fullmatch(r"[a-z0-9]{1,5}", ext):
+                ext = "png"
             return (doc.file_id, doc.file_unique_id, ext)
         return None
 
     async def _download_image(self, context, msg) -> str | None:
         """Download the image in ``msg`` to a stable absolute path and return it (None if msg has
-        no image). Persisted under the temp dir (not unlinked) so it survives the whole turn AND
+        no image). Persisted in the inbox (not unlinked) so it survives the whole turn AND
         follow-up references ("now make it bigger"); the absolute path lets the agent's edit_image
         / view_image read it regardless of the chat's working directory."""
         ref = self._image_file_ref(msg)
         if ref is None:
             return None
+        if self._inbox is None:
+            log.error("telegram image ignored: no media inbox configured")
+            return None
         file_id, uid, ext = ref
-        dest = Path(tempfile.gettempdir()) / f"tg_img_{uid}.{ext}"
+        dest = self._inbox / f"tg_img_{re.sub(r'[^A-Za-z0-9_-]', '_', uid)}.{ext}"
         try:
+            self._inbox.mkdir(parents=True, exist_ok=True)
+            self._inbox.chmod(0o700)
             if not dest.exists():
                 tg_file = await context.bot.get_file(file_id)
                 await tg_file.download_to_drive(str(dest))
@@ -1187,7 +1208,7 @@ class TelegramGateway:
             await self._apply_fusion_choice(query)
             return
         decision, _, token = data.partition(":")
-        future = self._pending.get(token)
+        future = self._pending.get(pending_key(query.message.chat.id, token))
         if future and not future.done():
             future.set_result(decision == "ok")
         try:
@@ -1284,13 +1305,13 @@ class TelegramGateway:
         mid = plan_state.get("message_id")
         if mid is None:
             try:
-                msg = await bot.send_message(chat_id, text)
+                msg = await bot.send_message(chat_id, text, **NO_PREVIEW)
                 plan_state["message_id"] = msg.message_id
             except Exception:
                 log.exception("failed to send plan")
         else:
             try:
-                await bot.edit_message_text(text, chat_id=chat_id, message_id=mid)
+                await bot.edit_message_text(text, chat_id=chat_id, message_id=mid, **NO_PREVIEW)
             except Exception:
                 pass  # text unchanged or a transient edit failure — not worth surfacing
 
@@ -1344,7 +1365,7 @@ class TelegramGateway:
         if len(diff) <= self._DIFF_INLINE_LIMIT and len(ev.get("files", [])) <= 10:
             html = f"{_html.escape(header)}\n<pre>{_html.escape(diff)}</pre>"
             try:
-                await bot.send_message(chat_id, html, parse_mode="HTML")
+                await bot.send_message(chat_id, html, parse_mode="HTML", **NO_PREVIEW)
                 return
             except Exception:
                 pass  # over-long / bad HTML → fall through to the document path
@@ -1364,6 +1385,6 @@ class TelegramGateway:
 
     async def _safe_send_message(self, bot, chat_id, text: str) -> None:
         try:
-            await bot.send_message(chat_id, text)
+            await bot.send_message(chat_id, text, **NO_PREVIEW)
         except Exception:
             log.exception("failed to send message")

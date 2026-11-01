@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,29 @@ class ToolContext:
     # Subagent fan-out runner (N105). None in subagent children, which both hides the
     # spawn_subagents tool from their schema (check_fn) and blocks recursion at call time.
     subagents: "SubagentRunner | None" = None
+    # Directories outside ``cwd`` that tools may read without asking: the backend's own media
+    # output and the Telegram inbox. The user's generated or uploaded files live there, and a
+    # prompt before every view of them would teach the user to approve blindly.
+    read_roots: tuple[Path, ...] = ()
+    # The run's approver and an event sink, set per run by the agent loop. A subagent child
+    # asks through the parent's approver, and an interactive request the child raises is
+    # forwarded through ``on_event`` to the parent's stream — the human the parent asks.
+    approver: object | None = None
+    on_event: "Callable[[dict], None] | None" = None
+
+
+def outside_reach(raw: object, ctx: ToolContext) -> bool:
+    """True when ``raw`` (a path argument as the model wrote it) resolves outside the workspace
+    and every read root. Resolved through realpath so ``../`` and symlinks count as outside."""
+    if not isinstance(raw, str) or not raw:
+        return False
+    p = Path(raw).expanduser()
+    target = Path(os.path.realpath(p if p.is_absolute() else ctx.cwd / p))
+    for root in (ctx.cwd, *ctx.read_roots):
+        r = Path(os.path.realpath(root))
+        if target == r or r in target.parents:
+            return False
+    return True
 
 
 def service_available(attr: str) -> "Callable[[ToolContext], bool]":
@@ -75,6 +99,9 @@ class Tool:
     # Optional schema-time availability gate (G/S13): when set and it returns False for the turn's
     # context, the tool is omitted from the schema sent to the model. None = always offered.
     check_fn: "Callable[[ToolContext], bool] | None" = None
+    # Per-call approval gate for a tool that is safe in general but not for every argument
+    # (read_file outside the workspace). True = this call needs approval like a mutating tool.
+    approval_when: "Callable[[dict, ToolContext], bool] | None" = None
 
     def to_openai(self) -> dict:
         return {

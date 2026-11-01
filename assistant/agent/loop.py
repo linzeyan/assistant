@@ -168,12 +168,13 @@ class AgentLoop:
         self._trace = trace_store
         # In-process hook seam (P2); empty registry by default so every fire is a no-op.
         self._hooks = hooks or HookRegistry()
-        # Wildcard permission rules (S5), layered over whichever approver a run uses. The
-        # ask-once grant set is process-scoped (resets on backend restart), so an approved
-        # action isn't re-prompted for the life of the backend.
+        # Wildcard permission rules (S5), layered over whichever approver a run uses. An
+        # ask-once grant covers exactly the call the human approved — same conversation, same
+        # working directory, same tool, same arguments — and lasts until the backend restarts.
+        # Anything looser lets one approval stand in for calls nobody saw.
         self._rules = approval_rules or []
         self._ask_once = approval_ask_once
-        self._granted: set[tuple[str, str]] = set()
+        self._granted: set[tuple[str, str, str, str]] = set()
 
     async def run(
         self,
@@ -200,9 +201,10 @@ class AgentLoop:
         # isolated): the turn's model rides it — a tool that spawns model work (spawn_subagents)
         # must target the conversation's own model — and Telegram's per-chat cwd overrides the
         # desktop/HTTP default.
-        ctx = replace(self._ctx, model=model)
+        ctx = replace(self._ctx, model=model, approver=effective_approver)
         if cwd is not None:
             ctx = replace(ctx, cwd=Path(cwd))
+        grant_scope = (session.id, str(ctx.cwd))
         # Prefix stability (S2+S3): the system prompt is STABLE (base + skills index only)
         # and is reinstalled only when its fingerprint changes, so the cacheable prefix
         # stays byte-identical turn-to-turn. Per-turn memory is kept OUT of it and instead
@@ -413,6 +415,17 @@ class AgentLoop:
                         "arguments": tc["arguments"],
                     }
                     tool = self._registry.get(tc["name"])
+                    # What the approval path sees: a safe tool whose arguments reach past the
+                    # workspace (read_file on ~/.ssh) is gated like a mutating one for this call.
+                    # Bookkeeping below (B2 replay, mutation tracking) keeps using ``tool``.
+                    gate = tool
+                    if (
+                        tool is not None
+                        and not tool.needs_approval
+                        and tool.approval_when is not None
+                        and tool.approval_when(tc["arguments"], ctx)
+                    ):
+                        gate = replace(tool, needs_approval=True)
                     result: ToolResult | None = None
                     run_it = False  # set by whichever branch authorizes execution
                     # B2: identity of this call for thrash detection — name + canonicalised args.
@@ -446,12 +459,12 @@ class AgentLoop:
                     else:
                         # S5: rules + ask-once decide allow/deny before any prompt; only an
                         # unresolved "ask" falls through to the interactive/policy approver.
-                        decision = self._rule_decision(tool, tc["arguments"])
+                        decision = self._rule_decision(gate, tc["arguments"], grant_scope)
                         if decision == "allow":
                             run_it = True
                         elif decision == "deny":
                             result = ToolResult(False, f"denied by rule: tool '{tool.name}'")
-                        elif tool.needs_approval and getattr(
+                        elif gate.needs_approval and getattr(
                             effective_approver, "interactive", False
                         ):
                             # Interactive approver (GUI/HTTP): surface the request and wait
@@ -465,13 +478,13 @@ class AgentLoop:
                                 "arguments": tc["arguments"],
                             }
                             if await effective_approver.wait(token):
-                                self._remember(tool, tc["arguments"])  # ask-once-per-session
+                                self._remember(gate, tc["arguments"], grant_scope)
                                 run_it = True
                             else:
                                 result = ToolResult(
                                     False, f"denied: tool '{tool.name}' requires approval"
                                 )
-                        elif not await effective_approver.approve(tool, tc["arguments"]):
+                        elif not await effective_approver.approve(gate, tc["arguments"]):
                             result = ToolResult(
                                 False, f"denied: tool '{tool.name}' requires approval"
                             )
@@ -481,11 +494,11 @@ class AgentLoop:
                     # gated) decision, so allow/deny outcomes on mutating tools are reviewable after
                     # the fact regardless of which path (rule / ask-once / interactive / policy)
                     # decided. Read-only auto-allows and cache replays aren't security-interesting.
-                    if tool is not None and tool.needs_approval:
+                    if gate is not None and gate.needs_approval:
                         log.info(
                             "approval audit: tool=%s resource=%r decision=%s",
                             tool.name,
-                            resource_of(tc["arguments"]),
+                            resource_of(gate, tc["arguments"]),
                             "allow" if run_it else "deny",
                         )
                     # Run the tool (whichever path allowed it) while forwarding any progress
@@ -495,7 +508,11 @@ class AgentLoop:
                         self._snapshot_before_edit(tc, turn_snapshots, ctx)
                         self._snapshot_before_shell(tc, shell_state, ctx)
                         async for sub in self._run_tool_with_progress(tool, tc, ctx):
-                            if sub["type"] == "progress":
+                            if sub["type"] == "event":
+                                # Raised inside the tool (a subagent child's approval request)
+                                # and addressed to whoever consumes this turn's stream.
+                                yield sub["event"]
+                            elif sub["type"] == "progress":
                                 yield {
                                     "type": "tool_progress",
                                     "id": tc["id"],
@@ -689,27 +706,33 @@ class AgentLoop:
             schemas.append(tool.to_openai())
         return schemas or None
 
-    def _rule_decision(self, tool, arguments: dict) -> str:
+    def _rule_decision(self, tool, arguments: dict, scope: tuple[str, str]) -> str:
         """S5 permission decision: 'allow' (run without prompting), 'deny' (refuse), or 'ask'
-        (defer to the interactive/policy approver). Safe tools and session-remembered grants
-        short-circuit to allow. Among rules: deny wins outright (a broad allow can't override a
-        deny — fail safe); otherwise the last matching allow/ask wins; no match -> 'ask'."""
+        (defer to the interactive/policy approver). A matching deny wins first, for every tool
+        — a rule denying ``read_file`` on ``*/.ssh/*`` must bind a tool that never asks. Then
+        safe tools and this conversation's exact grants allow; among the remaining rules the
+        last matching allow/ask wins; no match -> 'ask'."""
+        resource = resource_of(tool, arguments)
+        if any(r.decision == "deny" and r.matches(tool.name, resource) for r in self._rules):
+            return "deny"
         if not tool.needs_approval:
             return "allow"
-        resource = resource_of(arguments)
-        if self._ask_once and (tool.name, resource) in self._granted:
+        if self._ask_once and self._grant_key(tool, arguments, scope) in self._granted:
             return "allow"
         decision = "ask"  # default when nothing matches
         for rule in self._rules:
             if rule.matches(tool.name, resource):
-                if rule.decision == "deny":
-                    return "deny"  # deny-priority: short-circuit
                 decision = rule.decision  # last-match-wins among allow/ask
         return decision
 
-    def _remember(self, tool, arguments: dict) -> None:
+    @staticmethod
+    def _grant_key(tool, arguments: dict, scope: tuple[str, str]) -> tuple[str, str, str, str]:
+        args = json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
+        return (*scope, tool.name, args)
+
+    def _remember(self, tool, arguments: dict, scope: tuple[str, str]) -> None:
         if self._ask_once:
-            self._granted.add((tool.name, resource_of(arguments)))
+            self._granted.add(self._grant_key(tool, arguments, scope))
 
     async def _run_tool_with_progress(self, tool, tc: dict, ctx: ToolContext):
         """Run a tool, yielding ``{"type": "progress", ...}`` for each tick it reports and a
@@ -723,7 +746,10 @@ class AgentLoop:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
         ctx.on_progress = lambda fraction, label="": loop.call_soon_threadsafe(
-            queue.put_nowait, (fraction, label)
+            queue.put_nowait, {"type": "progress", "fraction": fraction, "label": label}
+        )
+        ctx.on_event = lambda ev: loop.call_soon_threadsafe(
+            queue.put_nowait, {"type": "event", "event": ev}
         )
         task = asyncio.ensure_future(self._run_tool(tool, tc, ctx))
         t0 = loop.time()
@@ -731,8 +757,7 @@ class AgentLoop:
         try:
             while not task.done():
                 try:
-                    fraction, label = await asyncio.wait_for(queue.get(), timeout=0.25)
-                    yield {"type": "progress", "fraction": fraction, "label": label}
+                    yield await asyncio.wait_for(queue.get(), timeout=0.25)
                     last_emit = loop.time()
                 except asyncio.TimeoutError:
                     # Heartbeat: a long, silent tool (bash, web fetch) must not look frozen.
@@ -746,11 +771,11 @@ class AgentLoop:
                                "label": f"{el // 60}:{el % 60:02d}"}
                         last_emit = now
             while not queue.empty():  # ticks that landed just before completion
-                fraction, label = queue.get_nowait()
-                yield {"type": "progress", "fraction": fraction, "label": label}
+                yield queue.get_nowait()
             yield {"type": "result", "result": task.result()}
         finally:
             ctx.on_progress = None
+            ctx.on_event = None
             task.cancel()  # no-op once done; tidies the orphan if the caller stops early
 
     async def _run_tool(self, tool, tc: dict, ctx: ToolContext) -> ToolResult:

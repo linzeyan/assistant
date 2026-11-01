@@ -1,7 +1,7 @@
 import asyncio
 from unittest.mock import AsyncMock, Mock
 
-from assistant.gateway.approval import TelegramApprover
+from assistant.gateway.approval import TelegramApprover, pending_key
 from assistant.gateway.telegram import (
     TelegramGateway,
     _StreamEditor,
@@ -126,7 +126,7 @@ class _FakeFusion:
 
 def _gateway(
     allowed=None, models=None, default=None, audio=None, video=None, images=None,
-    fusion=None, model_dirs=None, download_manager=None
+    fusion=None, model_dirs=None, download_manager=None, media_inbox=None
 ) -> TelegramGateway:
     return TelegramGateway(
         token="x",
@@ -141,6 +141,7 @@ def _gateway(
         fusion=fusion,
         model_dirs=model_dirs,
         download_manager=download_manager,
+        media_inbox=media_inbox,
     )
 
 
@@ -659,10 +660,11 @@ async def test_on_callback_approve_resolves_pending_future():
     # waiting future to True so the agent loop proceeds.
     gw = _gateway(allowed=[7])
     fut = asyncio.get_event_loop().create_future()
-    gw._pending["abc123"] = fut
+    gw._pending[pending_key(1, "abc123")] = fut
     query = Mock()
     query.data = "ok:abc123"
     query.from_user.id = 7
+    query.message.chat.id = 1
     query.answer = AsyncMock()
     query.edit_message_text = AsyncMock()
     update = Mock()
@@ -674,10 +676,11 @@ async def test_on_callback_approve_resolves_pending_future():
 async def test_on_callback_deny_resolves_future_false():
     gw = _gateway(allowed=[7])
     fut = asyncio.get_event_loop().create_future()
-    gw._pending["abc123"] = fut
+    gw._pending[pending_key(1, "abc123")] = fut
     query = Mock()
     query.data = "no:abc123"
     query.from_user.id = 7
+    query.message.chat.id = 1
     query.answer = AsyncMock()
     query.edit_message_text = AsyncMock()
     update = Mock()
@@ -691,7 +694,7 @@ async def test_on_callback_from_a_non_allowlisted_member_changes_nothing():
     # allowlist must neither approve the pending shell call nor act on any other picker.
     gw = _gateway(allowed=[7], models=[ModelInfo("a", type="llm")])
     fut = asyncio.get_event_loop().create_future()
-    gw._pending["abc123"] = fut
+    gw._pending[pending_key(1, "abc123")] = fut
     for data in ("ok:abc123", "model:0123456789abcdef", "sess:tg:42"):
         query = Mock()
         query.data = data
@@ -750,10 +753,10 @@ def test_with_image_context_injects_path_and_tool_hint():
     assert "edit_image" in out and "view_image" in out  # tells the model what to call
 
 
-async def test_reply_to_image_rides_path_into_turn():
+async def test_reply_to_image_rides_path_into_turn(tmp_path):
     # The user's exact failure: replying to a (bot or uploaded) image with "make this a sketch"
     # must hand the model the image path, not leave it asking for one it can't see.
-    gw = _gateway(allowed=[7])
+    gw = _gateway(allowed=[7], media_inbox=tmp_path)
     captured = {}
 
     async def fake_run_turn(update, context, text, *, voice_reply):
@@ -774,8 +777,8 @@ async def test_reply_to_image_rides_path_into_turn():
     assert "tg_img_ruq.jpg" in captured["text"] and "edit_image" in captured["text"]
 
 
-async def test_photo_upload_rides_caption_and_path_into_turn():
-    gw = _gateway(allowed=[7])
+async def test_photo_upload_rides_caption_and_path_into_turn(tmp_path):
+    gw = _gateway(allowed=[7], media_inbox=tmp_path)
     captured = {}
 
     async def fake_run_turn(update, context, text, *, voice_reply):

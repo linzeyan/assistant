@@ -186,8 +186,7 @@ struct AssistantClient {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    var request = URLRequest(url: url("/chat"))
-                    request.httpMethod = "POST"
+                    var request = self.request("/chat", method: "POST")
                     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     var body: [String: Any] = [
                         "message": message, "model": model,
@@ -225,30 +224,51 @@ struct AssistantClient {
         return URL(string: base + path) ?? baseURL
     }
 
+    /// The backend's per-launch client token, from the owner-only file it writes at start-up
+    /// (backend `main.client_token_path`). Without it the backend refuses every request but
+    /// /v1/*, which is what keeps other local processes and accounts off the agent. Read per
+    /// request: it is a few bytes and changes whenever the backend restarts.
+    static func clientToken() -> String? {
+        let file = Bootstrap.dataHome().appendingPathComponent("assistant/client-token")
+        guard let raw = try? String(contentsOf: file, encoding: .utf8) else { return nil }
+        let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return token.isEmpty ? nil : token
+    }
+
+    /// Only a backend on this machine gets the token: it unlocks the local backend alone, and
+    /// a remote base URL has no business receiving it.
+    static func isLoopback(_ url: URL) -> Bool {
+        ["127.0.0.1", "localhost", "::1"].contains(url.host ?? "")
+    }
+
+    func request(_ path: String, method: String = "GET") -> URLRequest {
+        var request = URLRequest(url: url(path))
+        request.httpMethod = method
+        if AssistantClient.isLoopback(baseURL), let token = AssistantClient.clientToken() {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return request
+    }
+
     private func get<T: Decodable>(_ path: String) async throws -> T {
-        let (data, response) = try await session.data(from: url(path))
+        let (data, response) = try await session.data(for: request(path))
         try check(data, response)
         return try JSONDecoder().decode(T.self, from: data)
     }
 
     private func post(_ path: String) async throws {
-        var request = URLRequest(url: url(path))
-        request.httpMethod = "POST"
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request(path, method: "POST"))
         try check(data, response)
     }
 
     private func postDecoding<T: Decodable>(_ path: String) async throws -> T {
-        var request = URLRequest(url: url(path))
-        request.httpMethod = "POST"
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request(path, method: "POST"))
         try check(data, response)
         return try JSONDecoder().decode(T.self, from: data)
     }
 
     private func postJSON<T: Decodable>(_ path: String, body: [String: Any]) async throws -> T {
-        var request = URLRequest(url: url(path))
-        request.httpMethod = "POST"
+        var request = self.request(path, method: "POST")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await session.data(for: request)
@@ -261,8 +281,7 @@ struct AssistantClient {
     }
 
     private func sendJSONNoDecode(_ method: String, _ path: String, body: [String: Any]) async throws {
-        var request = URLRequest(url: url(path))
-        request.httpMethod = method
+        var request = self.request(path, method: method)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await session.data(for: request)
@@ -295,6 +314,17 @@ struct AssistantClient {
         guard line.hasPrefix("data:") else { return nil }
         let payload = line.dropFirst("data:".count).trimmingCharacters(in: .whitespaces)
         guard !payload.isEmpty, let data = payload.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(ChatEvent.self, from: data)
+        guard var event = try? JSONDecoder().decode(ChatEvent.self, from: data) else { return nil }
+        // `arguments` is whatever the tool takes, so it isn't modelled: it is kept as the
+        // pretty-printed JSON the user reads before approving.
+        if event.type == "approval_request",
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let args = obj["arguments"], JSONSerialization.isValidJSONObject(args),
+            let text = try? JSONSerialization.data(
+                withJSONObject: args, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        {
+            event.argumentsText = String(decoding: text, as: UTF8.self)
+        }
+        return event
     }
 }

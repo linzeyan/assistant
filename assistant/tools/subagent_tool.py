@@ -34,7 +34,7 @@ from .registry import registry
         },
         "required": ["tasks"],
     },
-    needs_approval=True,  # one human gate for the whole fan-out; children don't re-prompt
+    needs_approval=True,  # the fan-out is asked once; each child's gated calls are asked too
     check_fn=lambda ctx: ctx.subagents is not None,
 )
 async def spawn_subagents(arguments: dict, ctx: ToolContext) -> ToolResult:

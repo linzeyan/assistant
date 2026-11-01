@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import ToolContext, ToolResult, service_available
+from .base import ToolContext, ToolResult, outside_reach, service_available
 from .registry import registry
 
 
@@ -48,6 +48,11 @@ async def generate_image(args: dict, ctx: ToolContext) -> ToolResult:
     return ToolResult(True, str(path))
 
 
+def _input_paths(args: dict) -> list:
+    many = args.get("image_paths")
+    return [args.get("image_path"), *(many if isinstance(many, list) else [])]
+
+
 @registry.tool(
     name="edit_image",
     description=(
@@ -77,6 +82,7 @@ async def generate_image(args: dict, ctx: ToolContext) -> ToolResult:
         "required": ["prompt"],
     },
     check_fn=service_available("images"),
+    approval_when=lambda args, ctx: any(outside_reach(p, ctx) for p in _input_paths(args)),
 )
 async def edit_image(args: dict, ctx: ToolContext) -> ToolResult:
     if ctx.images is None or not ctx.images.available():

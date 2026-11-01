@@ -162,12 +162,12 @@ Key defaults:
 
 | Field | Default | Notes |
 |-------|---------|-------|
-| `backend_host` / `backend_port` | `127.0.0.1` / `9981` | Set host to `0.0.0.0` to expose on the LAN. |
+| `backend_host` / `backend_port` | `127.0.0.1` / `9981` | Set host to `0.0.0.0` to expose on the LAN; that needs `ssl_certfile` + `ssl_keyfile` (the backend refuses to start without them) and an `api_token` for remote clients. |
 | `model_backend` | `mlx` | Native in-process inference; or `omlx` for an external server. |
 | `models_dir` / `download_dir` | `~/.local/share/assistant/models` | Downloads land where models are discovered. |
-| `approval_required` | `true` | Require human approval for mutating tools. |
+| `approval_required` | `true` | Require human approval for mutating tools, memory writes, and reads outside the workspace. |
 | `approval_rules` | (none) | Wildcard allow/deny/ask rules per tool + resource; first match wins. |
-| `workspace_dir` | process cwd | Where file/shell tools operate. |
+| `workspace_dir` | `~/.local/share/assistant/workspace` | Where file/shell tools operate (Telegram: `/cd`). Writes are refused when it is `/` or your home folder. |
 
 Application data follows the XDG spec under `~/.local/share/assistant/`
 (`models/`, `skills/`, `memory/`, `sessions/`, `images/`, `videos/`, `audio/`).
@@ -205,10 +205,12 @@ account (first launch: right-click → Open); a distributable build needs a Deve
 (`CODESIGN_IDENTITY=… make app-package`, then `make app-notarize`). CI runs the tests,
 builds the app, and attaches `Assistant.app.zip` to Releases on `v*` tags.
 
-Backend API quick check with the server running:
+Backend API quick check with the server running. Every route except `/v1/*` needs the
+client token the backend writes (owner-only) at start-up:
 
 ```sh
-curl -s http://127.0.0.1:9981/status | python3 -m json.tool
-curl -sN http://127.0.0.1:9981/chat -H 'content-type: application/json' \
+AUTH="Authorization: Bearer $(cat ~/.local/share/assistant/client-token)"
+curl -s http://127.0.0.1:9981/status -H "$AUTH" | python3 -m json.tool
+curl -sN http://127.0.0.1:9981/chat -H "$AUTH" -H 'content-type: application/json' \
   -d '{"model":"<model-id>","message":"hello"}'      # SSE stream
 ```

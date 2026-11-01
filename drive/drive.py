@@ -57,8 +57,23 @@ def visible(text: str) -> str:
     return "\n".join(part.strip() for part in parts[1:] if part.strip())
 
 
+def auth_headers() -> dict[str, str]:
+    """The token the backend requires: ASSISTANT_API_TOKEN for a remote backend, else the
+    per-launch client token a local backend writes owner-only under the XDG data dir.
+    Without one every route but /v1/* answers 403."""
+    token = os.environ.get("ASSISTANT_API_TOKEN")
+    if not token:
+        data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+        try:
+            token = (data / "assistant" / "client-token").read_text().strip()
+        except OSError:
+            return {}
+    return {"Authorization": f"Bearer {token}"}
+
+
 def get_json(url: str, timeout: float = 10.0):
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+    req = urllib.request.Request(url, headers=auth_headers())
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.load(resp)
 
 
@@ -179,7 +194,7 @@ def main() -> int:
     req = urllib.request.Request(
         f"{args.base}/chat",
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **auth_headers()},
         method="POST",
     )
 

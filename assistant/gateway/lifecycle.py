@@ -44,6 +44,7 @@ async def build_and_start(settings, app) -> tuple[object | None, str | None]:
         # Shared with the GUI/HTTP downloads, so /download reuses the same manager (progress,
         # cancel, resume) rather than a parallel path.
         download_manager=getattr(app.state, "download_manager", None),
+        media_inbox=settings.telegram_inbox,
     )
     try:
         await gateway.start()

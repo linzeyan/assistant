@@ -346,6 +346,8 @@ struct ChatEvent: Decodable {
     let summary: String?  // turn_diff: "N files changed (+x/-y)"
     let diff: String?     // turn_diff: the unified diff of files the turn changed
     let steps: [PlanStep]?  // plan: the agent's current checklist for this turn (SA.3)
+    /// approval_request: the call's arguments as pretty JSON, filled in by `parseSSELine`.
+    var argumentsText: String? = nil
 
     /// Estimated token counts carried by the terminal `done` event (backend tokens.py).
     struct Usage: Decodable {

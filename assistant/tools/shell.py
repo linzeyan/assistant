@@ -98,7 +98,11 @@ async def bash(args: dict, ctx: ToolContext) -> ToolResult:
     timeout = float(args.get("timeout", 120))
 
     path = await _user_path()
-    env = {**os.environ, "PATH": path} if path else None
+    # The backend's own ASSISTANT_* settings include the Telegram bot token and api_token;
+    # a command the user approved to build a project has no business seeing them.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ASSISTANT_")}
+    if path:
+        env["PATH"] = path
 
     proc = await asyncio.create_subprocess_shell(
         command,

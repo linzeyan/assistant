@@ -12,11 +12,13 @@ struct ChatMessage: Identifiable {
     var planSteps: [PlanStep]? = nil  // role "plan": the agent's per-turn checklist (SA.3)
 }
 
-/// A tool call paused awaiting the user's Approve/Deny.
+/// A tool call paused awaiting the user's Approve/Deny. `arguments` is what the call will
+/// actually do — the approval means nothing if the user can't read it.
 struct PendingApproval: Identifiable {
     let id = UUID()
     let token: String
     let name: String
+    var arguments: String = ""
 }
 
 struct ChatScreen: View {
@@ -33,9 +35,9 @@ struct ChatScreen: View {
             header
             Divider()
             transcript
-            if let pending = chat.pendingApproval {
+            if let pending = chat.pendingApprovals.first {
                 Divider()
-                approvalBar(pending)
+                approvalBar(pending, waiting: chat.pendingApprovals.count - 1)
             }
             Divider()
             composer
@@ -252,14 +254,29 @@ struct ChatScreen: View {
         }
     }
 
-    private func approvalBar(_ pending: PendingApproval) -> some View {
-        HStack {
-            Image(systemName: "lock.shield")
-            Text("Approve **\(pending.name)**?")
-            Spacer()
-            Button("Deny") { chat.respond(pending, false, client: controller.client) }
-            Button("Approve") { chat.respond(pending, true, client: controller.client) }
-                .keyboardShortcut(.defaultAction)
+    private func approvalBar(_ pending: PendingApproval, waiting: Int) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: "lock.shield")
+                Text("Approve **\(pending.name)**?")
+                // Subagents can ask in parallel; they are answered one at a time, in order.
+                if waiting > 0 {
+                    Text("\(waiting) more waiting").foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Deny") { chat.respond(pending, false, client: controller.client) }
+                Button("Approve") { chat.respond(pending, true, client: controller.client) }
+                    .keyboardShortcut(.defaultAction)
+            }
+            if !pending.arguments.isEmpty {
+                ScrollView {
+                    Text(pending.arguments)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 160)
+            }
         }
         .padding(8)
         .background(Color.orange.opacity(0.15))

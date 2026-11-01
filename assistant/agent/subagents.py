@@ -7,8 +7,9 @@ tool call into N concurrent child ``AgentLoop`` runs: each child gets a fresh
 in-memory ``Session`` (context isolation — the main conversation never sees the
 children's tool traffic, only their final summaries), the standard toolset minus
 ``spawn_subagents`` itself (the schema gate on ``ctx.subagents`` prevents
-recursion), and an auto-allow approver — the human approved the fan-out itself,
-task list in hand, so children don't re-prompt per tool; S5 deny rules still bind.
+recursion), and the parent turn's own approver: approving the fan-out approves a
+list of task strings, not the tool calls a child then chooses, so every
+approval-gated child call is asked of the same human, with its real arguments.
 
 Concurrency comes from the N104 batch lane: every child request is marked
 ``concurrent=True``, so children decode TOGETHER on one model when its engine is
@@ -95,11 +96,14 @@ class SubagentRunner:
 
         # One child loop serves all tasks: run() keeps its state per-invocation, so
         # concurrent runs don't interfere, and the children share the ask-once/rule setup.
-        child_ctx = replace(ctx, subagents=None, on_progress=None)
+        child_ctx = replace(ctx, subagents=None, on_progress=None, on_event=None)
+        # The parent's approver, so a child's write is asked of the human who approved the
+        # fan-out. Without one (a caller outside AgentLoop) refuse rather than auto-allow.
+        approver = ctx.approver or PolicyApprover(approval_required=True)
         loop = AgentLoop(
             self._llm,
             self._registry,
-            PolicyApprover(approval_required=False),  # fan-out itself was the approval
+            approver,
             child_ctx,
             max_iters=_MAX_ITERS,
             max_output_tokens=self._max_output_tokens,
@@ -113,7 +117,7 @@ class SubagentRunner:
         async def one(index: int, task: str) -> tuple[bool, str]:
             nonlocal done
             try:
-                ok, text = await self._run_child(loop, task, ctx.model)
+                ok, text = await self._run_child(loop, task, ctx.model, ctx.on_event)
             except Exception as exc:  # one child's crash must not sink its siblings
                 log.exception("subagent %d/%d failed", index + 1, total)
                 ok, text = False, f"[failed: {exc}]"
@@ -133,14 +137,20 @@ class SubagentRunner:
             parts.append(f"### Subagent {i} — {head}\n{text}")
         return any(ok for ok, _ in results), "\n\n".join(parts)
 
-    async def _run_child(self, loop: AgentLoop, task: str, model: str) -> tuple[bool, str]:
+    async def _run_child(
+        self, loop: AgentLoop, task: str, model: str, forward=None
+    ) -> tuple[bool, str]:
         """One subagent turn: fresh session, the task as its only user message. The final
         assistant message is the deliverable; deltas/tool events are deliberately dropped —
-        context isolation is the point (the parent pays only for the summary)."""
+        context isolation is the point (the parent pays only for the summary). The one
+        exception is an approval request: the child is blocked on it, and only the parent's
+        stream reaches the human who can answer."""
         session = Session(id=f"sub_{uuid.uuid4().hex[:12]}", model=model)
         error: str | None = None
         async for ev in loop.run(session, task, model):
-            if ev["type"] == "error":
+            if ev["type"] == "approval_request" and forward is not None:
+                forward(ev)
+            elif ev["type"] == "error":
                 error = ev.get("detail") or "unknown error"
         if error is not None:
             return False, f"[failed: {error}]"

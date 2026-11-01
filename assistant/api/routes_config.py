@@ -16,7 +16,7 @@ import tomli_w
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from assistant.config import XDG_CONFIG_DIR
+from assistant.config import XDG_CONFIG_DIR, write_private
 from assistant.downloads import hub_env
 from assistant.gateway import lifecycle as gateway_lifecycle
 
@@ -139,12 +139,11 @@ async def put_config(patch: ConfigPatch, request: Request):
             )
         updates["telegram_token"] = token  # normalise; "" clears the gateway
 
-    _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     existing: dict = {}
     if _CONFIG_PATH.is_file():
         existing = tomllib.loads(_CONFIG_PATH.read_text())
     existing.update(updates)
-    _CONFIG_PATH.write_text(tomli_w.dumps(existing))
+    write_private(_CONFIG_PATH, tomli_w.dumps(existing))  # holds telegram_token / api_token
 
     # Apply discovery-related changes to the LIVE backend so they take effect
     # immediately (discovery is just a filesystem scan). Only host/port and a backend

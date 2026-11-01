@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import ToolContext, ToolResult, service_available
+from .base import ToolContext, ToolResult, outside_reach, service_available
 from .registry import registry
 
 
@@ -24,6 +24,7 @@ from .registry import registry
         "required": ["path"],
     },
     check_fn=service_available("audio"),
+    approval_when=lambda args, ctx: outside_reach(args.get("path"), ctx),
 )
 async def transcribe_audio(args: dict, ctx: ToolContext) -> ToolResult:
     if ctx.audio is None or not ctx.audio.available():

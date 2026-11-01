@@ -12,6 +12,7 @@ current user turn via ``wrap_memory_context`` so dynamic context can't perturb t
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from .tokens import cut_at_tokens, estimate_tokens
@@ -129,9 +130,17 @@ def build_system_prompt(skills_index: str) -> str:
     return "\n".join(parts)
 
 
+_CLOSE_MEMORY = re.compile(r"</(memory-context)", re.IGNORECASE)
+
+
 def wrap_memory_context(memory_block: str) -> str:
     """Wrap prefetched memory as a reference-only block to ride the *current user turn*
-    (never the system prompt), so dynamic memory can't perturb the cacheable prefix."""
+    (never the system prompt), so dynamic memory can't perturb the cacheable prefix.
+
+    A closing tag inside an entry is defused: memory is the one block that persists across
+    conversations, and an entry that ended the block early would have its tail read as the
+    user speaking."""
+    memory_block = _CLOSE_MEMORY.sub(r"<\\/\1", memory_block)
     return f"<memory-context reference-only>\n{memory_block}\n</memory-context>"
 
 

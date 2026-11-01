@@ -272,7 +272,7 @@ Give each track its own worktree, its own `--label`, and its own `--session-file
 | `--brief PATH` | the file whose contents become the message (required) |
 | `--workspace PATH` | absolute path the turn's file/shell tools operate in (required) |
 | `--label NAME` | names the log files; defaults to the brief's filename |
-| `--base URL` | backend base URL; defaults to `$ASSISTANT_BASE_URL` or `http://127.0.0.1:9981` |
+| `--base URL` | backend base URL; defaults to `$ASSISTANT_BASE_URL` or `http://127.0.0.1:9981`. Requests carry `$ASSISTANT_API_TOKEN` if set, else the running backend's client token (`~/.local/share/assistant/client-token`) |
 | `--model ID` | defaults to the backend's configured default model |
 | `--thinking on\|off` | per-turn scratchpad switch; omit to inherit the model's setting |
 | `--effort VALUE` | per-turn reasoning effort, validated against the model's template |

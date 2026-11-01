@@ -5,10 +5,16 @@ DuckDuckGo's HTML endpoint (no API key), ``fetch_url`` strips a page to readable
 Both are read-only, so they're not approval-gated — but they DO make outbound network
 calls, hence short timeouts and best-effort failure (a clear message, never a hang) so a
 flaky network degrades gracefully instead of stalling the agent loop.
+
+Because nobody approves a fetch, ``fetch_url`` only reaches public addresses: a page that
+talks the model into fetching http://127.0.0.1:9981/..., a router's admin page or a cloud
+metadata endpoint would otherwise get the answer read back into the conversation.
 """
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlparse
 
@@ -29,6 +35,30 @@ _UA = "Mozilla/5.0 (Macintosh; Apple Silicon) Assistant/0.1"
 _FETCH_UA = "Assistant/0.1 (+https://gitlab.com/linzeyan/assistant) python-httpx"
 _TIMEOUT = 12.0
 _MAX_FETCH_CHARS = 6000  # cap fetched text so a long page can't blow the token budget
+
+
+class _NotPublic(Exception):
+    pass
+
+
+async def _require_public(request: httpx.Request) -> None:
+    """httpx request hook, so it runs again for every redirect hop — a public URL that
+    redirects to a private one is refused at the hop. The address is resolved here and again
+    by the connection; a DNS answer that changes in between is not caught."""
+    host = request.url.host
+    try:
+        addrs = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(host, None)
+        except OSError as exc:
+            raise _NotPublic(f"cannot resolve {host}: {exc}") from exc
+        addrs = [ipaddress.ip_address(info[4][0].split("%", 1)[0]) for info in infos]
+    for addr in addrs:
+        mapped = getattr(addr, "ipv4_mapped", None)
+        addr = mapped or addr
+        if not addr.is_global or addr.is_multicast:
+            raise _NotPublic(f"{host} is a private or local address ({addr})")
 
 
 def _clean_ddg(href: str | None) -> str:
@@ -171,12 +201,15 @@ async def fetch_url(args: dict, ctx: ToolContext) -> ToolResult:
     cap = max(500, min(int(args.get("max_chars") or _MAX_FETCH_CHARS), 20_000))
     try:
         async with httpx.AsyncClient(
-            timeout=_TIMEOUT, follow_redirects=True, headers={"User-Agent": _FETCH_UA}
+            timeout=_TIMEOUT, follow_redirects=True, headers={"User-Agent": _FETCH_UA},
+            event_hooks={"request": [_require_public]},
         ) as client:
             resp = await client.get(url)
             resp.raise_for_status()
             ctype = resp.headers.get("content-type", "")
             body = resp.text
+    except _NotPublic as exc:
+        return ToolResult(False, f"fetch not allowed: {exc}")
     except Exception as exc:
         return ToolResult(False, f"fetch failed: {exc}")
     if "html" in ctype.lower():

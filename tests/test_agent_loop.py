@@ -849,7 +849,9 @@ async def test_h3_approval_audit_logs_allow_and_deny(tmp_path, caplog):
     async def w(args, ctx):
         return ToolResult(True, "wrote")
 
-    reg = _reg_with(_tool("danger", w, needs_approval=True))
+    danger = _tool("danger", w, needs_approval=True)
+    danger.parameters = {"type": "object", "properties": {"path": {"type": "string"}}}
+    reg = _reg_with(danger)
 
     async def _run(approval_required):
         llm = FakeLLM([_call("c1", "danger", {"path": "x.py"}),

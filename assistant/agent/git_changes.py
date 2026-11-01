@@ -9,6 +9,11 @@ its committed content as "before" (correct — clean means working == HEAD); a n
 file has no "before" (it's an addition).
 
 git is optional: outside a repo this captures nothing and the write/edit diff still works.
+
+These git calls run before the approved bash command, on a repo the agent may have just
+cloned, so they must not execute anything the repo's own .git/config names: fsmonitor is
+switched off per call, blobs are read with cat-file (no textconv), and a repo whose local
+config defines filter or diff drivers is not snapshotted at all.
 """
 
 from __future__ import annotations
@@ -19,9 +24,15 @@ from pathlib import Path
 _TIMEOUT = 10
 
 
+# Local-config keys whose value is a command `git status` (clean/process) or a diff
+# (textconv/command) would run. Global config is the user's own and stays trusted — git-lfs
+# installs its filter there.
+_COMMAND_KEYS = r"^(filter\..*\.(clean|smudge|process)|diff\..*\.(textconv|command))$"
+
+
 def _git(cwd, *args: str, text: bool = True):
     return subprocess.run(
-        ["git", "-C", str(cwd), *args],
+        ["git", "-c", "core.fsmonitor=false", "-C", str(cwd), *args],
         capture_output=True,
         text=text,
         timeout=_TIMEOUT,
@@ -38,8 +49,11 @@ def repo_root(cwd) -> Path | None:
 
 
 def dirty_paths(root: Path) -> dict[str, str]:
-    """Map repo-relative path -> porcelain status for every changed/untracked file."""
+    """Map repo-relative path -> porcelain status for every changed/untracked file. Empty
+    when the repo's local config names commands git would run (see module docstring)."""
     try:
+        if _git(root, "config", "--local", "--get-regexp", _COMMAND_KEYS).stdout.strip():
+            return {}
         r = _git(root, "status", "--porcelain")
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -59,7 +73,7 @@ def dirty_paths(root: Path) -> dict[str, str]:
 def head_bytes(root: Path, relpath: str) -> bytes | None:
     """The committed (HEAD) bytes of a path, or None if it isn't tracked there."""
     try:
-        r = _git(root, "show", f"HEAD:{relpath}", text=False)
+        r = _git(root, "cat-file", "blob", f"HEAD:{relpath}", text=False)
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout if r.returncode == 0 else None

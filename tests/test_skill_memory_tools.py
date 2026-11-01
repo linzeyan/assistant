@@ -48,7 +48,9 @@ async def test_skill_manage_requires_body():
 def test_self_modifying_tools_need_approval():
     reg = build_registry()
     assert reg.get("skill_manage").needs_approval is True
-    assert reg.get("memory_write").needs_approval is False  # learning facts is low-risk
+    # A stored memory rides every later prompt: a write the model was talked into by a page it
+    # read is a prompt injection that outlives the conversation, so the human approves it.
+    assert reg.get("memory_write").needs_approval is True
 
 
 async def test_memory_tools_roundtrip(tmp_path):

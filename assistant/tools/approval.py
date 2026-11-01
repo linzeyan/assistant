@@ -55,11 +55,16 @@ class Rule:
         )
 
 
-def resource_of(arguments: dict) -> str:
+def resource_of(tool: Tool, arguments: dict) -> str:
     """Best-effort resource string for a tool call (the thing a rule's resource glob matches):
-    the first present of path / command / url / pattern / name."""
+    the first present of path / command / url / pattern / name that the tool's schema declares.
+
+    Only declared keys count because the model writes the arguments: an extra ``"path": "ls"``
+    on a bash call would otherwise become its resource, missing ``deny rm *`` and hitting
+    ``allow ls*`` while the handler still runs ``command``."""
+    declared = (tool.parameters or {}).get("properties") or {}
     for key in _RESOURCE_KEYS:
-        value = arguments.get(key)
+        value = arguments.get(key) if key in declared else None
         if isinstance(value, str) and value:
             return value
     return ""

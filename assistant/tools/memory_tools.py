@@ -1,7 +1,8 @@
 """Memory tools: store and recall durable facts/preferences.
 
-Writing memory is low-risk and core to "the assistant learns about you", so it is
-not approval-gated. Search is read-only.
+Writing memory is approval-gated: a stored entry rides every later turn's prompt, so a
+write the model was talked into by a page or file it just read would be a prompt injection
+that outlives the conversation. Search is read-only.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from .registry import registry
         },
         "required": ["content"],
     },
+    needs_approval=True,
 )
 async def memory_write(args: dict, ctx: ToolContext) -> ToolResult:
     if ctx.memory is None:

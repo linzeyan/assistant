@@ -9,11 +9,17 @@ from assistant.tools.approval import Rule, resource_of
 from assistant.tools.base import Tool, ToolResult
 
 
-def _tool(name: str, needs_approval: bool = True) -> Tool:
+_PROPS = {k: {"type": "string"} for k in ("path", "command", "url", "pattern", "name")}
+_SCOPE = ("session", "/work")
+
+
+def _tool(name: str, needs_approval: bool = True, props: dict = _PROPS) -> Tool:
     async def handler(args, ctx):
         return ToolResult(True, "ok")
 
-    return Tool(name=name, description="", parameters={}, handler=handler, needs_approval=needs_approval)
+    return Tool(name=name, description="",
+                parameters={"type": "object", "properties": props},
+                handler=handler, needs_approval=needs_approval)
 
 
 def _loop(rules=None, ask_once: bool = True) -> AgentLoop:
@@ -59,56 +65,73 @@ def test_rule_matches_action_and_resource_globs():
 
 
 def test_resource_of_precedence_and_empty():
-    assert resource_of({"path": "a", "command": "b"}) == "a"  # path beats command
-    assert resource_of({"command": "ls"}) == "ls"
-    assert resource_of({}) == ""
+    tool = _tool("t")
+    assert resource_of(tool, {"path": "a", "command": "b"}) == "a"  # path beats command
+    assert resource_of(tool, {"command": "ls"}) == "ls"
+    assert resource_of(tool, {}) == ""
+
+
+def test_resource_of_ignores_keys_the_tool_does_not_declare():
+    # The model writes the arguments: an undeclared "path" on bash must not become the resource
+    # a rule is matched against while the handler runs "command".
+    bash = _tool("bash", props={"command": {"type": "string"}})
+    assert resource_of(bash, {"path": "ls", "command": "rm -rf x"}) == "rm -rf x"
 
 
 # --- loop decision ---
 def test_safe_tool_always_allows():
-    assert _loop()._rule_decision(_tool("read_file", needs_approval=False), {}) == "allow"
+    assert _loop()._rule_decision(_tool("read_file", needs_approval=False), {}, _SCOPE) == "allow"
 
 
 def test_allow_rule_skips_prompt():
     loop = _loop([Rule("bash", "*", "allow")])
-    assert loop._rule_decision(_tool("bash"), {"command": "ls"}) == "allow"
+    assert loop._rule_decision(_tool("bash"), {"command": "ls"}, _SCOPE) == "allow"
 
 
 def test_deny_rule_refuses():
     loop = _loop([Rule("bash", "rm *", "deny")])
-    assert loop._rule_decision(_tool("bash"), {"command": "rm -rf x"}) == "deny"
+    assert loop._rule_decision(_tool("bash"), {"command": "rm -rf x"}, _SCOPE) == "deny"
 
 
 def test_no_rule_falls_through_to_ask():
-    assert _loop()._rule_decision(_tool("bash"), {"command": "ls"}) == "ask"
+    assert _loop()._rule_decision(_tool("bash"), {"command": "ls"}, _SCOPE) == "ask"
 
 
 def test_deny_wins_regardless_of_position():
     # deny-priority: even with allow listed last, a matching deny must win (fail safe).
     loop = _loop([Rule("bash", "rm *", "deny"), Rule("bash", "rm *", "allow")])
-    assert loop._rule_decision(_tool("bash"), {"command": "rm x"}) == "deny"
+    assert loop._rule_decision(_tool("bash"), {"command": "rm x"}, _SCOPE) == "deny"
 
 
 def test_last_match_wins_among_non_deny():
     loop = _loop([Rule("bash", "*", "allow"), Rule("bash", "make *", "ask")])
-    assert loop._rule_decision(_tool("bash"), {"command": "make test"}) == "ask"  # last match
-    assert loop._rule_decision(_tool("bash"), {"command": "ls"}) == "allow"  # only the first
+    assert loop._rule_decision(_tool("bash"), {"command": "make test"}, _SCOPE) == "ask"  # last match
+    assert loop._rule_decision(_tool("bash"), {"command": "ls"}, _SCOPE) == "allow"  # only the first
 
 
 def test_ask_once_remembers_exact_resource_only():
     loop = _loop()  # no rules -> default ask
     tool, args = _tool("bash"), {"command": "make test"}
-    assert loop._rule_decision(tool, args) == "ask"
-    loop._remember(tool, args)
-    assert loop._rule_decision(tool, args) == "allow"  # same command -> no re-prompt
-    assert loop._rule_decision(tool, {"command": "make build"}) == "ask"  # different -> ask
+    assert loop._rule_decision(tool, args, _SCOPE) == "ask"
+    loop._remember(tool, args, _SCOPE)
+    assert loop._rule_decision(tool, args, _SCOPE) == "allow"  # same command -> no re-prompt
+    assert loop._rule_decision(tool, {"command": "make build"}, _SCOPE) == "ask"  # different -> ask
+    assert loop._rule_decision(tool, args, ("other", "/work")) == "ask"  # other conversation
+    assert loop._rule_decision(tool, args, ("session", "/elsewhere")) == "ask"  # other directory
+
+
+def test_deny_rule_binds_a_tool_that_needs_no_approval():
+    loop = _loop([Rule("read_file", "*/.ssh/*", "deny")])
+    read = _tool("read_file", needs_approval=False)
+    assert loop._rule_decision(read, {"path": "/u/.ssh/id_rsa"}, _SCOPE) == "deny"
+    assert loop._rule_decision(read, {"path": "/u/notes.txt"}, _SCOPE) == "allow"
 
 
 def test_ask_once_disabled_never_remembers():
     loop = _loop(ask_once=False)
     tool, args = _tool("bash"), {"command": "make test"}
-    loop._remember(tool, args)
-    assert loop._rule_decision(tool, args) == "ask"
+    loop._remember(tool, args, _SCOPE)
+    assert loop._rule_decision(tool, args, _SCOPE) == "ask"
 
 
 # --- schema filtering (S5): blanket deny hides the tool from the model ---

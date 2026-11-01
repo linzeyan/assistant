@@ -12,10 +12,12 @@ from assistant.main import create_app
 from fastapi.testclient import TestClient
 
 
-def _client(tmp_path, client_ip="127.0.0.1", host="127.0.0.1:9981", token=None):
+def _client(tmp_path, client_ip="127.0.0.1", host="127.0.0.1:9981", token=None, app_token=True):
     # Used as a context manager so the lifespan runs and the routes have their state.
+    # app_token: send the per-process client token the desktop app reads from its file.
     app = create_app(Settings(sessions_dir=tmp_path / "s", models_dir=tmp_path / "m", api_token=token))
-    return TestClient(app, base_url=f"http://{host}", client=(client_ip, 50000))
+    headers = {"Authorization": f"Bearer {app.state.client_token}"} if app_token else {}
+    return TestClient(app, base_url=f"http://{host}", client=(client_ip, 50000), headers=headers)
 
 
 def test_local_client_addressing_loopback_is_allowed(tmp_path):
@@ -25,13 +27,19 @@ def test_local_client_addressing_loopback_is_allowed(tmp_path):
 
 
 def test_dns_rebinding_page_is_refused(tmp_path):
-    # Same loopback connection a rebinding page would make, but under the attacker's name.
+    # Same loopback connection a rebinding page would make, but under the attacker's name —
+    # refused even if it somehow held the client token.
     with _client(tmp_path, host="attacker.example:9981") as c:
         assert c.get("/sessions").status_code == 403
 
 
+def test_client_token_does_not_work_from_off_the_machine(tmp_path):
+    with _client(tmp_path, client_ip="192.168.1.20", host="192.168.1.5:9981") as c:
+        assert c.get("/sessions").status_code == 403
+
+
 def test_remote_client_needs_the_token(tmp_path):
-    remote = dict(client_ip="192.168.1.20", host="192.168.1.5:9981")
+    remote = dict(client_ip="192.168.1.20", host="192.168.1.5:9981", app_token=False)
     with _client(tmp_path, **remote) as c:
         assert c.get("/sessions").status_code == 403  # no token configured
     with _client(tmp_path, token="s3cret", **remote) as c:

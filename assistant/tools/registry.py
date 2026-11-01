@@ -29,6 +29,7 @@ class ToolRegistry:
         needs_approval: bool = False,
         toolset: str = "core",
         check_fn: Callable[[ToolContext], bool] | None = None,
+        approval_when: Callable[[dict, ToolContext], bool] | None = None,
     ):
         def decorator(fn):
             self.register(
@@ -40,6 +41,7 @@ class ToolRegistry:
                     needs_approval=needs_approval,
                     toolset=toolset,
                     check_fn=check_fn,
+                    approval_when=approval_when,
                 )
             )
             return fn

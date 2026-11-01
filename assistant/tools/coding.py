@@ -2,16 +2,16 @@
 
 Implemented in pure Python (no rg/fd dependency) so the assistant works on any
 end-user machine. write_file and edit_file are approval-gated because they mutate
-the filesystem; the read-only tools are not.
+the filesystem; the read-only tools ask only when they reach outside the workspace.
 """
 
 from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePath
 
-from .base import ToolContext, ToolResult
+from .base import ToolContext, ToolResult, outside_reach
 from .output_bounding import bound_text
 from .registry import registry
 
@@ -24,12 +24,19 @@ def _resolve(path: str, ctx: ToolContext) -> Path:
     return p if p.is_absolute() else (ctx.cwd / p)
 
 
-def _inside_workspace(path: str, ctx: ToolContext) -> Path | None:
-    """Where a mutating tool may write, or None when the path leaves the workspace.
+def _too_broad(root: Path) -> bool:
+    # "/" is what a Finder-launched backend inherits as its cwd, and home holds ~/.ssh,
+    # shell profiles and LaunchAgents: as a write root either one confines nothing.
+    return root == Path("/") or root == Path(os.path.realpath(Path.home()))
 
-    Only the two tools that change files ask this. Reading is left alone: an agent
-    that has to check ``~/.config`` or a sibling checkout to answer a question is
-    doing something ordinary, and a read cannot damage anything.
+
+def _inside_workspace(path: str, ctx: ToolContext) -> Path | None:
+    """Where a mutating tool may write, or None when the path leaves the workspace — or
+    when the workspace is "/" or the home directory, which contain everything.
+
+    Only the two tools that change files ask this. Reads outside the workspace are not
+    refused but asked about (``approval_when`` on the read tools): checking ``~/.config``
+    or a sibling checkout is ordinary, but it should be the human's call.
 
     It exists because ``approval_rules`` cannot express it. A rule's resource glob
     matches the path as the model wrote it, so a deny on ``/Users/*/.ssh/*`` is
@@ -41,7 +48,27 @@ def _inside_workspace(path: str, ctx: ToolContext) -> Path | None:
     """
     target = Path(os.path.realpath(_resolve(path, ctx)))
     root = Path(os.path.realpath(ctx.cwd))
+    if _too_broad(root):
+        return None
     return target if target == root or root in target.parents else None
+
+
+def _write_refusal(path: str, ctx: ToolContext) -> str:
+    root = Path(os.path.realpath(ctx.cwd))
+    if _too_broad(root):
+        return (
+            f"refusing to write: the workspace is {root}, which is too broad to confine "
+            "writes — switch to a project directory (/cd in Telegram, or workspace_dir)"
+        )
+    return f"outside the workspace ({ctx.cwd}): {path}"
+
+
+def _glob_escapes(args: dict, ctx: ToolContext) -> bool:
+    pattern = args.get("pattern")
+    if not isinstance(pattern, str):
+        return False
+    parts = PurePath(pattern).parts
+    return PurePath(pattern).is_absolute() or ".." in parts or pattern.startswith("~")
 
 
 @registry.tool(
@@ -52,6 +79,7 @@ def _inside_workspace(path: str, ctx: ToolContext) -> Path | None:
         "properties": {"path": {"type": "string"}},
         "required": ["path"],
     },
+    approval_when=lambda args, ctx: outside_reach(args.get("path"), ctx),
 )
 async def read_file(args: dict, ctx: ToolContext) -> ToolResult:
     p = _resolve(args["path"], ctx)
@@ -76,7 +104,7 @@ async def read_file(args: dict, ctx: ToolContext) -> ToolResult:
 async def write_file(args: dict, ctx: ToolContext) -> ToolResult:
     p = _inside_workspace(args["path"], ctx)
     if p is None:
-        return ToolResult(False, f"outside the workspace ({ctx.cwd}): {args['path']}")
+        return ToolResult(False, _write_refusal(args["path"], ctx))
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(args["content"])
     return ToolResult(True, f"wrote {len(args['content'])} chars to {p}")
@@ -113,7 +141,7 @@ def _lines_resembling(text: str, old: str, limit: int = 5) -> str:
 async def edit_file(args: dict, ctx: ToolContext) -> ToolResult:
     p = _inside_workspace(args["path"], ctx)
     if p is None:
-        return ToolResult(False, f"outside the workspace ({ctx.cwd}): {args['path']}")
+        return ToolResult(False, _write_refusal(args["path"], ctx))
     if not p.is_file():
         return ToolResult(False, f"not a file: {p}")
     text = p.read_text(errors="replace")
@@ -152,6 +180,7 @@ async def edit_file(args: dict, ctx: ToolContext) -> ToolResult:
         "properties": {"pattern": {"type": "string"}},
         "required": ["pattern"],
     },
+    approval_when=_glob_escapes,
 )
 async def glob_files(args: dict, ctx: ToolContext) -> ToolResult:
     matches = sorted(str(x) for x in ctx.cwd.glob(args["pattern"]))
@@ -185,6 +214,7 @@ def _is_file(p: Path) -> bool:
         },
         "required": ["pattern"],
     },
+    approval_when=lambda args, ctx: outside_reach(args.get("path"), ctx),
 )
 async def grep(args: dict, ctx: ToolContext) -> ToolResult:
     try:

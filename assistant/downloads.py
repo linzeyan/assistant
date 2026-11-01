@@ -20,6 +20,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -51,6 +52,16 @@ _DOWNLOAD_SCRIPT = (
 
 # Statuses for which a download is still live (idempotent start, resume-on-boot).
 ACTIVE_STATUSES = frozenset({"queued", "downloading"})
+
+
+# A HuggingFace repo id: "namespace/name", each part starting alphanumeric. The id becomes a
+# path under the download dir (target_dir / repo_id), so "..", "/abs" or a third segment
+# would land the download — and a later DELETE's rmtree — somewhere else.
+_REPO_ID = re.compile(r"[A-Za-z0-9][\w.-]{0,95}/[A-Za-z0-9][\w.-]{0,95}")
+
+
+def valid_repo_id(repo_id: str) -> bool:
+    return bool(_REPO_ID.fullmatch(repo_id)) and ".." not in repo_id
 
 
 def hub_env(*, disable_xet: bool, download_timeout: int) -> dict[str, str]:

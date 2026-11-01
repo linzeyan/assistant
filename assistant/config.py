@@ -34,6 +34,22 @@ XDG_CONFIG_DIR = _xdg_dir("XDG_CONFIG_HOME", ".config")
 XDG_DATA_DIR = _xdg_dir("XDG_DATA_HOME", ".local/share")
 
 
+def write_private(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` readable by its owner only, inside an owner-only directory.
+
+    For files holding secrets (config.toml's telegram_token/api_token, the client token):
+    created 0600 from the start and swapped in atomically, so no other account on the Mac
+    ever sees a readable copy, even for the moment between write and chmod."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    tmp = path.with_name(f".{path.name}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    os.chmod(tmp, 0o600)  # O_CREAT's mode is ignored when a stale tmp already existed
+    os.replace(tmp, path)
+
+
 class Settings(BaseSettings):
     # protected_namespaces=(): we use plain field names like `models_dir`; silence
     # pydantic's `model_`-prefix guard which is irrelevant here.
@@ -48,6 +64,11 @@ class Settings(BaseSettings):
     # `x-api-key`). Local clients addressing the backend as 127.0.0.1/localhost need none; with
     # no token set, every other request is refused — so a LAN bind is useless until one is set.
     api_token: str | None = None
+    # TLS certificate + key (PEM paths) for a non-loopback backend_host. Required there: the
+    # backend refuses to start on the LAN without them, since the api_token — a shell on this
+    # Mac — would otherwise cross the network in clear text.
+    ssl_certfile: Path | None = None
+    ssl_keyfile: Path | None = None
 
     # --- model backend selection ---
     # "mlx": native in-process MLX (mlx-lm), no external server — the default, so the
@@ -180,8 +201,10 @@ class Settings(BaseSettings):
     tool_output_dir: Path = XDG_DATA_DIR / "tool-output"
     # Retention for spilled tool-output files (S15 GC), swept once at startup. 0 = keep forever.
     tool_output_retention_days: float = 14
-    # Directory the coding/shell tools operate in. Defaults to the process cwd.
-    workspace_dir: Path = Field(default_factory=Path.cwd)
+    # Directory the coding/shell tools operate in. A dedicated directory by default — the
+    # process cwd was "/" when launched from Finder, which made the whole disk the write root.
+    # Point it at a project here, or per chat with Telegram's /cd.
+    workspace_dir: Path = XDG_DATA_DIR / "workspace"
     # Fallback model for non-GUI entry points (Telegram) that don't pick one.
     default_model: str | None = None
 
@@ -224,6 +247,12 @@ class Settings(BaseSettings):
     # --- telegram (wired in a later phase) ---
     telegram_token: str | None = None
     telegram_allowed_users: list[int] = Field(default_factory=list)
+
+    @property
+    def telegram_inbox(self) -> Path:
+        """Where Telegram uploads are saved: inside the owner-only data dir rather than a temp
+        dir, and listed as a tool read root so viewing an upload doesn't prompt."""
+        return self.home_dir / "telegram-inbox"
 
     @property
     def omlx_base_url(self) -> str:

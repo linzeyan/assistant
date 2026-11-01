@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
+import socket
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -45,7 +47,8 @@ from assistant.api import (
     routes_video,
     routes_vision,
 )
-from assistant.config import Settings, get_settings
+from assistant import config as assistant_config
+from assistant.config import Settings, get_settings, write_private
 from assistant.images.mlx_backend import MlxImageBackend
 from assistant.memory.file_provider import FileMemoryProvider
 from assistant.agent.fusion import FusionEngine
@@ -144,7 +147,7 @@ async def lifespan(app: FastAPI):
 
     # Ensure the user-facing model dirs exist so a fresh default install doesn't present
     # a "missing" path (and downloads have somewhere to land). Best-effort, never fatal.
-    for d in {settings.models_dir, settings.download_dir}:
+    for d in {settings.models_dir, settings.download_dir, settings.workspace_dir}:
         try:
             Path(d).mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -250,6 +253,15 @@ async def lifespan(app: FastAPI):
         audio=audio,
         video=video,
         output_spill_dir=settings.tool_output_dir,
+        # The backend's own output and the Telegram inbox: the user's files, readable by the
+        # media tools without a prompt even though they sit outside the workspace.
+        read_roots=(
+            settings.images_dir,
+            settings.video_dir,
+            settings.audio_dir,
+            settings.tool_output_dir,
+            settings.telegram_inbox,
+        ),
     )
     # Capability set for the skill requires-gate (E2): which optional media backends are installed.
     # Set now that the services exist; it's process-stable, so the gated skills index stays a
@@ -401,17 +413,33 @@ async def lifespan(app: FastAPI):
 def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="assistant-backend", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings or get_settings()
+    # Per-process secret the desktop app reads from an owner-only file (written by run()) and
+    # presents on every request — see access.py for why loopback alone isn't enough.
+    app.state.client_token = secrets.token_urlsafe(32)
 
     # Registered before log_requests so it sits inside it: refusals still get their log line.
     @app.middleware("http")
     async def guard_access(request: Request, call_next):
-        if not access.is_allowed(request, app.state.settings.api_token):
+        if not access.is_allowed(
+            request, app.state.settings.api_token, app.state.client_token
+        ):
             log.warning(
-                "refused %s %s: client=%s host=%r (not loopback, no valid api token)",
+                "refused %s %s: client=%s host=%r origin=%r (no valid token, or a browser "
+                "page from another site)",
                 request.method, request.url.path,
                 request.client.host if request.client else "?", request.headers.get("host"),
+                request.headers.get("origin"),
             )
             return JSONResponse({"detail": "forbidden"}, status_code=403)
+        # The compat routes read the body with request.json() whatever its declared type. A
+        # page can POST text/plain without a CORS preflight; requiring JSON forces one, which
+        # this backend never answers.
+        if request.method == "POST" and request.url.path.startswith("/v1/"):
+            ctype = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if ctype != "application/json":
+                return JSONResponse(
+                    {"detail": "Content-Type must be application/json"}, status_code=415
+                )
         return await call_next(request)
 
     @app.exception_handler(InvalidSessionId)
@@ -474,6 +502,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
+def client_token_path() -> Path:
+    # A fixed XDG location rather than a setting: the desktop app has to find it before it
+    # can ask the backend anything (Bootstrap.dataHome() mirrors XDG_DATA_DIR).
+    return assistant_config.XDG_DATA_DIR / "client-token"
+
+
+def _secure_private_paths(settings: Settings) -> None:
+    """Owner-only permissions on the data, log and config dirs and on config.toml. They hold
+    conversations, memory, logs of tool calls and the bot/api tokens; an install from before
+    this was enforced has them world-readable under the default umask."""
+    config_dir = assistant_config.XDG_CONFIG_DIR
+    for d in (settings.home_dir, settings.log_dir, config_dir):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            d.chmod(0o700)
+        except OSError:
+            log.warning("could not restrict permissions on %s", d, exc_info=True)
+    cfg = config_dir / "config.toml"
+    if cfg.is_file():
+        cfg.chmod(0o600)
+
+
+def _port_is_free(host: str, port: int) -> bool:
+    """Whether uvicorn will be able to bind host:port — probed the way it binds (SO_REUSEADDR,
+    so a restart's TIME_WAIT doesn't count as taken)."""
+    try:
+        family, kind, proto, _, addr = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+        )[0]
+        with socket.socket(family, kind, proto) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(addr)
+        return True
+    except OSError:
+        return False
+
+
 def run() -> None:
     import uvicorn
 
@@ -489,17 +554,39 @@ def run() -> None:
         settings.models_dir,
         log_path,
     )
-    if not access.is_loopback_bind(settings.backend_host) and not settings.api_token:
-        log.warning(
-            "backend_host=%s exposes the API beyond this machine but api_token is unset: "
-            "every non-local request will be refused until one is configured",
-            settings.backend_host,
-        )
+    tls = {}
+    if settings.ssl_certfile and settings.ssl_keyfile:
+        tls = {"ssl_certfile": str(settings.ssl_certfile), "ssl_keyfile": str(settings.ssl_keyfile)}
+    if not access.is_loopback_bind(settings.backend_host):
+        if not tls:
+            msg = (
+                f"backend_host={settings.backend_host} exposes the API beyond this machine "
+                "without TLS: set ssl_certfile and ssl_keyfile, or bind 127.0.0.1"
+            )
+            log.error(msg)
+            raise SystemExit(msg)
+        if not settings.api_token:
+            log.warning(
+                "backend_host=%s exposes the API beyond this machine but api_token is unset: "
+                "every non-local request will be refused until one is configured",
+                settings.backend_host,
+            )
+    # Checked before the token file is written: a second instance that would only fail to bind
+    # (`make run` while the app's backend is up) must not replace the running one's token —
+    # that locks the desktop app out of a backend that is still serving.
+    if not _port_is_free(settings.backend_host, settings.backend_port):
+        msg = f"{settings.backend_host}:{settings.backend_port} is already in use"
+        log.error(msg)
+        raise SystemExit(msg)
+    _secure_private_paths(settings)
+    app = create_app(settings)
+    write_private(client_token_path(), app.state.client_token)
     uvicorn.run(
-        create_app(settings),
+        app,
         host=settings.backend_host,
         port=settings.backend_port,
         # Per-request logging is handled by our middleware (with ids + timings), so disable
         # uvicorn's bare access log — it was the low-value spam in backend.out.log.
         access_log=False,
+        **tls,
     )

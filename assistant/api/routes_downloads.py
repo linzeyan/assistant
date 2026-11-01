@@ -14,6 +14,8 @@ import importlib.util
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from assistant.downloads import valid_repo_id
+
 router = APIRouter(tags=["downloads"])
 
 
@@ -23,9 +25,9 @@ class DownloadRequest(BaseModel):
 
 def _clean_repo_id(raw: str) -> str:
     repo_id = raw.strip()
-    if not repo_id or any(c.isspace() for c in repo_id):
+    if not valid_repo_id(repo_id):
         # A pasted multi-line / doubled value would otherwise reach the hub and fail with a
-        # confusing message — reject it up front with a clear one (also guards non-GUI callers).
+        # confusing message, and a path-shaped one would download outside the models dir.
         raise HTTPException(
             status_code=400,
             detail="repo_id must be a single 'namespace/name' with no spaces or line breaks.",
